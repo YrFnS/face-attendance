@@ -1,0 +1,13 @@
+[Unit]
+Description=Face Attendance Folder Watcher
+After=network-online.target face-attendance-ftp.service
+Wants=network-online.target
+
+[Service]
+WorkingDirectory=/opt/face-attendance
+ExecStart=/opt/face-attendance/.venv/bin/python -u face_attendance.py watch-folder
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

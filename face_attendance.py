@@ -231,7 +231,7 @@ def bench_execute(method, kwargs):
             shlex.quote(json.dumps(kwargs)),
         ]
     )
-    cmd = ["wsl", "-d", "Ubuntu-24.04", "--", "bash", "-lc", command]
+    cmd = ["wsl", "-d", cfg.get("wsl_distro", "Ubuntu-24.04"), "--", "bash", "-lc", command] if os.name == "nt" else ["bash", "-lc", command]
     result = subprocess.run(cmd, check=True, capture_output=True, text=True)
     output = result.stdout.strip()
     return json.loads(output) if output else None
@@ -242,6 +242,10 @@ def windows_to_wsl_path(path):
     drive = path.drive.rstrip(":").lower()
     parts = [part for part in path.parts[1:]]
     return "/mnt/" + drive + "/" + "/".join(parts)
+
+
+def bench_file_path(path):
+    return windows_to_wsl_path(path) if os.name == "nt" else str(path.resolve())
 
 
 def bench_console(script):
@@ -257,7 +261,7 @@ def bench_console(script):
             "console",
         ]
     )
-    cmd = ["wsl", "-d", "Ubuntu-24.04", "--", "bash", "-lc", command]
+    cmd = ["wsl", "-d", cfg.get("wsl_distro", "Ubuntu-24.04"), "--", "bash", "-lc", command] if os.name == "nt" else ["bash", "-lc", command]
     subprocess.run(cmd, input=script, check=True, capture_output=True, text=True)
 
 
@@ -268,7 +272,7 @@ def attach_image(doctype, docname, image_path):
                 "from pathlib import Path",
                 "import frappe",
                 "from frappe.utils.file_manager import save_file",
-                f"path = Path({windows_to_wsl_path(image_path)!r})",
+                f"path = Path({bench_file_path(image_path)!r})",
                 f"save_file(path.name, path.read_bytes(), {doctype!r}, {docname!r}, is_private=1)",
                 "frappe.db.commit()",
             ]
