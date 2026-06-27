@@ -1,0 +1,33 @@
+# Python/runtime
+.venv/
+__pycache__/
+*.py[cod]
+
+# Local config and runtime state
+config.json
+cooldown_state.json
+cooldown_state.lock
+embeddings.pkl
+*.log
+*.out
+*.err
+
+# Camera/biometric data
+faces/
+bad_samples/
+camera_uploads/
+detected_faces/
+logs/
+*.jpg
+*.jpeg
+*.png
+*.bmp
+*.webp
+*.gif
+*.mp4
+*.avi
+*.mov
+*.mkv
+
+# Local scratch
+ftp_test.txt

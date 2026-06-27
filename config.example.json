@@ -1,0 +1,20 @@
+{
+  "camera_url": "rtsp://admin:CHANGE_ME@192.168.3.207:554/LiveMedia/ch1/Media1/trackID=1",
+  "bench_dir": "/home/test/frappe-bench",
+  "site": "test",
+  "log_type": "IN",
+  "camera_uploads_dir": "C:/Users/E2NEXT/face-attendance/camera_uploads",
+  "ftp_username": "camera",
+  "ftp_password": "CHANGE_ME",
+  "ftp_port": 2121,
+  "model": "antelopev2",
+  "det_size": 960,
+  "build_det_size": 640,
+  "threshold": 0.55,
+  "cooldown_seconds": 600,
+  "frame_stride": 25,
+  "process_scale": 1.5,
+  "min_face_width": 65,
+  "min_face_height": 80,
+  "min_detection_score": 0.5
+}
