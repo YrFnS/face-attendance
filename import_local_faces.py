@@ -25,7 +25,24 @@ def frappe_headers(cfg):
     return {"Authorization": "token " + token}
 
 
-def find_employee(cfg, folder_name):
+def load_manifest(path):
+    if not path:
+        return {}
+
+    data = json.loads(path.read_text(encoding="utf-8"))
+    mapping = {}
+    for item in data:
+        name = item.get("name")
+        employee_id = item.get("emp_id")
+        if name and employee_id and item.get("status") == "ok":
+            mapping[name] = {"name": employee_id, "employee_name": name, "source": "manifest"}
+    return mapping
+
+
+def find_employee(cfg, folder_name, manifest):
+    if folder_name in manifest:
+        return [manifest[folder_name]]
+
     url = cfg["frappe_url"].rstrip("/") + "/api/resource/Employee"
     params = {
         "filters": json.dumps([["employee_name", "=", folder_name]], ensure_ascii=False),
@@ -41,8 +58,9 @@ def image_files(folder):
     return sorted(path for path in folder.iterdir() if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS)
 
 
-def copy_faces(source, dest, dry_run):
+def copy_faces(source, dest, manifest_path, dry_run):
     cfg = load_config()
+    manifest = load_manifest(manifest_path)
     report = {"copied": [], "skipped": []}
 
     for folder in sorted(source.iterdir(), key=lambda path: path.name):
@@ -54,7 +72,7 @@ def copy_faces(source, dest, dry_run):
             report["skipped"].append({"folder": folder.name, "reason": "no supported images"})
             continue
 
-        matches = find_employee(cfg, folder.name)
+        matches = find_employee(cfg, folder.name, manifest)
         if len(matches) != 1:
             report["skipped"].append(
                 {
@@ -83,6 +101,7 @@ def copy_faces(source, dest, dry_run):
                 "folder": folder.name,
                 "employee": employee_id,
                 "employee_name": matches[0]["employee_name"],
+                "source": matches[0].get("source", "frappe"),
                 "image_count": len(files),
                 "files": copied,
             }
@@ -98,13 +117,14 @@ def main():
     parser = argparse.ArgumentParser(description="Import local employee face folders into faces/<employee-id>.")
     parser.add_argument("--source", required=True, type=Path, help="Folder containing one subfolder per employee name.")
     parser.add_argument("--dest", default=ROOT / "faces", type=Path, help="Destination faces folder.")
+    parser.add_argument("--manifest", type=Path, help="Optional enrollment_report.json with name/emp_id mappings.")
     parser.add_argument("--dry-run", action="store_true", help="Only write the report; do not copy images.")
     args = parser.parse_args()
 
     if not args.source.exists():
         raise SystemExit(f"source does not exist: {args.source}")
 
-    copy_faces(args.source, args.dest, args.dry_run)
+    copy_faces(args.source, args.dest, args.manifest, args.dry_run)
 
 
 if __name__ == "__main__":
