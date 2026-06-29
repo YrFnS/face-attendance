@@ -2,15 +2,15 @@
 
 Standalone local face-recognition bridge for HOLOWITS camera FTP captures and ERPNext `Employee Checkin`.
 
-It does not install anything inside Frappe. It creates `Employee Checkin` records through local `bench` or the Frappe HTTP API, and attaches the camera image to the checkin.
+It does not install anything inside Frappe. It creates `Employee Checkin` records through local `bench` or the Frappe HTTP API, and attaches the matched face crop to the checkin.
 
 ## What Runs
 
 - `ftp_receiver.py` receives camera FTP uploads.
-- `face_attendance.py watch-folder` watches uploaded images, recognizes employees, creates checkins, and attaches the image.
+- `face_attendance.py watch-folder` watches uploaded images, recognizes employees, creates checkins, and attaches the matched face crop.
 - `web_admin.py` lets a user upload employee face images and rebuild embeddings.
 
-The model is local InsightFace `antelopev2`; no cloud recognition is used.
+The model is local InsightFace, normally `buffalo_l` on CPU; no cloud recognition is used.
 
 ## Frappe Requirements
 

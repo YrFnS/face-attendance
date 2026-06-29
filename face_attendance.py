@@ -217,7 +217,10 @@ def match_employee(known, embedding):
     for item in known:
         vectors = item.get("embeddings") or [item["embedding"]]
         scores.append((max(float(np.dot(vector, embedding)) for vector in vectors), item["employee"]))
-    return max(scores, default=(0.0, None))
+    scores.sort(reverse=True)
+    best_score, employee = scores[0] if scores else (0.0, None)
+    second_score = scores[1][0] if len(scores) > 1 else 0.0
+    return best_score, employee, best_score - second_score
 
 
 def bench_execute(method, kwargs):
@@ -391,7 +394,7 @@ def process_image(image, source_name, app, known, cfg, last_seen, dry_run=False,
             cv2.imwrite(str(LOGS / f"latest_face_{index}.jpg"), crop)
             cv2.imwrite(str(LOGS / "latest_face.jpg"), crop)
         width, height = face_size(face)
-        score, employee = match_employee(known, face.embedding)
+        score, employee, margin = match_employee(known, face.embedding)
         prefix = f"{source_name} face={index}/{len(faces)}"
         if (
             width < int(cfg["min_face_width"])
@@ -401,16 +404,21 @@ def process_image(image, source_name, app, known, cfg, last_seen, dry_run=False,
             log(
                 f"{prefix} rejected=size_or_detection "
                 f"size={width:.0f}x{height:.0f} det={float(face.det_score):.3f} "
-                f"best={employee} score={score:.3f}"
+                f"best={employee} score={score:.3f} margin={margin:.3f}"
             )
             save_rejected(crop, "quality", employee, score)
             continue
-        log(f"{prefix} match={employee} score={score:.3f}")
-        if not employee or score < float(cfg["threshold"]) or employee in seen_this_image:
+        log(f"{prefix} match={employee} score={score:.3f} margin={margin:.3f}")
+        if (
+            not employee
+            or score < float(cfg["threshold"])
+            or margin < float(cfg.get("min_score_margin", 0.0))
+            or employee in seen_this_image
+        ):
             save_rejected(crop, "unknown", employee, score)
             continue
         seen_this_image.add(employee)
-        image_path = attach_source or save_checkin_image(crop, employee, score)
+        image_path = save_checkin_image(crop, employee, score)
         created = create_checkin_with_cooldown(employee, cfg, image_path, dry_run, log_type_for_path(cfg, attach_source)) or created
     return created
 
