@@ -1,5 +1,5 @@
 {
-  "camera_url": "rtsp://admin:CHANGE_ME@192.168.3.207:554/LiveMedia/ch1/Media1/trackID=1",
+  "camera_url": "rtsp://admin:CHANGE_ME@192.168.68.121:554/LiveMedia/ch1/Media1",
   "bench_dir": "/home/test/frappe-bench",
   "site": "test",
   "frappe_url": "",
