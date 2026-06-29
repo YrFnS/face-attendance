@@ -41,7 +41,11 @@ def load_config():
 def face_app(det_size=None):
     cfg = load_config()
     det_size = int(det_size or cfg.get("det_size", 640))
-    app = FaceAnalysis(name=cfg.get("model", "buffalo_s"), providers=["CPUExecutionProvider"])
+    app = FaceAnalysis(
+        name=cfg.get("model", "buffalo_s"),
+        allowed_modules=cfg.get("allowed_modules", ["detection", "recognition"]),
+        providers=["CPUExecutionProvider"],
+    )
     app.prepare(ctx_id=-1, det_size=(det_size, det_size))
     return app
 
