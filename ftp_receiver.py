@@ -19,7 +19,13 @@ def main():
     uploads = Path(cfg.get("camera_uploads_dir", ROOT / "camera_uploads"))
     uploads.mkdir(exist_ok=True)
     authorizer = DummyAuthorizer()
-    authorizer.add_user(cfg["ftp_username"], cfg["ftp_password"], str(uploads), perm="elradfmwMT")
+    users = cfg.get("ftp_users") or {
+        cfg["ftp_username"]: {"password": cfg["ftp_password"], "dir": str(uploads)}
+    }
+    for username, item in users.items():
+        folder = Path(item.get("dir", uploads / username))
+        folder.mkdir(parents=True, exist_ok=True)
+        authorizer.add_user(username, item["password"], str(folder), perm="elradfmwMT")
 
     handler = FTPHandler
     handler.authorizer = authorizer

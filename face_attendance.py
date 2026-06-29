@@ -343,7 +343,8 @@ def create_checkin(employee, log_type, image_path=None):
     return create_checkin_bench(employee, log_type, image_path)
 
 
-def create_checkin_with_cooldown(employee, cfg, image_path, dry_run=False):
+def create_checkin_with_cooldown(employee, cfg, image_path, dry_run=False, log_type=None):
+    log_type = log_type or cfg["log_type"]
     lock_fd = acquire_cooldown_lock()
     try:
         last_seen = load_cooldown_state()
@@ -353,14 +354,21 @@ def create_checkin_with_cooldown(employee, cfg, image_path, dry_run=False):
             log(f"cooldown skip: {employee} {remaining}s remaining")
             return False
         if dry_run:
-            log(f"dry run: would create {employee} {cfg['log_type']}")
+            log(f"dry run: would create {employee} {log_type}")
             return True
-        create_checkin(employee, cfg["log_type"], image_path)
+        create_checkin(employee, log_type, image_path)
         last_seen[employee] = now
         save_cooldown_state(last_seen)
         return True
     finally:
         release_cooldown_lock(lock_fd)
+
+
+def log_type_for_path(cfg, path):
+    if not path:
+        return cfg["log_type"]
+    parts = {part.lower() for part in Path(path).parts}
+    return cfg.get("folder_log_types", {}).get("out" if "out" in parts else "in" if "in" in parts else "", cfg["log_type"])
 
 
 def process_image(image, source_name, app, known, cfg, last_seen, dry_run=False, attach_source=None):
@@ -399,7 +407,7 @@ def process_image(image, source_name, app, known, cfg, last_seen, dry_run=False,
             continue
         seen_this_image.add(employee)
         image_path = attach_source or save_checkin_image(crop, employee, score)
-        created = create_checkin_with_cooldown(employee, cfg, image_path, dry_run) or created
+        created = create_checkin_with_cooldown(employee, cfg, image_path, dry_run, log_type_for_path(cfg, attach_source)) or created
     return created
 
 
