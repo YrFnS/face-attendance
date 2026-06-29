@@ -1,5 +1,6 @@
 import subprocess
 import sys
+import json
 from pathlib import Path
 
 from flask import Flask, redirect, render_template_string, request, url_for
@@ -8,6 +9,7 @@ from werkzeug.utils import secure_filename
 
 ROOT = Path(__file__).resolve().parent
 FACES = ROOT / "faces"
+CONFIG = ROOT / "config.json"
 ALLOWED = {".jpg", ".jpeg", ".png", ".webp"}
 app = Flask(__name__)
 
@@ -115,4 +117,5 @@ def build():
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8088)
+    port = json.loads(CONFIG.read_text()).get("web_port", 8088) if CONFIG.exists() else 8088
+    app.run(host="0.0.0.0", port=int(port))

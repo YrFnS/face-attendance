@@ -10,6 +10,7 @@ from pathlib import Path
 
 import cv2
 import numpy as np
+import requests
 from insightface.app import FaceAnalysis
 
 
@@ -280,7 +281,44 @@ def attach_image(doctype, docname, image_path):
     )
 
 
-def create_checkin(employee, log_type, image_path=None):
+def api_headers(json_request=True):
+    cfg = load_config()
+    headers = {"Authorization": f"token {cfg['frappe_api_key']}:{cfg['frappe_api_secret']}"}
+    if json_request:
+        headers["Content-Type"] = "application/json"
+    return headers
+
+
+def create_checkin_api(employee, log_type, image_path=None):
+    cfg = load_config()
+    doc = {
+        "employee": employee,
+        "log_type": log_type,
+        "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    resp = requests.post(
+        f"{cfg['frappe_url'].rstrip('/')}/api/resource/Employee%20Checkin",
+        headers=api_headers(),
+        json=doc,
+        timeout=30,
+    )
+    resp.raise_for_status()
+    docname = resp.json()["data"]["name"]
+    if image_path:
+        with open(image_path, "rb") as file:
+            upload = requests.post(
+                f"{cfg['frappe_url'].rstrip('/')}/api/method/upload_file",
+                headers=api_headers(json_request=False),
+                data={"doctype": "Employee Checkin", "docname": docname, "is_private": "1"},
+                files={"file": (image_path.name, file, "image/jpeg")},
+                timeout=30,
+            )
+        upload.raise_for_status()
+        log(f"checkin attachment added: {docname} {image_path.name}")
+    log(f"checkin created: {employee} {log_type} {docname}")
+
+
+def create_checkin_bench(employee, log_type, image_path=None):
     doc = {
         "doctype": "Employee Checkin",
         "employee": employee,
@@ -296,6 +334,13 @@ def create_checkin(employee, log_type, image_path=None):
         except subprocess.CalledProcessError as exc:
             log(f"checkin attachment failed: {docname} {exc}")
     log(f"checkin created: {employee} {log_type} {docname}")
+
+
+def create_checkin(employee, log_type, image_path=None):
+    cfg = load_config()
+    if cfg.get("frappe_url") and cfg.get("frappe_api_key") and cfg.get("frappe_api_secret"):
+        return create_checkin_api(employee, log_type, image_path)
+    return create_checkin_bench(employee, log_type, image_path)
 
 
 def create_checkin_with_cooldown(employee, cfg, image_path, dry_run=False):

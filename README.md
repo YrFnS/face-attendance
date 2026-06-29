@@ -2,7 +2,7 @@
 
 Standalone local face-recognition bridge for HOLOWITS camera FTP captures and ERPNext `Employee Checkin`.
 
-It does not install anything inside Frappe. It runs beside a Frappe bench, creates `Employee Checkin` records through `bench`, and attaches the camera image to the checkin.
+It does not install anything inside Frappe. It creates `Employee Checkin` records through local `bench` or the Frappe HTTP API, and attaches the camera image to the checkin.
 
 ## What Runs
 
@@ -14,10 +14,10 @@ The model is local InsightFace `antelopev2`; no cloud recognition is used.
 
 ## Frappe Requirements
 
-- Frappe/ERPNext bench exists on the same Linux server.
+- Frappe/ERPNext bench exists on the same Linux server, or Frappe API credentials are configured.
 - Employees already exist in ERPNext.
 - Folder names in `faces/` must match Employee IDs, for example `HR-EMP-00001`.
-- The Linux user running this app can run:
+- For bench mode, the Linux user running this app can run:
 
 ```bash
 cd /home/test/frappe-bench
@@ -29,7 +29,7 @@ No custom Frappe app is required.
 ## Linux VPS Install
 
 ```bash
-git clone https://github.com/E2NEXT/face-attendance.git
+git clone https://github.com/YrFnS/face-attendance.git
 cd face-attendance
 bash install_linux.sh
 ```
@@ -55,11 +55,26 @@ Minimum Linux config changes:
 {
   "bench_dir": "/home/test/frappe-bench",
   "site": "test",
+  "frappe_url": "https://example.com",
+  "frappe_api_key": "CHANGE_ME",
+  "frappe_api_secret": "CHANGE_ME",
   "camera_uploads_dir": "/opt/face-attendance/camera_uploads",
   "ftp_username": "camera",
   "ftp_password": "CHANGE_ME",
-  "ftp_port": 2121
+  "ftp_port": 2121,
+  "web_port": 8090,
+  "central_url": "http://148.230.111.16:8080",
+  "branch_name": "بغداد - الحارثية"
 }
+```
+
+Import employee images from the central face dashboard:
+
+```bash
+cd /opt/face-attendance
+. .venv/bin/activate
+python import_faces.py
+python face_attendance.py build
 ```
 
 ## Camera FTP Settings
