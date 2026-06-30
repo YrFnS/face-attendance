@@ -4,6 +4,8 @@ Standalone local face-recognition bridge for HOLOWITS camera FTP captures and ER
 
 It does not install anything inside Frappe. It creates `Employee Checkin` records through local `bench` or the Frappe HTTP API, and attaches the matched face crop to the checkin.
 
+For the full project handoff, current decisions, VPS test context, and known risks, read [HANDOFF.md](HANDOFF.md).
+
 ## What Runs
 
 - `ftp_receiver.py` receives camera FTP uploads.
