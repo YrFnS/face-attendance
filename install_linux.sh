@@ -2,8 +2,16 @@
 set -euo pipefail
 
 APP_DIR="${APP_DIR:-/opt/face-attendance}"
+SERVICE_USER="${FACE_ATTENDANCE_USER:-${SUDO_USER:-$(id -un)}}"
+
+if ! id "$SERVICE_USER" >/dev/null 2>&1; then
+  echo "Unknown FACE_ATTENDANCE_USER: $SERVICE_USER" >&2
+  exit 1
+fi
+SERVICE_GROUP="${FACE_ATTENDANCE_GROUP:-$(id -gn "$SERVICE_USER")}"
 
 sudo mkdir -p "$APP_DIR"
+sudo chown "$SERVICE_USER:$SERVICE_GROUP" "$APP_DIR"
 sudo rsync -a \
   --exclude .git \
   --exclude .venv \
@@ -14,32 +22,63 @@ sudo rsync -a \
   --exclude embedding_gallery.json \
   --exclude embedding_sync_status.json \
   --exclude embeddings.pkl \
+  --exclude runtime_state.sqlite3 \
+  --exclude runtime_state.sqlite3-wal \
+  --exclude runtime_state.sqlite3-shm \
   ./ "$APP_DIR/"
-cd "$APP_DIR"
+sudo chown -R "$SERVICE_USER:$SERVICE_GROUP" "$APP_DIR"
 
-python3 -m venv .venv
-. .venv/bin/activate
-pip install -r requirements.txt
+sudo -u "$SERVICE_USER" python3 -m venv "$APP_DIR/.venv"
+sudo -u "$SERVICE_USER" "$APP_DIR/.venv/bin/python" -m pip install --upgrade pip
+sudo -u "$SERVICE_USER" "$APP_DIR/.venv/bin/python" -m pip install -r "$APP_DIR/requirements.txt"
 
-[ -f config.json ] || cp config.example.json config.json
-mkdir -p faces camera_uploads logs
+if [ ! -f "$APP_DIR/config.json" ]; then
+  sudo -u "$SERVICE_USER" cp "$APP_DIR/config.example.json" "$APP_DIR/config.json"
+fi
+sudo chmod 600 "$APP_DIR/config.json"
+sudo -u "$SERVICE_USER" mkdir -p "$APP_DIR/faces" "$APP_DIR/camera_uploads" "$APP_DIR/logs"
+sudo chmod 700 "$APP_DIR/faces" "$APP_DIR/camera_uploads" "$APP_DIR/logs"
 
-sudo cp deploy/systemd/*.service /etc/systemd/system/
+sudo cp "$APP_DIR"/deploy/systemd/*.service /etc/systemd/system/
+sudo cp "$APP_DIR"/deploy/systemd/*.timer /etc/systemd/system/
+for unit in \
+  face-attendance-ftp.service \
+  face-attendance-watch.service \
+  face-attendance-web.service \
+  face-attendance-sync.service
+do
+  dropin="/etc/systemd/system/${unit}.d"
+  sudo mkdir -p "$dropin"
+  printf '[Service]\nUser=%s\nGroup=%s\n' "$SERVICE_USER" "$SERVICE_GROUP" \
+    | sudo tee "$dropin/user.conf" >/dev/null
+done
+
 sudo systemctl daemon-reload
 sudo systemctl enable face-attendance-ftp face-attendance-watch face-attendance-web
+sudo systemctl enable --now face-attendance-sync.timer
 
-# FTP collection and the admin UI are safe to start before enrollment is ready.
+# FTP collection and the locked admin UI are safe to start before enrollment is ready.
 sudo systemctl restart face-attendance-ftp face-attendance-web
 
-# Do not start live checkin creation on a fresh installation without a gallery.
-if [ -s embedding_gallery.json ] || [ -s embeddings.pkl ]; then
+# Do not start live check-in creation on a fresh installation without a gallery.
+if [ -s "$APP_DIR/embedding_gallery.json" ] || [ -s "$APP_DIR/embeddings.pkl" ]; then
   sudo systemctl restart face-attendance-watch
 else
   sudo systemctl stop face-attendance-watch 2>/dev/null || true
   echo "Watcher left stopped: configure and sync a valid embedding gallery first."
 fi
 
-echo "Edit $APP_DIR/config.json"
-echo "Sync embeddings: cd $APP_DIR && . .venv/bin/activate && python sync_embeddings.py"
-echo "After dry-run validation: sudo systemctl start face-attendance-watch"
-echo "Web UI: http://SERVER-IP:8088"
+if [ "$SERVICE_USER" = "root" ]; then
+  echo "WARNING: services are configured to run as root. Re-run with FACE_ATTENDANCE_USER set to the bench/service owner."
+fi
+
+echo
+echo "Installed for service account: $SERVICE_USER:$SERVICE_GROUP"
+echo "Next steps:"
+echo "1. Edit $APP_DIR/config.json and replace all placeholder secrets."
+echo "2. Configure the admin login: sudo -u $SERVICE_USER $APP_DIR/.venv/bin/python $APP_DIR/manage_admin.py set-password"
+echo "3. Put Caddy/Nginx in front of 127.0.0.1:8088 with HTTPS."
+echo "4. Sync embeddings: sudo -u $SERVICE_USER $APP_DIR/.venv/bin/python $APP_DIR/sync_embeddings.py"
+echo "5. Validate old samples safely: sudo -u $SERVICE_USER $APP_DIR/.venv/bin/python $APP_DIR/watch_service.py --once --dry-run --allow-stale"
+echo "6. After controlled validation: sudo systemctl start face-attendance-watch"
+echo "7. Verify model licensing before commercial production use."

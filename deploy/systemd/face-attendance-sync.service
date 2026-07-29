@@ -1,14 +1,12 @@
 [Unit]
-Description=Face Attendance FTP Receiver
+Description=Synchronize Face Attendance Embedding Gallery
 After=network-online.target
 Wants=network-online.target
 
 [Service]
-Type=simple
+Type=oneshot
 WorkingDirectory=/opt/face-attendance
-ExecStart=/opt/face-attendance/.venv/bin/python -u ftp_receiver.py
-Restart=on-failure
-RestartSec=3
+ExecStart=/opt/face-attendance/.venv/bin/python -u sync_embeddings.py --scheduled
 UMask=0077
 NoNewPrivileges=true
 PrivateTmp=true
@@ -17,6 +15,3 @@ ProtectKernelModules=true
 ProtectControlGroups=true
 RestrictSUIDSGID=true
 LockPersonality=true
-
-[Install]
-WantedBy=multi-user.target

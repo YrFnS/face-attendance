@@ -1,324 +1,132 @@
-import json
-import secrets
-import subprocess
-import sys
+import json, secrets, subprocess, sys
 from pathlib import Path
-
-from flask import (
-    Flask,
-    abort,
-    jsonify,
-    make_response,
-    redirect,
-    render_template_string,
-    request,
-    url_for,
-)
+import cv2, numpy as np
+from flask import Flask, abort, jsonify, make_response, redirect, render_template_string, request, session, url_for
 from werkzeug.utils import secure_filename
+from embedding_gallery import GalleryError, gallery_status, load_gallery, read_sync_status
+from runtime_state import RuntimeState, resolve_runtime_path
+from secure_sync import sync_gallery
+from web_security import add_security_headers, admin_user, auth_configured, configure_app, csrf_protected, csrf_token, login_required, remote_address, safe_next_url, validate_csrf, verify_password
 
-from embedding_gallery import (
-    GalleryError,
-    gallery_status,
-    load_gallery,
-    read_sync_status,
-    sync_gallery,
-)
-
-
-ROOT = Path(__file__).resolve().parent
-FACES = ROOT / "faces"
-CONFIG = ROOT / "config.json"
-GALLERY = ROOT / "embedding_gallery.json"
-SYNC_STATUS = ROOT / "embedding_sync_status.json"
-ALLOWED = {".jpg", ".jpeg", ".png", ".webp"}
-app = Flask(__name__)
-
-PAGE = """
-<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>Face Attendance</title>
-  <style>
-  *{box-sizing:border-box}
-  body{font-family:Inter,system-ui,Arial,sans-serif;margin:0;background:#f4f6f8;color:#17202a}
-  .wrap{max-width:1120px;margin:0 auto;padding:34px 24px}
-  .top{display:flex;justify-content:space-between;gap:20px;align-items:flex-end;margin-bottom:24px}
-  h1{margin:0;font-size:30px}.sub{color:#667085;margin:6px 0 0;line-height:1.5}
-  .grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:18px;margin-bottom:22px}
-  .card{background:white;border:1px solid #e3e7ee;border-radius:10px;padding:20px;box-shadow:0 1px 2px #10182812}
-  .stats{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin-top:18px}
-  .stat{background:#f8fafc;border:1px solid #e4e7ec;border-radius:8px;padding:14px}
-  .stat strong{display:block;font-size:22px;margin-top:5px}.label{color:#667085;font-size:12px;text-transform:uppercase;letter-spacing:.04em}
-  .ok{color:#067647}.warn{color:#b54708}.bad{color:#b42318}
-  label{display:block;font-weight:650;margin-bottom:8px}
-  input{font:inherit;width:100%;padding:11px 12px;border:1px solid #cfd6df;border-radius:6px;background:white}
-  input[type=file]{padding:9px}.row{display:grid;gap:14px}
-  button{font:inherit;font-weight:700;cursor:pointer;border:0;border-radius:6px;padding:11px 16px;background:#0f766e;color:white}
-  .secondary{background:#1f2937}.full{width:100%;margin-top:10px}
-  .msg{padding:12px 14px;border-radius:8px;margin-bottom:18px;border:1px solid}
-  .msg.ok{background:#ecfdf3;border-color:#abefc6}.msg.error{background:#fef3f2;border-color:#fecdca;color:#b42318}
-  table{border-collapse:separate;border-spacing:0;width:100%;overflow:hidden;border-radius:8px}
-  th{background:#eef2f6;color:#475467;font-size:13px;text-transform:uppercase;letter-spacing:.04em}
-  td,th{border-bottom:1px solid #e4e7ec;text-align:left;padding:13px 16px}
-  tr:last-child td{border-bottom:0}.count{font-weight:800}.mono{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:13px}
-  .meta{display:grid;gap:8px;margin-top:14px}.meta div{display:flex;justify-content:space-between;gap:16px;border-bottom:1px solid #eef2f6;padding-bottom:8px}
-  .meta span:first-child{color:#667085}.empty{text-align:center;color:#667085;padding:24px}
-  @media (max-width:820px){.top{display:block}.grid,.stats{grid-template-columns:1fr 1fr}}
-  @media (max-width:560px){.grid,.stats{grid-template-columns:1fr}.wrap{padding:24px 14px}}
-  </style>
-</head>
-<body>
-<div class="wrap">
-  <div class="top">
-    <div>
-      <h1>Face Attendance</h1>
-      <p class="sub">Employee identity is synchronized as embeddings. Attendance servers do not need enrollment photos.</p>
-    </div>
-  </div>
-
-  {% if msg %}<div class="msg {{ 'error' if error else 'ok' }}">{{ msg }}</div>{% endif %}
-
-  <div class="card" style="margin-bottom:18px">
-    <div style="display:flex;justify-content:space-between;gap:18px;align-items:flex-start;flex-wrap:wrap">
-      <div>
-        <div class="label">Embedding gallery</div>
-        {% if gallery.available %}
-          <h2 style="margin:6px 0 0" class="{{ 'warn' if gallery.stale else 'ok' }}">{{ 'Stale' if gallery.stale else 'Ready' }}</h2>
-        {% else %}
-          <h2 style="margin:6px 0 0" class="bad">Unavailable</h2>
-        {% endif %}
-      </div>
-      {% if sync_enabled %}
-      <form method="post" action="{{ url_for('sync') }}">
-        <button>Sync Embeddings</button>
-      </form>
-      {% endif %}
-    </div>
-    <div class="stats">
-      <div class="stat"><span class="label">Employees</span><strong>{{ gallery.employee_count or 0 }}</strong></div>
-      <div class="stat"><span class="label">Embeddings</span><strong>{{ gallery.embedding_count or 0 }}</strong></div>
-      <div class="stat"><span class="label">Dimension</span><strong>{{ gallery.dimension or '-' }}</strong></div>
-      <div class="stat"><span class="label">Model</span><strong style="font-size:17px">{{ gallery.model or '-' }}</strong></div>
-    </div>
-    <div class="meta">
-      <div><span>Branch</span><strong>{{ gallery.branch or config.branch_name or '-' }}</strong></div>
-      <div><span>Gallery version</span><strong class="mono">{{ gallery.gallery_version or '-' }}</strong></div>
-      <div><span>Last local update</span><strong>{{ gallery.updated_at or '-' }}</strong></div>
-      <div><span>Last successful sync</span><strong>{{ sync_status.last_success_at or '-' }}</strong></div>
-      {% if sync_status.error %}<div><span>Last sync error</span><strong class="bad">{{ sync_status.error }}</strong></div>{% endif %}
-    </div>
-  </div>
-
-  {% if local_enrollment_enabled %}
-  <div class="grid">
-    <form class="card" method="post" action="{{ url_for('upload') }}" enctype="multipart/form-data">
-      <div class="row">
-        <div>
-          <label>Employee ID</label>
-          <input name="employee" placeholder="HR-EMP-00001" required>
-        </div>
-        <div>
-          <label>Enrollment images</label>
-          <input type="file" name="photos" multiple accept="image/*" required>
-        </div>
-        <button>Upload Images</button>
-      </div>
-    </form>
-    <form class="card" method="post" action="{{ url_for('build') }}">
-      <label>Central enrollment gallery</label>
-      <p class="sub">Build normalized embeddings after adding or replacing enrollment images. Only enable this on the trusted enrollment server.</p>
-      <button class="secondary full">Rebuild Embeddings</button>
-    </form>
-  </div>
-  {% endif %}
-
-  <div class="card">
-    <table>
-      <tr><th>Employee</th><th>Name</th><th>Embeddings</th></tr>
-      {% for row in employees %}
-        <tr><td class="mono">{{ row.employee }}</td><td>{{ row.employee_name or '-' }}</td><td class="count">{{ row.count }}</td></tr>
-      {% else %}
-        <tr><td class="empty" colspan="3">No valid employee embeddings are loaded.</td></tr>
-      {% endfor %}
-    </table>
-  </div>
-</div>
-</body>
-</html>
-"""
-
+ROOT=Path(__file__).resolve().parent; FACES=ROOT/'faces'; CONFIG=ROOT/'config.json'; GALLERY=ROOT/'embedding_gallery.json'; SYNC_STATUS=ROOT/'embedding_sync_status.json'
+ALLOWED={'.jpg','.jpeg','.png','.webp'}; PLACEHOLDERS={'','CHANGE_ME','REPLACE_ME','CHANGEME'}; app=Flask(__name__)
+STYLE='body{font-family:system-ui;margin:2rem auto;max-width:1000px;padding:0 1rem;background:#f5f7f9;color:#17202a}.card{background:white;padding:1rem;border:1px solid #ddd;border-radius:8px;margin:1rem 0}input,button{padding:.65rem;margin:.25rem}button{background:#0f766e;color:white;border:0;border-radius:5px}table{width:100%;border-collapse:collapse}td,th{padding:.5rem;border-bottom:1px solid #ddd;text-align:left}.bad{color:#b42318}.warn{background:#fff4ce;padding:.7rem}.mono{font-family:monospace}'
+LOGIN='''<!doctype html><style>{{style}}</style><div class=card><h1>Face Attendance</h1>{% if message %}<p class=bad>{{message}}</p>{% endif %}<form method=post><input type=hidden name=csrf_token value="{{csrf}}"><input type=hidden name=next value="{{next_url}}"><p><input name=username placeholder=Username required></p><p><input type=password name=password placeholder=Password required></p><button>Sign in</button></form></div>'''
+SETUP='''<!doctype html><style>{{style}}</style><div class=card><h1>Admin setup required</h1><p class=bad>The web UI is locked.</p><pre>cd /opt/face-attendance\nsource .venv/bin/activate\npython manage_admin.py set-password</pre></div>'''
+HOME='''<!doctype html><style>{{style}}</style><h1>Face Attendance</h1><form method=post action="{{url_for('logout')}}"><input type=hidden name=csrf_token value="{{csrf}}"><button>Sign out {{user}}</button></form>{% if msg %}<p class="{{'bad' if error else ''}}">{{msg}}</p>{% endif %}{% if not cfg.model_license_acknowledged %}<p class=warn><b>Model license not acknowledged.</b> Verify production/commercial terms before live use.</p>{% endif %}<div class=card><h2>Embedding gallery: {{'stale' if gallery.stale else 'ready' if gallery.available else 'unavailable'}}</h2><p>Employees {{gallery.employee_count or 0}} · Embeddings {{gallery.embedding_count or 0}} · Model {{gallery.model or '-'}} · Version <span class=mono>{{gallery.gallery_version or '-'}}</span></p><p>Last sync {{sync.last_success_at or '-'}}{% if sync.error %} · <span class=bad>{{sync.error}}</span>{% endif %}</p>{% if sync_enabled %}<form method=post action="{{url_for('sync')}}"><input type=hidden name=csrf_token value="{{csrf}}"><button>Sync embeddings</button></form>{% endif %}</div>{% if enroll %}<div class=card><form method=post action="{{url_for('upload')}}" enctype=multipart/form-data><input type=hidden name=csrf_token value="{{csrf}}"><input name=employee placeholder="Employee ID" required><input type=file name=photos multiple required><button>Upload</button></form><form method=post action="{{url_for('build')}}"><input type=hidden name=csrf_token value="{{csrf}}"><button>Rebuild embeddings</button></form></div>{% endif %}<div class=card><table><tr><th>Employee</th><th>Name</th><th>Templates</th></tr>{% for x in employees %}<tr><td class=mono>{{x.employee}}</td><td>{{x.employee_name or '-'}}</td><td>{{x.count}}</td></tr>{% else %}<tr><td colspan=3>No embeddings loaded</td></tr>{% endfor %}</table></div>'''
 
 def load_config():
     try:
-        data = json.loads(CONFIG.read_text(encoding="utf-8"))
-        return data if isinstance(data, dict) else {}
-    except (FileNotFoundError, OSError, json.JSONDecodeError):
-        return {}
+        x=json.loads(CONFIG.read_text(encoding='utf-8')); return x if isinstance(x,dict) else {}
+    except (FileNotFoundError,OSError,json.JSONDecodeError): return {}
 
+def apply_security_config(): return configure_app(app,load_config())
+apply_security_config()
 
-def employee_rows(cfg):
-    try:
-        _, _, payload = load_gallery(
-            GALLERY,
-            expected_model=cfg.get("model"),
-            expected_model_version=cfg.get("model_version"),
-            expected_branch=cfg.get("branch_name"),
-            require_model_match=bool(cfg.get("require_model_match", True)),
-            require_model_version_match=bool(
-                cfg.get("require_model_version_match", False)
-            ),
-            allow_empty=bool(cfg.get("allow_empty_embedding_gallery", False)),
-        )
-    except GalleryError:
-        return []
-    return [
-        {
-            "employee": item["employee"],
-            "employee_name": item.get("employee_name", ""),
-            "count": len(item.get("embeddings", [])),
-        }
-        for item in payload["employees"]
-    ]
+def state_store(cfg=None):
+    cfg=cfg or load_config(); return RuntimeState(resolve_runtime_path(ROOT,cfg.get('runtime_state_db'),'runtime_state.sqlite3'))
 
+def audit(action,detail=None,actor=None):
+    try: state_store().audit(actor=actor or admin_user() or 'anonymous',action=action,remote_addr=remote_address(),detail=detail or {})
+    except Exception: app.logger.exception('audit write failed')
 
-def render_index(msg=None, error=False):
-    cfg = load_config()
-    status = gallery_status(
-        GALLERY,
-        max_age_seconds=cfg.get("embedding_max_age_seconds", 86400),
-    )
-    return render_template_string(
-        PAGE,
-        config=cfg,
-        gallery=status,
-        sync_status=read_sync_status(SYNC_STATUS),
-        employees=employee_rows(cfg),
-        sync_enabled=bool(cfg.get("embedding_sync_enabled", True))
-        and bool(cfg.get("central_url")),
-        local_enrollment_enabled=bool(
-            cfg.get("local_enrollment_enabled", False)
-        ),
-        msg=msg,
-        error=error,
-    )
+def payload(cfg):
+    return load_gallery(GALLERY,expected_model=cfg.get('model'),expected_model_version=cfg.get('model_version'),expected_branch=cfg.get('branch_name'),require_model_match=bool(cfg.get('require_model_match',True)),require_model_version_match=bool(cfg.get('require_model_version_match',False)),allow_empty=bool(cfg.get('allow_empty_embedding_gallery',False)))[2]
 
+def employees(cfg):
+    try: rows=payload(cfg)['employees']
+    except GalleryError: return []
+    return [{'employee':x['employee'],'employee_name':x.get('employee_name',''),'count':len(x.get('embeddings',[]))} for x in rows]
 
-@app.get("/")
+@app.after_request
+def headers(r): return add_security_headers(r,load_config())
+@app.get('/healthz')
+def health(): return jsonify(ok=True,service='face-attendance-web')
+@app.get('/readyz')
+def ready():
+    cfg=load_config(); g=gallery_status(GALLERY,max_age_seconds=cfg.get('embedding_max_age_seconds',86400)); reasons=[]
+    if not auth_configured(cfg): reasons.append('admin authentication is not configured')
+    if not g.get('available'): reasons.append(g.get('error') or 'gallery unavailable')
+    if g.get('stale') and cfg.get('reject_stale_embedding_gallery'): reasons.append('gallery stale')
+    return jsonify(ok=not reasons,reasons=reasons,gallery=g),200 if not reasons else 503
+
+@app.route('/login',methods=['GET','POST'])
+def login():
+    cfg=load_config()
+    if not auth_configured(cfg): return render_template_string(SETUP,style=STYLE),503
+    if request.method=='GET':
+        if session.get('admin_authenticated'): return redirect(url_for('index'))
+        return render_template_string(LOGIN,style=STYLE,csrf=csrf_token(),next_url=safe_next_url(request.args.get('next')),message='')
+    validate_csrf(); user=str(request.form.get('username') or '').strip(); password=str(request.form.get('password') or ''); nxt=safe_next_url(request.form.get('next')); key=f'login:{remote_address()}'; store=state_store(cfg); allowed,retry=store.login_allowed(key)
+    if not allowed: audit('login_locked',{'username':user},'anonymous'); return render_template_string(LOGIN,style=STYLE,csrf=csrf_token(),next_url=nxt,message=f'Try again in {retry} seconds.'),429
+    expected=str(cfg.get('web_admin_username') or ''); valid=secrets.compare_digest(user,expected) and verify_password(password,cfg.get('web_admin_password_hash'))
+    if not valid:
+        store.record_login_failure(key,max_attempts=cfg.get('web_login_attempts',5),window_seconds=cfg.get('web_login_window_seconds',300),lockout_seconds=cfg.get('web_lockout_seconds',900)); audit('login_failed',{'username':user},'anonymous')
+        return render_template_string(LOGIN,style=STYLE,csrf=csrf_token(),next_url=nxt,message='Invalid username or password.'),401
+    store.clear_login_failures(key); session.clear(); session.update(admin_authenticated=True,admin_user=expected); session.permanent=True; csrf_token(); audit('login_succeeded',actor=expected); return redirect(nxt)
+
+@app.post('/logout')
+@login_required
+@csrf_protected
+def logout(): audit('logout',actor=admin_user()); session.clear(); return redirect(url_for('login'))
+@app.get('/')
+@login_required
 def index():
-    return render_index(
-        msg=request.args.get("msg"),
-        error=request.args.get("error") == "1",
-    )
+    cfg=load_config(); return render_template_string(HOME,style=STYLE,cfg=cfg,gallery=gallery_status(GALLERY,max_age_seconds=cfg.get('embedding_max_age_seconds',86400)),sync=read_sync_status(SYNC_STATUS),employees=employees(cfg),sync_enabled=bool(cfg.get('embedding_sync_enabled',True) and cfg.get('central_url')),enroll=bool(cfg.get('local_enrollment_enabled',False)),user=admin_user(),csrf=csrf_token(),msg=request.args.get('msg'),error=request.args.get('error')=='1')
 
-
-@app.post("/sync")
+@app.post('/sync')
+@login_required
+@csrf_protected
 def sync():
-    cfg = load_config()
-    if not cfg.get("central_url"):
-        return redirect(
-            url_for("index", msg="central_url is not configured", error="1")
-        )
+    cfg=load_config()
+    if not cfg.get('central_url'): return redirect(url_for('index',msg='central_url is not configured',error='1'))
     try:
-        result = sync_gallery(cfg, GALLERY, SYNC_STATUS)
-        action = "updated" if result["changed"] else "already current"
-        message = (
-            f"Embedding gallery {action}: {result['employee_count']} employee(s), "
-            f"{result['embedding_count']} embedding(s)"
-        )
-        return redirect(url_for("index", msg=message))
-    except GalleryError as exc:
-        return redirect(url_for("index", msg=str(exc), error="1"))
+        r=sync_gallery(cfg,GALLERY,SYNC_STATUS); action='not modified' if r.get('not_modified') else 'updated' if r['changed'] else 'already current'; audit('embedding_sync',{'action':action,'version':r.get('gallery_version')}); return redirect(url_for('index',msg=f"Gallery {action}: {r['employee_count']} employees, {r['embedding_count']} embeddings"))
+    except GalleryError as e: audit('embedding_sync_failed',{'error':str(e)}); return redirect(url_for('index',msg=str(e),error='1'))
 
-
-@app.post("/upload")
+@app.post('/upload')
+@login_required
+@csrf_protected
 def upload():
-    cfg = load_config()
-    if not bool(cfg.get("local_enrollment_enabled", False)):
-        abort(403)
-    raw_employee = request.form.get("employee", "")
-    employee = secure_filename(raw_employee).replace("_", "-")
-    if not employee:
-        return redirect(url_for("index", msg="Employee ID is required", error="1"))
+    cfg=load_config()
+    if not cfg.get('local_enrollment_enabled'): abort(403)
+    employee=secure_filename(request.form.get('employee','')).replace('_','-')
+    if not employee: return redirect(url_for('index',msg='Employee ID is required',error='1'))
+    files=request.files.getlist('photos'); max_files=max(1,int(cfg.get('max_enrollment_files_per_request',20)))
+    if len(files)>max_files: return redirect(url_for('index',msg=f'Maximum {max_files} files',error='1'))
+    max_bytes=max(1024,int(cfg.get('max_enrollment_image_bytes',10485760))); max_pixels=max(1,int(cfg.get('max_enrollment_image_pixels',20000000))); folder=FACES/employee; folder.mkdir(parents=True,exist_ok=True); start=sum(p.suffix.lower() in ALLOWED for p in folder.iterdir()); saved=rejected=0
+    for f in files:
+        raw=f.read(max_bytes+1)
+        if Path(f.filename or '').suffix.lower() not in ALLOWED or not raw or len(raw)>max_bytes: rejected+=1; continue
+        image=cv2.imdecode(np.frombuffer(raw,dtype=np.uint8),cv2.IMREAD_COLOR)
+        if image is None or image.shape[0]*image.shape[1]>max_pixels: rejected+=1; continue
+        ok,data=cv2.imencode('.jpg',image,[cv2.IMWRITE_JPEG_QUALITY,95])
+        if not ok: rejected+=1; continue
+        saved+=1; (folder/f'{start+saved:03d}.jpg').write_bytes(data.tobytes())
+    audit('enrollment_upload',{'employee':employee,'saved':saved,'rejected':rejected}); return redirect(url_for('index',msg=f'Uploaded {saved}; rejected {rejected}'))
 
-    folder = FACES / employee
-    folder.mkdir(parents=True, exist_ok=True)
-    saved = 0
-    start = len(
-        [path for path in folder.iterdir() if path.suffix.lower() in ALLOWED]
-    )
-    for file in request.files.getlist("photos"):
-        suffix = Path(file.filename or "").suffix.lower()
-        if suffix not in ALLOWED:
-            continue
-        saved += 1
-        file.save(folder / f"{start + saved:03d}{suffix}")
-    return redirect(
-        url_for("index", msg=f"Uploaded {saved} image(s) for {employee}")
-    )
-
-
-@app.post("/build")
+@app.post('/build')
+@login_required
+@csrf_protected
 def build():
-    cfg = load_config()
-    if not bool(cfg.get("local_enrollment_enabled", False)):
-        abort(403)
-    result = subprocess.run(
-        [sys.executable, "face_attendance.py", "build"],
-        cwd=ROOT,
-        text=True,
-        capture_output=True,
-    )
-    if result.returncode == 0:
-        message = result.stdout.strip().splitlines()[-1] if result.stdout.strip() else "Embeddings rebuilt"
-        return redirect(url_for("index", msg=message))
-    message = (result.stderr or result.stdout or "Build failed").strip()[-500:]
-    return redirect(url_for("index", msg=message, error="1"))
+    cfg=load_config()
+    if not cfg.get('local_enrollment_enabled'): abort(403)
+    try: r=subprocess.run([sys.executable,'face_attendance.py','build'],cwd=ROOT,text=True,capture_output=True,timeout=max(60,int(cfg.get('embedding_build_timeout_seconds',1800))))
+    except subprocess.TimeoutExpired: audit('embedding_build_failed',{'error':'timeout'}); return redirect(url_for('index',msg='Build timed out',error='1'))
+    text=(r.stdout if r.returncode==0 else r.stderr or r.stdout or 'Build failed').strip(); msg=text.splitlines()[-1] if text else 'Embeddings rebuilt'; audit('embedding_build_succeeded' if r.returncode==0 else 'embedding_build_failed',{'message':msg[-500:]}); return redirect(url_for('index',msg=msg[-500:],error='1' if r.returncode else None))
 
-
-def _authorized_export(cfg):
-    expected = str(cfg.get("embedding_export_token") or "").strip()
-    if not expected or expected.upper() in {"CHANGE_ME", "REPLACE_ME", "CHANGEME"}:
-        return False
-    supplied = request.headers.get("Authorization", "")
-    return secrets.compare_digest(supplied, f"Bearer {expected}")
-
-
-@app.get("/api/faces/embeddings")
+def export_allowed(cfg):
+    expected=str(cfg.get('embedding_export_token') or '').strip(); return expected.upper() not in PLACEHOLDERS and secrets.compare_digest(request.headers.get('Authorization',''),f'Bearer {expected}')
+@app.get('/api/faces/embeddings')
 def export_embeddings():
-    cfg = load_config()
-    if not bool(cfg.get("embedding_export_enabled", False)):
-        abort(404)
-    if not _authorized_export(cfg):
-        abort(401)
+    cfg=load_config()
+    if not cfg.get('embedding_export_enabled'): abort(404)
+    if not export_allowed(cfg): abort(401)
+    try: p=payload(cfg)
+    except GalleryError as e: return jsonify(error=str(e)),503
+    requested=str(request.args.get('branch') or '').strip(); actual=str(p.get('branch') or '').strip()
+    if requested and requested!=actual: abort(404)
+    checksum=str(p['checksum']); r=make_response('',304) if request.if_none_match and request.if_none_match.contains(checksum) else make_response(jsonify(p)); r.headers['Cache-Control']='no-store'; r.headers['ETag']=f'"{checksum}"'; return r
 
-    try:
-        _, _, payload = load_gallery(
-            GALLERY,
-            expected_model=cfg.get("model"),
-            expected_model_version=cfg.get("model_version"),
-            expected_branch=cfg.get("branch_name"),
-            require_model_match=True,
-            require_model_version_match=bool(
-                cfg.get("require_model_version_match", False)
-            ),
-            allow_empty=False,
-        )
-    except GalleryError as exc:
-        return jsonify({"error": str(exc)}), 503
-
-    requested_branch = str(request.args.get("branch") or "").strip()
-    gallery_branch = str(payload.get("branch") or "").strip()
-    if requested_branch and requested_branch != gallery_branch:
-        abort(404)
-
-    response = make_response(jsonify(payload))
-    response.headers["Cache-Control"] = "no-store"
-    response.headers["ETag"] = f'"{payload["checksum"]}"'
-    return response
-
-
-if __name__ == "__main__":
-    cfg = load_config()
-    app.run(host="0.0.0.0", port=int(cfg.get("web_port", 8088)))
+if __name__=='__main__':
+    cfg=load_config(); app.run(host=str(cfg.get('web_bind_host','127.0.0.1')),port=int(cfg.get('web_port',8088)))
