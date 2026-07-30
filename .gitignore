@@ -10,14 +10,22 @@ cooldown_state.lock
 embedding_gallery.json
 embedding_sync_status.json
 embeddings.pkl
+model_manifest.json
 runtime_state.sqlite3
 runtime_state.sqlite3-wal
 runtime_state.sqlite3-shm
 .embedding_gallery.json.*
 .embedding_sync_status.json.*
+.model_manifest.json.*
 *.log
 *.out
 *.err
+
+# Local certificates and private keys
+*.key
+*.pem
+*.p12
+*.pfx
 
 # Camera/biometric data
 faces/

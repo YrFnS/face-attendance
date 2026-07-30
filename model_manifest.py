@@ -1,0 +1,311 @@
+import argparse
+import hashlib
+import json
+import os
+import tempfile
+from datetime import datetime, timezone
+from pathlib import Path
+
+
+SCHEMA_VERSION = 1
+PLACEHOLDERS = {"", "CHANGE_ME", "REPLACE_ME", "CHANGEME", "TODO"}
+
+
+def utc_now():
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def is_placeholder(value):
+    return str(value or "").strip().upper() in PLACEHOLDERS
+
+
+def resolve_path(root, value, default):
+    path = Path(value or default).expanduser()
+    return path if path.is_absolute() else Path(root) / path
+
+
+def default_model_directory(cfg):
+    model = str(cfg.get("model") or "buffalo_l").strip()
+    configured = str(cfg.get("model_directory") or "").strip()
+    if configured:
+        return Path(configured).expanduser()
+    return Path.home() / ".insightface" / "models" / model
+
+
+def sha256_file(path, chunk_size=1024 * 1024):
+    digest = hashlib.sha256()
+    size = 0
+    with Path(path).open("rb") as handle:
+        while True:
+            chunk = handle.read(chunk_size)
+            if not chunk:
+                break
+            size += len(chunk)
+            digest.update(chunk)
+    return digest.hexdigest(), size
+
+
+def _model_files(model_directory):
+    model_directory = Path(model_directory).expanduser().resolve()
+    files = []
+    for path in sorted(model_directory.rglob("*")):
+        if not path.is_file() or path.is_symlink() or path.name.startswith("."):
+            continue
+        relative = path.relative_to(model_directory).as_posix()
+        digest, size = sha256_file(path)
+        files.append({"path": relative, "sha256": digest, "size": size})
+    if not files:
+        raise ValueError(f"no model files found under {model_directory}")
+    return files
+
+
+def build_manifest(*, model_directory, model, model_version="", license_reference=""):
+    model_directory = Path(model_directory).expanduser().resolve()
+    reference = str(license_reference or "").strip()
+    if is_placeholder(reference):
+        raise ValueError("a non-placeholder license reference is required")
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "generated_at": utc_now(),
+        "model": str(model or "").strip(),
+        "model_version": str(model_version or "").strip(),
+        "license_reference": reference,
+        "model_directory": str(model_directory),
+        "files": _model_files(model_directory),
+    }
+
+
+def write_manifest_atomic(path, manifest):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    temp_path = Path(temp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(manifest, handle, ensure_ascii=False, indent=2)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temp_path, 0o600)
+        os.replace(temp_path, path)
+        os.chmod(path, 0o600)
+    finally:
+        try:
+            temp_path.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def verify_manifest(
+    manifest_path,
+    *,
+    expected_model=None,
+    expected_model_version=None,
+    expected_model_directory=None,
+    expected_license_reference=None,
+    require_complete=True,
+):
+    manifest_path = Path(manifest_path)
+    errors = []
+    warnings = []
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {
+            "ok": False,
+            "errors": [f"model manifest not found: {manifest_path}"],
+            "warnings": [],
+            "manifest_path": str(manifest_path),
+        }
+    except (OSError, json.JSONDecodeError) as exc:
+        return {
+            "ok": False,
+            "errors": [f"could not read model manifest {manifest_path}: {exc}"],
+            "warnings": [],
+            "manifest_path": str(manifest_path),
+        }
+
+    if not isinstance(manifest, dict):
+        return {
+            "ok": False,
+            "errors": ["model manifest must be a JSON object"],
+            "warnings": [],
+            "manifest_path": str(manifest_path),
+        }
+
+    if manifest.get("schema_version") != SCHEMA_VERSION:
+        errors.append(
+            f"unsupported model manifest schema {manifest.get('schema_version')!r}; "
+            f"expected {SCHEMA_VERSION}"
+        )
+
+    model = str(manifest.get("model") or "").strip()
+    version = str(manifest.get("model_version") or "").strip()
+    reference = str(manifest.get("license_reference") or "").strip()
+    if expected_model and model != str(expected_model).strip():
+        errors.append(f"model manifest names {model!r}; expected {expected_model!r}")
+    if expected_model_version is not None and version != str(expected_model_version or "").strip():
+        errors.append(
+            f"model manifest version {version!r}; expected {str(expected_model_version or '').strip()!r}"
+        )
+    if is_placeholder(reference):
+        errors.append("model manifest has no usable license_reference")
+    if expected_license_reference and reference != str(expected_license_reference).strip():
+        errors.append("model manifest license_reference does not match config")
+
+    directory_value = str(manifest.get("model_directory") or "").strip()
+    if not directory_value:
+        errors.append("model manifest has no model_directory")
+        model_directory = None
+    else:
+        model_directory = Path(directory_value).expanduser().resolve()
+        if expected_model_directory:
+            expected = Path(expected_model_directory).expanduser().resolve()
+            if model_directory != expected:
+                errors.append(
+                    f"model manifest directory {model_directory} does not match configured directory {expected}"
+                )
+        if not model_directory.exists() or not model_directory.is_dir():
+            errors.append(f"model directory is unavailable: {model_directory}")
+
+    entries = manifest.get("files")
+    if not isinstance(entries, list) or not entries:
+        errors.append("model manifest has no files")
+        entries = []
+
+    listed = set()
+    verified_count = 0
+    if model_directory and model_directory.is_dir():
+        for index, item in enumerate(entries):
+            if not isinstance(item, dict):
+                errors.append(f"files[{index}] must be an object")
+                continue
+            relative = str(item.get("path") or "").strip().replace("\\", "/")
+            if not relative or relative.startswith("/") or ".." in Path(relative).parts:
+                errors.append(f"files[{index}] has an unsafe path")
+                continue
+            if relative in listed:
+                errors.append(f"duplicate model file in manifest: {relative}")
+                continue
+            listed.add(relative)
+            expected_hash = str(item.get("sha256") or "").strip().lower()
+            try:
+                expected_size = int(item.get("size"))
+            except (TypeError, ValueError):
+                errors.append(f"invalid size for model file {relative}")
+                continue
+            path = (model_directory / relative).resolve()
+            try:
+                path.relative_to(model_directory)
+            except ValueError:
+                errors.append(f"model file escapes model directory: {relative}")
+                continue
+            if not path.is_file() or path.is_symlink():
+                errors.append(f"model file missing or unsafe: {relative}")
+                continue
+            actual_hash, actual_size = sha256_file(path)
+            if actual_size != expected_size:
+                errors.append(
+                    f"model file size mismatch for {relative}: {actual_size} != {expected_size}"
+                )
+            if actual_hash != expected_hash:
+                errors.append(f"model file SHA-256 mismatch for {relative}")
+            if actual_size == expected_size and actual_hash == expected_hash:
+                verified_count += 1
+
+        if require_complete:
+            actual = {
+                path.relative_to(model_directory).as_posix()
+                for path in model_directory.rglob("*")
+                if path.is_file() and not path.is_symlink() and not path.name.startswith(".")
+            }
+            unlisted = sorted(actual - listed)
+            missing = sorted(listed - actual)
+            if unlisted:
+                errors.append("unlisted model files are present: " + ", ".join(unlisted[:10]))
+            if missing:
+                errors.append("listed model files are absent: " + ", ".join(missing[:10]))
+
+    if entries and not any(str(item.get("path", "")).lower().endswith(".onnx") for item in entries if isinstance(item, dict)):
+        warnings.append("model manifest contains no ONNX files")
+
+    return {
+        "ok": not errors,
+        "errors": errors,
+        "warnings": warnings,
+        "manifest_path": str(manifest_path),
+        "model": model,
+        "model_version": version,
+        "license_reference": reference,
+        "model_directory": str(model_directory) if model_directory else "",
+        "file_count": len(entries),
+        "verified_file_count": verified_count,
+    }
+
+
+def load_config(path):
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+    except FileNotFoundError as exc:
+        raise SystemExit(f"missing config: {path}") from exc
+    except json.JSONDecodeError as exc:
+        raise SystemExit(f"invalid JSON in {path}: {exc}") from exc
+    if not isinstance(data, dict):
+        raise SystemExit("config must contain a JSON object")
+    return data
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Create or verify a pinned face-model manifest.")
+    parser.add_argument("--config", type=Path, default=Path(__file__).resolve().parent / "config.json")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    create = sub.add_parser("create")
+    create.add_argument("--model-dir", type=Path)
+    create.add_argument("--output", type=Path)
+    create.add_argument("--license-reference")
+
+    verify = sub.add_parser("verify")
+    verify.add_argument("--manifest", type=Path)
+    args = parser.parse_args()
+    cfg = load_config(args.config)
+    root = args.config.resolve().parent
+    model_dir = args.model_dir if args.command == "create" and args.model_dir else default_model_directory(cfg)
+    manifest_path = (
+        args.output
+        if args.command == "create" and args.output
+        else args.manifest
+        if args.command == "verify" and args.manifest
+        else resolve_path(root, cfg.get("model_manifest_path"), "model_manifest.json")
+    )
+
+    if args.command == "create":
+        reference = args.license_reference or cfg.get("model_license_reference")
+        try:
+            manifest = build_manifest(
+                model_directory=model_dir,
+                model=cfg.get("model", "buffalo_l"),
+                model_version=cfg.get("model_version", ""),
+                license_reference=reference,
+            )
+        except ValueError as exc:
+            raise SystemExit(str(exc)) from exc
+        write_manifest_atomic(manifest_path, manifest)
+        print(f"wrote {manifest_path}: {len(manifest['files'])} file(s)")
+        return
+
+    result = verify_manifest(
+        manifest_path,
+        expected_model=cfg.get("model", "buffalo_l"),
+        expected_model_version=cfg.get("model_version", ""),
+        expected_model_directory=default_model_directory(cfg),
+        expected_license_reference=cfg.get("model_license_reference"),
+        require_complete=bool(cfg.get("model_manifest_require_complete", True)),
+    )
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    if not result["ok"]:
+        raise SystemExit(1)
+
+
+if __name__ == "__main__":
+    main()

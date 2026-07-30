@@ -4,7 +4,7 @@ import time
 from pathlib import Path
 
 from pyftpdlib.authorizers import DummyAuthorizer
-from pyftpdlib.handlers import FTPHandler
+from pyftpdlib.handlers import FTPHandler, TLS_FTPHandler
 from pyftpdlib.servers import FTPServer
 
 
@@ -25,7 +25,7 @@ def load_config():
 
 
 def resolve_folder(value):
-    path = Path(value)
+    path = Path(value).expanduser()
     return path if path.is_absolute() else ROOT / path
 
 
@@ -44,7 +44,7 @@ def unique_destination(folder, filename):
         counter += 1
 
 
-class AtomicUploadHandler(FTPHandler):
+class AtomicUploadMixin:
     user_targets = {}
     max_upload_bytes = 20 * 1024 * 1024
 
@@ -94,6 +94,30 @@ class AtomicUploadHandler(FTPHandler):
         )
 
 
+class AtomicUploadHandler(AtomicUploadMixin, FTPHandler):
+    pass
+
+
+class AtomicTLSUploadHandler(AtomicUploadMixin, TLS_FTPHandler):
+    pass
+
+
+def configure_tls(cfg, handler):
+    if not bool(cfg.get("ftp_tls_enabled", False)):
+        return "ftp"
+    certfile = resolve_folder(cfg.get("ftp_tls_certfile", ""))
+    keyfile = resolve_folder(cfg.get("ftp_tls_keyfile", ""))
+    if not certfile.is_file():
+        raise SystemExit(f"FTPS certificate not found: {certfile}")
+    if not keyfile.is_file():
+        raise SystemExit(f"FTPS private key not found: {keyfile}")
+    handler.certfile = str(certfile)
+    handler.keyfile = str(keyfile)
+    handler.tls_control_required = bool(cfg.get("ftp_tls_control_required", True))
+    handler.tls_data_required = bool(cfg.get("ftp_tls_data_required", True))
+    return "ftps"
+
+
 def main():
     cfg = load_config()
     uploads = resolve_folder(cfg.get("camera_uploads_dir", ROOT / "camera_uploads"))
@@ -124,7 +148,7 @@ def main():
         authorizer.add_user(username, password, str(home), perm=permissions)
         targets[username] = target
 
-    handler = AtomicUploadHandler
+    handler = AtomicTLSUploadHandler if bool(cfg.get("ftp_tls_enabled", False)) else AtomicUploadHandler
     handler.authorizer = authorizer
     handler.user_targets = targets
     handler.max_upload_bytes = int(
@@ -132,6 +156,8 @@ def main():
     )
     handler.banner = "Face Attendance camera upload service"
     handler.timeout = int(cfg.get("ftp_client_timeout_seconds", 120))
+    protocol = configure_tls(cfg, handler)
+
     passive_start = int(cfg.get("ftp_passive_port_start", 30000))
     passive_end = int(cfg.get("ftp_passive_port_end", 30009))
     if passive_end < passive_start:
@@ -149,8 +175,10 @@ def main():
         1, int(cfg.get("ftp_max_connections_per_ip", 5))
     )
     print(
-        f"FTP receiver listening on {bind_host}:{port} -> {uploads}; "
-        f"staging={'on' if staging_enabled else 'off'}",
+        f"{protocol.upper()} receiver listening on {bind_host}:{port} -> {uploads}; "
+        f"staging={'on' if staging_enabled else 'off'}; "
+        f"tls_control_required={getattr(handler, 'tls_control_required', False)}; "
+        f"tls_data_required={getattr(handler, 'tls_data_required', False)}",
         flush=True,
     )
     server.serve_forever()

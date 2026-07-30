@@ -1,0 +1,22 @@
+{
+    email {$ACME_EMAIL}
+}
+
+{$FACE_ATTENDANCE_DOMAIN} {
+    encode zstd gzip
+
+    reverse_proxy 127.0.0.1:8088 {
+        transport http {
+            dial_timeout 3s
+            response_header_timeout 130s
+        }
+    }
+
+    log {
+        output file /var/log/caddy/face-attendance-access.log {
+            roll_size 10MiB
+            roll_keep 10
+            roll_keep_for 720h
+        }
+    }
+}

@@ -22,6 +22,7 @@ sudo rsync -a \
   --exclude embedding_gallery.json \
   --exclude embedding_sync_status.json \
   --exclude embeddings.pkl \
+  --exclude model_manifest.json \
   --exclude runtime_state.sqlite3 \
   --exclude runtime_state.sqlite3-wal \
   --exclude runtime_state.sqlite3-shm \
@@ -77,8 +78,10 @@ echo "Installed for service account: $SERVICE_USER:$SERVICE_GROUP"
 echo "Next steps:"
 echo "1. Edit $APP_DIR/config.json and replace all placeholder secrets."
 echo "2. Configure the admin login: sudo -u $SERVICE_USER $APP_DIR/.venv/bin/python $APP_DIR/manage_admin.py set-password"
-echo "3. Put Caddy/Nginx in front of 127.0.0.1:8088 with HTTPS."
-echo "4. Sync embeddings: sudo -u $SERVICE_USER $APP_DIR/.venv/bin/python $APP_DIR/sync_embeddings.py"
-echo "5. Validate old samples safely: sudo -u $SERVICE_USER $APP_DIR/.venv/bin/python $APP_DIR/watch_service.py --once --dry-run --allow-stale"
-echo "6. After controlled validation: sudo systemctl start face-attendance-watch"
-echo "7. Verify model licensing before commercial production use."
+echo "3. Deploy HTTPS using deploy/caddy or deploy/nginx and restrict camera ports using deploy/firewall."
+echo "4. Verify model licensing, then create the pinned manifest: sudo -u $SERVICE_USER $APP_DIR/.venv/bin/python $APP_DIR/model_manifest.py create"
+echo "5. Configure and validate the PAD/liveness service."
+echo "6. Sync embeddings: sudo -u $SERVICE_USER $APP_DIR/.venv/bin/python $APP_DIR/sync_embeddings.py"
+echo "7. Run readiness checks: sudo -u $SERVICE_USER $APP_DIR/.venv/bin/python $APP_DIR/production_readiness.py --strict"
+echo "8. Validate old samples safely: sudo -u $SERVICE_USER $APP_DIR/.venv/bin/python $APP_DIR/watch_service.py --once --dry-run --allow-stale"
+echo "9. After controlled validation, set production_mode=true and start face-attendance-watch."

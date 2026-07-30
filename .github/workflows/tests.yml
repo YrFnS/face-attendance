@@ -13,7 +13,7 @@ permissions:
 jobs:
   security-and-gallery-tests:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -40,6 +40,12 @@ jobs:
             test_secure_sync.py \
             test_runtime_state.py \
             test_web_security.py \
-            test_web_admin.py
-      - name: Validate shell scripts
-        run: bash -n install_linux.sh
+            test_web_admin.py \
+            test_model_manifest.py \
+            test_pad.py \
+            test_production_readiness.py
+      - name: Validate configuration and shell templates
+        run: |
+          python -m json.tool config.example.json >/dev/null
+          bash -n install_linux.sh
+          bash -n deploy/firewall/ufw-rules.example.sh

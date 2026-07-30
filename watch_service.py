@@ -7,6 +7,8 @@ from pathlib import Path
 import cv2
 
 import face_attendance as attendance
+from pad import PADConfigError, PADGate, PADResult
+from production_readiness import check_production_readiness, format_report
 from runtime_state import RuntimeState, file_sha256, make_event_id, resolve_runtime_path
 
 
@@ -121,7 +123,56 @@ def reject_file(path, reason, cfg, *, dry_run=False):
             remove_source(path, cfg)
 
 
-def process_path(path, app, known, gallery, cfg, state, *, dry_run=False, allow_stale=False):
+def evaluate_pad(image, app, cfg, pad_gate, context):
+    if not pad_gate.enabled and not pad_gate.required:
+        return None, None
+
+    detect_frame = attendance.scaled_frame(image, cfg)
+    faces = app.get(detect_frame)
+    if not faces:
+        return PADResult(False, None, pad_gate.provider, reason="no_face_for_pad"), None
+    if bool(cfg.get("pad_require_single_face", True)) and len(faces) != 1:
+        return (
+            PADResult(
+                False,
+                None,
+                pad_gate.provider,
+                reason=f"pad_expected_one_face_found_{len(faces)}",
+            ),
+            None,
+        )
+
+    face = max(
+        faces,
+        key=lambda item: (item.bbox[2] - item.bbox[0])
+        * (item.bbox[3] - item.bbox[1]),
+    )
+    width, height = attendance.face_size(face)
+    if (
+        width < int(cfg.get("min_face_width", 65))
+        or height < int(cfg.get("min_face_height", 80))
+        or float(face.det_score) < float(cfg.get("min_detection_score", 0.5))
+    ):
+        return PADResult(False, None, pad_gate.provider, reason="pad_face_quality"), None
+
+    crop = attendance.face_crop(
+        detect_frame, face, margin=float(cfg.get("pad_crop_margin", 0.25))
+    )
+    return pad_gate.evaluate(crop, context), crop
+
+
+def process_path(
+    path,
+    app,
+    known,
+    gallery,
+    cfg,
+    state,
+    pad_gate,
+    *,
+    dry_run=False,
+    allow_stale=False,
+):
     path = Path(path)
     try:
         if not attendance.wait_until_stable(path):
@@ -172,6 +223,38 @@ def process_path(path, app, known, gallery, cfg, state, *, dry_run=False, allow_
             reject_file(path, "image_too_large", cfg, dry_run=dry_run)
             return False
 
+        pad_result, pad_crop = evaluate_pad(
+            image,
+            app,
+            cfg,
+            pad_gate,
+            {
+                "camera_id": camera_id,
+                "log_type": log_type,
+                "event_id": event_id,
+                "source_name": path.name,
+                "source_sha256": source_sha256,
+            },
+        )
+        if pad_result is not None:
+            score_text = "-" if pad_result.score is None else f"{pad_result.score:.3f}"
+            attendance.log(
+                f"ftp:{path.name}: pad provider={pad_result.provider} "
+                f"passed={int(pad_result.passed)} score={score_text} "
+                f"reason={pad_result.reason or '-'} evidence={pad_result.evidence_id or '-'}"
+            )
+            if not pad_result.passed:
+                if claim:
+                    state.finish_event(
+                        event_id,
+                        status="rejected",
+                        error=f"pad:{pad_result.reason}"[:2000],
+                    )
+                if pad_crop is not None and getattr(pad_crop, "size", 0):
+                    attendance.save_rejected(pad_crop, "pad", cfg)
+                reject_file(path, "pad_rejected", cfg, dry_run=dry_run)
+                return False
+
         known = gallery.refresh()
         try:
             created = attendance.process_image(
@@ -206,11 +289,28 @@ def process_path(path, app, known, gallery, cfg, state, *, dry_run=False, allow_
 
 def run(*, once=False, dry_run=False, allow_stale=False):
     cfg = service_config()
-    if not bool(cfg.get("model_license_acknowledged", False)):
+    report = check_production_readiness(
+        cfg,
+        ROOT,
+        verify_model_files=bool(cfg.get("model_integrity_verify_on_start", True)),
+    )
+    for issue in report.issues:
         attendance.log(
-            "WARNING: model_license_acknowledged is false; verify recognition-model "
-            "licensing before commercial production use"
+            f"production readiness {issue.severity}: {issue.code}: {issue.message}"
         )
+    if bool(cfg.get("production_mode", False)) and not dry_run and report.blockers:
+        raise SystemExit("Production readiness check failed:\n" + format_report(report))
+
+    try:
+        pad_gate = PADGate(cfg)
+    except PADConfigError as exc:
+        if bool(cfg.get("pad_required", False)) or bool(cfg.get("production_mode", False)):
+            raise SystemExit(f"Invalid PAD configuration: {exc}") from exc
+        attendance.log(f"PAD disabled after configuration error: {exc}")
+        fallback = dict(cfg)
+        fallback.update(pad_provider="disabled", pad_required=False)
+        pad_gate = PADGate(fallback)
+
     folder = Path(cfg.get("camera_uploads_dir", ROOT / "camera_uploads"))
     folder.mkdir(parents=True, exist_ok=True)
     state = state_for_config(cfg)
@@ -220,7 +320,10 @@ def run(*, once=False, dry_run=False, allow_stale=False):
     attendance.cleanup_old_audit_files(cfg)
     state.prune_events(cfg.get("event_retention_days", 30))
     last_cleanup = time.monotonic()
-    attendance.log(f"secure folder watcher started: {folder}")
+    attendance.log(
+        f"secure folder watcher started: {folder}; pad={pad_gate.provider}; "
+        f"production_mode={int(bool(cfg.get('production_mode', False)))}"
+    )
 
     while True:
         created = False
@@ -234,6 +337,7 @@ def run(*, once=False, dry_run=False, allow_stale=False):
                     gallery,
                     cfg,
                     state,
+                    pad_gate,
                     dry_run=dry_run,
                     allow_stale=allow_stale,
                 )
