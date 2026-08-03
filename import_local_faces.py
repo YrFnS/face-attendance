@@ -1,3 +1,10 @@
+"""Migration helper for the trusted enrollment server only.
+
+Attendance servers should sync embedding_gallery.json and must not import employee
+reference photos. Enable local_enrollment_enabled explicitly before using this
+one-time migration tool.
+"""
+
 import argparse
 import json
 import shutil
@@ -14,7 +21,15 @@ REPORT = ROOT / "local_face_import_report.json"
 
 def load_config():
     cfg = json.loads(CONFIG.read_text(encoding="utf-8"))
-    missing = [key for key in ("frappe_url", "frappe_api_key", "frappe_api_secret") if not cfg.get(key)]
+    if not bool(cfg.get("local_enrollment_enabled", False)):
+        raise SystemExit(
+            "local face import is disabled; use embedding sync on attendance servers"
+        )
+    missing = [
+        key
+        for key in ("frappe_url", "frappe_api_key", "frappe_api_secret")
+        if not cfg.get(key)
+    ]
     if missing:
         raise SystemExit(f"missing Frappe config: {', '.join(missing)}")
     return cfg
@@ -35,7 +50,11 @@ def load_manifest(path):
         name = item.get("name")
         employee_id = item.get("emp_id")
         if name and employee_id and item.get("status") == "ok":
-            mapping[name] = {"name": employee_id, "employee_name": name, "source": "manifest"}
+            mapping[name] = {
+                "name": employee_id,
+                "employee_name": name,
+                "source": "manifest",
+            }
     return mapping
 
 
@@ -45,17 +64,25 @@ def find_employee(cfg, folder_name, manifest):
 
     url = cfg["frappe_url"].rstrip("/") + "/api/resource/Employee"
     params = {
-        "filters": json.dumps([["employee_name", "=", folder_name]], ensure_ascii=False),
+        "filters": json.dumps(
+            [["employee_name", "=", folder_name]], ensure_ascii=False
+        ),
         "fields": json.dumps(["name", "employee_name"], ensure_ascii=False),
         "limit_page_length": 2,
     }
-    response = requests.get(url, headers=frappe_headers(cfg), params=params, timeout=20)
+    response = requests.get(
+        url, headers=frappe_headers(cfg), params=params, timeout=20
+    )
     response.raise_for_status()
     return response.json().get("data", [])
 
 
 def image_files(folder):
-    return sorted(path for path in folder.iterdir() if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS)
+    return sorted(
+        path
+        for path in folder.iterdir()
+        if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS
+    )
 
 
 def copy_faces(source, dest, manifest_path, dry_run):
@@ -69,7 +96,9 @@ def copy_faces(source, dest, manifest_path, dry_run):
 
         files = image_files(folder)
         if not files:
-            report["skipped"].append({"folder": folder.name, "reason": "no supported images"})
+            report["skipped"].append(
+                {"folder": folder.name, "reason": "no supported images"}
+            )
             continue
 
         matches = find_employee(cfg, folder.name, manifest)
@@ -107,18 +136,40 @@ def copy_faces(source, dest, manifest_path, dry_run):
             }
         )
 
-    REPORT.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+    REPORT.write_text(
+        json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
     print(f"matched {len(report['copied'])} folder(s)")
     print(f"skipped {len(report['skipped'])} folder(s)")
     print(f"report: {REPORT}")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Import local employee face folders into faces/<employee-id>.")
-    parser.add_argument("--source", required=True, type=Path, help="Folder containing one subfolder per employee name.")
-    parser.add_argument("--dest", default=ROOT / "faces", type=Path, help="Destination faces folder.")
-    parser.add_argument("--manifest", type=Path, help="Optional enrollment_report.json with name/emp_id mappings.")
-    parser.add_argument("--dry-run", action="store_true", help="Only write the report; do not copy images.")
+    parser = argparse.ArgumentParser(
+        description=(
+            "Import local employee face folders into the trusted enrollment server."
+        )
+    )
+    parser.add_argument(
+        "--source",
+        required=True,
+        type=Path,
+        help="Folder containing one subfolder per employee name.",
+    )
+    parser.add_argument(
+        "--dest",
+        default=ROOT / "faces",
+        type=Path,
+        help="Destination faces folder.",
+    )
+    parser.add_argument(
+        "--manifest",
+        type=Path,
+        help="Optional enrollment_report.json with name/emp_id mappings.",
+    )
+    parser.add_argument(
+        "--dry-run", action="store_true", help="Write the report without copying."
+    )
     args = parser.parse_args()
 
     if not args.source.exists():

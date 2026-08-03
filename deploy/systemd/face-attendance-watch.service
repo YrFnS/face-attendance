@@ -1,13 +1,22 @@
 [Unit]
-Description=Face Attendance Folder Watcher
+Description=Face Attendance Replay-Resistant Folder Watcher
 After=network-online.target face-attendance-ftp.service
 Wants=network-online.target
 
 [Service]
+Type=simple
 WorkingDirectory=/opt/face-attendance
-ExecStart=/opt/face-attendance/.venv/bin/python -u face_attendance.py watch-folder
-Restart=always
+ExecStart=/opt/face-attendance/.venv/bin/python -u watch_service.py
+Restart=on-failure
 RestartSec=3
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
 
 [Install]
 WantedBy=multi-user.target
