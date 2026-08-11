@@ -281,7 +281,7 @@ def check_production_readiness(cfg, root, *, verify_model_files=True):
             )
         )
     for message in _ftp_permission_issues(cfg):
-        issues.append(ReadinessIsssue("ftp_permissions_unsafe", message))
+        issues.append(ReadinessIssue("ftp_permissions_unsafe", message))
 
     camera_ids = cfg.get("camera_ids") if isinstance(cfg.get("camera_ids"), dict) else {}
     in_id = _text(camera_ids.get("in"))
