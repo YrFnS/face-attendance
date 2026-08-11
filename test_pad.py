@@ -70,6 +70,12 @@ class PADTests(unittest.TestCase):
         self.assertFalse(result.passed)
         self.assertEqual(result.reason, "score_below_threshold")
 
+    def test_missing_score_fails_closed(self):
+        session = FakeSession(FakeResponse({"live": True}))
+        result = PADGate(self.config(), session=session).evaluate(self.image())
+        self.assertFalse(result.passed)
+        self.assertIn("explicit score", result.reason)
+
     def test_provider_error_fails_closed(self):
         session = FakeSession(error=requests.ConnectionError("offline"))
         result = PADGate(self.config(), session=session).evaluate(self.image())

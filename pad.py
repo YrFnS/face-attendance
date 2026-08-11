@@ -190,8 +190,9 @@ class PADGate:
                 live_value = payload.get("is_live")
             if not isinstance(live_value, bool):
                 raise ValueError("PAD response must contain a boolean live/passed/is_live field")
-            raw_score = payload.get("score", 1.0 if live_value else 0.0)
-            score = float(raw_score)
+            if "score" not in payload:
+                raise ValueError("PAD response must contain an explicit score field")
+            score = float(payload["score"])
             if not math.isfinite(score) or not 0 <= score <= 1:
                 raise ValueError("PAD score must be finite and between 0 and 1")
             passed = bool(live_value) and score >= self.min_score

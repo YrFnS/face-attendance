@@ -13,6 +13,9 @@ from model_manifest import (
 from pad import configuration_issues as pad_configuration_issues
 
 
+FTP_UPLOAD_ONLY_PERMISSIONS = frozenset("elw")
+
+
 @dataclass(frozen=True)
 class ReadinessIssue:
     code: str
@@ -81,6 +84,36 @@ def _admin_auth_configured(cfg):
         and len(session_secret) >= 32
         and not is_placeholder(session_secret)
     )
+
+
+def _ftp_permission_issues(cfg):
+    default_permissions = _text(cfg.get("ftp_permissions") or "elw")
+    configured_users = cfg.get("ftp_users")
+    rows = []
+    issues = []
+
+    if configured_users in (None, {}):
+        rows.append(("default FTP user", default_permissions))
+    elif not isinstance(configured_users, dict):
+        return ["ftp_users must be a JSON object"]
+    else:
+        for username, item in configured_users.items():
+            label = f"FTP user {_text(username) or '<empty>'}"
+            if not isinstance(item, dict):
+                issues.append(f"{label} configuration must be an object")
+                continue
+            rows.append((label, _text(item.get("permissions") or default_permissions)))
+
+    for label, permissions in rows:
+        if "w" not in permissions:
+            issues.append(f"{label} must include the upload permission 'w'")
+        unsupported = sorted(set(permissions) - FTP_UPLOAD_ONLY_PERMISSIONS)
+        if unsupported:
+            issues.append(
+                f"{label} grants non-upload permissions: {''.join(unsupported)}; "
+                "only e, l, and w are allowed"
+            )
+    return issues
 
 
 def check_production_readiness(cfg, root, *, verify_model_files=True):
@@ -239,6 +272,16 @@ def check_production_readiness(cfg, root, *, verify_model_files=True):
                     "ftp_tls_data_required must be true in production",
                 )
             )
+
+    if not bool(cfg.get("ftp_staging_enabled", True)):
+        issues.append(
+            ReadinessIssue(
+                "ftp_staging_disabled",
+                "ftp_staging_enabled must be true so the watcher cannot observe partial uploads",
+            )
+        )
+    for message in _ftp_permission_issues(cfg):
+        issues.append(ReadinessIsssue("ftp_permissions_unsafe", message))
 
     camera_ids = cfg.get("camera_ids") if isinstance(cfg.get("camera_ids"), dict) else {}
     in_id = _text(camera_ids.get("in"))

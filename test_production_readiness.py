@@ -61,6 +61,8 @@ class ProductionReadinessTests(unittest.TestCase):
             "ftp_tls_keyfile": str(self.key),
             "ftp_tls_control_required": True,
             "ftp_tls_data_required": True,
+            "ftp_staging_enabled": True,
+            "ftp_permissions": "elw",
             "camera_ids": {"in": "camera-in", "out": "camera-out"},
         }
 
@@ -89,6 +91,27 @@ class ProductionReadinessTests(unittest.TestCase):
         report = check_production_readiness(cfg, self.root)
         self.assertIn(
             "camera_transport_unprotected",
+            {issue.code for issue in report.blockers},
+        )
+
+    def test_disabled_ftp_staging_is_a_blocker(self):
+        cfg = self.valid_config()
+        cfg["ftp_staging_enabled"] = False
+        report = check_production_readiness(cfg, self.root)
+        self.assertIn(
+            "ftp_staging_disabled",
+            {issue.code for issue in report.blockers},
+        )
+
+    def test_non_upload_ftp_permissions_are_a_blocker(self):
+        cfg = self.valid_config()
+        cfg["ftp_users"] = {
+            "camera_in": {"permissions": "elrw"},
+            "camera_out": {"permissions": "elw"},
+        }
+        report = check_production_readiness(cfg, self.root)
+        self.assertIn(
+            "ftp_permissions_unsafe",
             {issue.code for issue in report.blockers},
         )
 

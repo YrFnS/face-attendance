@@ -42,17 +42,34 @@ sudo chmod 700 "$APP_DIR/faces" "$APP_DIR/camera_uploads" "$APP_DIR/logs"
 
 sudo cp "$APP_DIR"/deploy/systemd/*.service /etc/systemd/system/
 sudo cp "$APP_DIR"/deploy/systemd/*.timer /etc/systemd/system/
-for unit in \
-  face-attendance-ftp.service \
-  face-attendance-watch.service \
-  face-attendance-web.service \
-  face-attendance-sync.service
-do
-  dropin="/etc/systemd/system/${unit}.d"
+
+write_service_override() {
+  local unit="$1"
+  local command="$2"
+  local dropin="/etc/systemd/system/${unit}.d"
   sudo mkdir -p "$dropin"
-  printf '[Service]\nUser=%s\nGroup=%s\n' "$SERVICE_USER" "$SERVICE_GROUP" \
-    | sudo tee "$dropin/user.conf" >/dev/null
-done
+  {
+    printf '[Service]\n'
+    printf 'User=%s\n' "$SERVICE_USER"
+    printf 'Group=%s\n' "$SERVICE_GROUP"
+    printf 'WorkingDirectory="%s"\n' "$APP_DIR"
+    printf 'ExecStart=\n'
+    printf 'ExecStart=%s\n' "$command"
+  } | sudo tee "$dropin/00-face-attendance-install.conf" >/dev/null
+}
+
+write_service_override \
+  face-attendance-ftp.service \
+  "\"$APP_DIR/.venv/bin/python\" -u \"$APP_DIR/ftp_receiver.py\""
+write_service_override \
+  face-attendance-watch.service \
+  "\"$APP_DIR/.venv/bin/python\" -u \"$APP_DIR/watch_service.py\""
+write_service_override \
+  face-attendance-web.service \
+  "\"$APP_DIR/.venv/bin/gunicorn\" --config \"$APP_DIR/gunicorn.conf.py\" web_admin:app"
+write_service_override \
+  face-attendance-sync.service \
+  "\"$APP_DIR/.venv/bin/python\" -u \"$APP_DIR/sync_embeddings.py\" --scheduled"
 
 sudo systemctl daemon-reload
 sudo systemctl enable face-attendance-ftp face-attendance-watch face-attendance-web

@@ -97,7 +97,7 @@ def quarantine(path, reason, cfg, *, dry_run=False):
         try:
             shutil.move(str(source), str(destination))
             return destination
-        except FileNotFoundError:
+        except OSError:
             return None
 
 
@@ -121,6 +121,20 @@ def reject_file(path, reason, cfg, *, dry_run=False):
         attendance.log(f"ftp:{Path(path).name}: rejected reason={reason}")
         if bool(cfg.get("delete_rejected_camera_uploads", False)):
             remove_source(path, cfg)
+
+
+def finish_claim(state, claim, event_id, status, error=""):
+    if not claim or not claim.accepted:
+        return False
+    try:
+        state.finish_event(event_id, status=status, error=error)
+        return True
+    except Exception as exc:
+        attendance.log(
+            f"event-state finalization failed event={event_id or '-'} "
+            f"status={status}: {exc}"
+        )
+        return False
 
 
 def evaluate_pad(image, app, cfg, pad_gate, context):
@@ -174,6 +188,9 @@ def process_path(
     allow_stale=False,
 ):
     path = Path(path)
+    claim = None
+    event_id = ""
+    claim_finalized = False
     try:
         if not attendance.wait_until_stable(path):
             attendance.log(f"ftp:{path.name}: skipped unstable file")
@@ -186,7 +203,6 @@ def process_path(
         source_sha256, source_size = file_sha256(path, max_bytes=max_bytes)
         camera_id, log_type = camera_context(cfg, path)
         event_id = make_event_id(camera_id, log_type, source_sha256)
-        claim = None
         if not dry_run:
             claim = state.claim_event(
                 event_id=event_id,
@@ -211,15 +227,17 @@ def process_path(
 
         image = cv2.imread(str(path))
         if image is None:
-            if claim:
-                state.finish_event(event_id, status="rejected", error="unreadable_image")
+            claim_finalized = finish_claim(
+                state, claim, event_id, status="rejected", error="unreadable_image"
+            )
             reject_file(path, "unreadable_image", cfg, dry_run=dry_run)
             return False
         height, width = image.shape[:2]
         max_pixels = int(cfg.get("max_camera_image_pixels", 20_000_000))
         if max_pixels and width * height > max_pixels:
-            if claim:
-                state.finish_event(event_id, status="rejected", error="image_too_large")
+            claim_finalized = finish_claim(
+                state, claim, event_id, status="rejected", error="image_too_large"
+            )
             reject_file(path, "image_too_large", cfg, dry_run=dry_run)
             return False
 
@@ -244,12 +262,13 @@ def process_path(
                 f"reason={pad_result.reason or '-'} evidence={pad_result.evidence_id or '-'}"
             )
             if not pad_result.passed:
-                if claim:
-                    state.finish_event(
-                        event_id,
-                        status="rejected",
-                        error=f"pad:{pad_result.reason}"[:2000],
-                    )
+                claim_finalized = finish_claim(
+                    state,
+                    claim,
+                    event_id,
+                    status="rejected",
+                    error=f"pad:{pad_result.reason}"[:2000],
+                )
                 if pad_crop is not None and getattr(pad_crop, "size", 0):
                     attendance.save_rejected(pad_crop, "pad", cfg)
                 reject_file(path, "pad_rejected", cfg, dry_run=dry_run)
@@ -267,24 +286,45 @@ def process_path(
                 attach_source=path,
             )
         except Exception as exc:
-            if claim:
-                state.finish_event(event_id, status="failed", error=str(exc))
+            claim_finalized = finish_claim(
+                state, claim, event_id, status="failed", error=str(exc)
+            )
             attendance.log(f"ftp:{path.name}: processing failed event={event_id}: {exc}")
             reject_file(path, "processing_failed", cfg, dry_run=dry_run)
             return False
 
-        if claim:
-            state.finish_event(
-                event_id,
-                status="checkin_created" if created else "processed_no_checkin",
-            )
+        claim_finalized = finish_claim(
+            state,
+            claim,
+            event_id,
+            status="checkin_created" if created else "processed_no_checkin",
+        )
         if not dry_run:
             remove_source(path, cfg)
         return bool(created)
     except (FileNotFoundError, ValueError) as exc:
+        if claim and claim.accepted and not claim_finalized:
+            claim_finalized = finish_claim(
+                state,
+                claim,
+                event_id,
+                status="failed",
+                error=f"invalid_upload:{exc}",
+            )
         attendance.log(f"ftp:{path.name}: rejected before processing: {exc}")
         reject_file(path, "invalid_upload", cfg, dry_run=dry_run)
         return False
+    except Exception as exc:
+        if claim and claim.accepted and not claim_finalized:
+            finish_claim(
+                state,
+                claim,
+                event_id,
+                status="failed",
+                error=f"unexpected:{exc}",
+            )
+        attendance.log(f"ftp:{path.name}: unexpected processing error: {exc}")
+        raise
 
 
 def run(*, once=False, dry_run=False, allow_stale=False):

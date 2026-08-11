@@ -43,7 +43,9 @@ jobs:
             test_web_admin.py \
             test_model_manifest.py \
             test_pad.py \
-            test_production_readiness.py
+            test_production_readiness.py \
+            test_watch_service.py \
+            test_install_linux.py
       - name: Validate configuration and shell templates
         run: |
           python -m json.tool config.example.json >/dev/null
