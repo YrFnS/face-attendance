@@ -1,0 +1,199 @@
+    elif isinstance(vector, tuple):
+        vector = list(vector)
+    if not isinstance(vector, list):
+        raise GalleryError(f"{field} must be a one-dimensional vector")
+    dimension = len(vector)
+    if dimension <= 0 or dimension > MAX_EMBEDDING_DIMENSION:
+        raise GalleryError(
+            f"{field} dimension must be between 1 and {MAX_EMBEDDING_DIMENSION}"
+        )
+    clean = validate_embedding_vector(vector, field=field, dimension=dimension)
+    return norm(clean)
+
+
+def build_gallery_payload(
+    employees,
+    *,
+    model,
+    branch="",
+    model_version="",
+    gallery_version=None,
+):
+    if not isinstance(employees, (list, tuple)):
+        raise GalleryError("employees must be a list or tuple")
+    model = validate_token(model, "model", required=True)
+    model_version = validate_token(
+        model_version, "model_version", required=False
+    )
+    branch = validate_gallery_label(branch, "branch", required=False, max_chars=128)
+    if gallery_version is not None:
+        gallery_version = validate_token(
+            gallery_version, "gallery_version", required=True, max_chars=128
+        )
+
+    employee_rows = []
+    dimension = None
+    for index, item in enumerate(employees):
+        if not isinstance(item, dict):
+            raise GalleryError(f"employees[{index}] must be an object")
+        employee = validate_employee_id(
+            item.get("employee") or item.get("person"),
+            f"employees[{index}].employee",
+        )
+        employee_name = validate_employee_name(
+            item.get("employee_name"), f"employees[{index}].employee_name"
+        )
+        vectors = item.get("embeddings")
+        if vectors is None and item.get("embedding") is not None:
+            vectors = [item.get("embedding")]
+        if not isinstance(vectors, (list, tuple)) or not vectors:
+            continue
+        normalized = [
+            _local_vector(
+                vector,
+                field=f"employees[{index}].embeddings[{vector_index}]",
+            )
+            for vector_index, vector in enumerate(vectors)
+            if vector is not None
+        ]
+        if not normalized:
+            continue
+        current_dimension = int(normalized[0].size)
+        if dimension is None:
+            dimension = current_dimension
+        if current_dimension != dimension or any(
+            int(vector.size) != dimension for vector in normalized
+        ):
+            raise GalleryError(
+                f"embedding dimension mismatch for employee {employee}"
+            )
+        row = {
+            "employee": employee,
+            "embeddings": [vector.tolist() for vector in normalized],
+        }
+        if employee_name:
+            row["employee_name"] = employee_name
+        employee_rows.append(row)
+    if dimension is None:
+        raise GalleryError("cannot build a gallery without embeddings")
+    payload = {
+        "schema_version": SCHEMA_VERSION,
+        "gallery_version": gallery_version or utc_now(),
+        "generated_at": utc_now(),
+        "model": model,
+        "model_version": model_version,
+        "dimension": dimension,
+        "normalized": True,
+        "branch": branch,
+        "employees": employee_rows,
+    }
+    return validate_gallery(payload)[0]
+
+
+def _atomic_write_text(path, text, mode=0o600):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=str(path.parent))
+    temp_path = Path(temp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        try:
+            os.chmod(temp_path, mode)
+        except OSError:
+            pass
+        os.replace(temp_path, path)
+    finally:
+        try:
+            temp_path.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def write_gallery_atomic(
+    path,
+    payload,
+    *,
+    expected_model=None,
+    expected_model_version=None,
+    expected_branch=None,
+    require_model_match=True,
+    require_model_version_match=False,
+    allow_empty=False,
+    max_employees=10000,
+    max_embeddings_per_employee=50,
+    max_dimension=MAX_EMBEDDING_DIMENSION,
+    max_total_embeddings=MAX_TOTAL_EMBEDDINGS,
+):
+    sanitized, known, metadata = validate_gallery(
+        payload,
+        expected_model=expected_model,
+        expected_model_version=expected_model_version,
+        expected_branch=expected_branch,
+        require_model_match=require_model_match,
+        require_model_version_match=require_model_version_match,
+        allow_empty=allow_empty,
+        max_employees=max_employees,
+        max_embeddings_per_employee=max_embeddings_per_employee,
+        max_dimension=max_dimension,
+        max_total_embeddings=max_total_embeddings,
+    )
+    _atomic_write_text(
+        path,
+        json.dumps(
+            sanitized, ensure_ascii=False, indent=2, allow_nan=False
+        )
+        + "\n",
+    )
+    return known, metadata
+
+
+def load_gallery(
+    path,
+    *,
+    expected_model=None,
+    expected_model_version=None,
+    expected_branch=None,
+    require_model_match=True,
+    require_model_version_match=False,
+    allow_empty=False,
+    max_employees=10000,
+    max_embeddings_per_employee=50,
+    max_dimension=MAX_EMBEDDING_DIMENSION,
+    max_total_embeddings=MAX_TOTAL_EMBEDDINGS,
+):
+    path = Path(path)
+    try:
+        payload = strict_json_loads(
+            path.read_text(encoding="utf-8"),
+            field="embedding gallery",
+        )
+    except FileNotFoundError as exc:
+        raise GalleryError(f"embedding gallery not found: {path}") from exc
+    except (OSError, GalleryError) as exc:
+        raise GalleryError(f"could not read embedding gallery {path}: {exc}") from exc
+    sanitized, known, metadata = validate_gallery(
+        payload,
+        expected_model=expected_model,
+        expected_model_version=expected_model_version,
+        expected_branch=expected_branch,
+        require_model_match=require_model_match,
+        require_model_version_match=require_model_version_match,
+        allow_empty=allow_empty,
+        max_employees=max_employees,
+        max_embeddings_per_employee=max_embeddings_per_employee,
+        max_dimension=max_dimension,
+        max_total_embeddings=max_total_embeddings,
+    )
+    return known, metadata, sanitized
+
+
+def gallery_signature(path):
+    try:
+        stat = Path(path).stat()
+    except FileNotFoundError:
+        return None
+    return stat.st_mtime_ns, stat.st_size
+
