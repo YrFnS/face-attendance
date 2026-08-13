@@ -39,6 +39,7 @@ The camera still sends an image because it cannot send an InsightFace embedding.
 - `ftp_receiver.py` — receives camera FTP uploads.
 - `import_faces.py` — compatibility wrapper; now syncs embeddings instead of downloading images.
 - `docs/embedding-api.md` — API contract for an existing central dashboard.
+- `docs/attendance-platform-plan.md` — phased plan for durable delivery, camera policy, operator workflows, enrollment, biometric assurance, and production validation.
 
 ## Linux install
 
