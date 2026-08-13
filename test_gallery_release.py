@@ -83,6 +83,7 @@ class GalleryReleaseTests(unittest.TestCase):
     def test_changed_identity_is_rejected(self):
         signed = self.signed()
         signed["employees"][0]["employee"] = "HR-EMP-CHANGED"
+        signed.pop("checksum", None)
         signed, _, _ = validate_gallery(
             signed,
             expected_model="buffalo_l",
@@ -127,10 +128,8 @@ class GalleryReleaseTests(unittest.TestCase):
     def test_invalid_generated_at_is_rejected(self):
         unsigned = payload()
         unsigned["generated_at"] = "not-a-time"
-        unsigned, _, _ = validate_gallery(unsigned)
-        cfg = dict(self.cfg, production_mode=False, embedding_release_required=False)
         with self.assertRaisesRegex(GalleryError, "RFC 3339"):
-            validate_release(unsigned, cfg, now=self.now)
+            validate_gallery(unsigned)
 
     def test_scope_is_bound_to_source_branch_and_model(self):
         first, descriptor = release_scope(

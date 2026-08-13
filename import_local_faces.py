@@ -12,6 +12,13 @@ from pathlib import Path
 
 import requests
 
+from data_contract import (
+    GalleryError,
+    employee_directory,
+    safe_log_value,
+    validate_employee_id,
+    validate_employee_name,
+)
 
 ROOT = Path(__file__).resolve().parent
 CONFIG = ROOT / "config.json"
@@ -91,6 +98,11 @@ def copy_faces(source, dest, manifest_path, dry_run):
     report = {"copied": [], "skipped": []}
 
     for folder in sorted(source.iterdir(), key=lambda path: path.name):
+        if folder.is_symlink():
+            report["skipped"].append(
+                {"folder": safe_log_value(folder.name), "reason": "symlinked folder"}
+            )
+            continue
         if not folder.is_dir():
             continue
 
@@ -113,14 +125,30 @@ def copy_faces(source, dest, manifest_path, dry_run):
             )
             continue
 
-        employee_id = matches[0]["name"]
-        target = dest / employee_id
+        try:
+            employee_id = validate_employee_id(matches[0].get("name"))
+            employee_name = validate_employee_name(
+                matches[0].get("employee_name"), "employee_name"
+            )
+            target = employee_directory(dest, employee_id)
+        except GalleryError as exc:
+            report["skipped"].append(
+                {
+                    "folder": folder.name,
+                    "reason": str(exc),
+                    "image_count": len(files),
+                }
+            )
+            continue
         copied = []
         if not dry_run:
             target.mkdir(parents=True, exist_ok=True)
 
-        for file_path in files:
-            target_path = target / f"local_{file_path.name}"
+        for index, file_path in enumerate(files, start=1):
+            if file_path.is_symlink():
+                continue
+            suffix = file_path.suffix.lower()
+            target_path = target / f"local_{index:03d}{suffix}"
             if not dry_run and not target_path.exists():
                 shutil.copy2(file_path, target_path)
             copied.append(str(target_path))
@@ -129,9 +157,9 @@ def copy_faces(source, dest, manifest_path, dry_run):
             {
                 "folder": folder.name,
                 "employee": employee_id,
-                "employee_name": matches[0]["employee_name"],
+                "employee_name": employee_name,
                 "source": matches[0].get("source", "frappe"),
-                "image_count": len(files),
+                "image_count": len(copied),
                 "files": copied,
             }
         )
@@ -142,6 +170,7 @@ def copy_faces(source, dest, manifest_path, dry_run):
     print(f"matched {len(report['copied'])} folder(s)")
     print(f"skipped {len(report['skipped'])} folder(s)")
     print(f"report: {REPORT}")
+
 
 
 def main():

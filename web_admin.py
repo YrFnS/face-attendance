@@ -17,8 +17,11 @@ from flask import (
     session,
     url_for,
 )
-from werkzeug.utils import secure_filename
-
+from data_contract import (
+    employee_directory,
+    validate_employee_id,
+    validate_gallery_label,
+)
 from embedding_gallery import GalleryError, gallery_status, load_gallery, read_sync_status
 from production_readiness import check_production_readiness
 from runtime_policy import effective_gallery_options
@@ -328,16 +331,17 @@ def upload():
     cfg = load_config()
     if not cfg.get("local_enrollment_enabled"):
         abort(403)
-    employee = secure_filename(request.form.get("employee", "")).replace("_", "-")
-    if not employee:
-        return redirect(url_for("index", msg="Employee ID is required", error="1"))
+    try:
+        employee = validate_employee_id(request.form.get("employee"))
+        folder = employee_directory(FACES, employee)
+    except GalleryError as exc:
+        return redirect(url_for("index", msg=str(exc), error="1"))
     files = request.files.getlist("photos")
     max_files = max(1, int(cfg.get("max_enrollment_files_per_request", 20)))
     if len(files) > max_files:
         return redirect(url_for("index", msg=f"Maximum {max_files} files", error="1"))
     max_bytes = max(1024, int(cfg.get("max_enrollment_image_bytes", 10485760)))
     max_pixels = max(1, int(cfg.get("max_enrollment_image_pixels", 20000000)))
-    folder = FACES / employee
     folder.mkdir(parents=True, exist_ok=True)
     start = sum(path.suffix.lower() in ALLOWED for path in folder.iterdir())
     saved = rejected = 0
@@ -362,6 +366,7 @@ def upload():
         (folder / f"{start + saved:03d}.jpg").write_bytes(encoded.tobytes())
     audit("enrollment_upload", {"employee": employee, "saved": saved, "rejected": rejected})
     return redirect(url_for("index", msg=f"Uploaded {saved}; rejected {rejected}"))
+
 
 
 @app.post("/build")
@@ -419,8 +424,16 @@ def export_embeddings():
         data = payload(cfg)
     except GalleryError as exc:
         return jsonify(error=str(exc)), 503
-    requested = str(request.args.get("branch") or "").strip()
-    actual = str(data.get("branch") or "").strip()
+    try:
+        requested = validate_gallery_label(
+            request.args.get("branch"),
+            "branch",
+            required=False,
+            max_chars=128,
+        )
+    except GalleryError as exc:
+        return jsonify(error=str(exc)), 400
+    actual = str(data.get("branch") or "")
     if requested and requested != actual:
         abort(404)
     checksum = str(data["checksum"])
@@ -432,6 +445,7 @@ def export_embeddings():
     response.headers["Cache-Control"] = "no-store"
     response.headers["ETag"] = f'"{checksum}"'
     return response
+
 
 
 if __name__ == "__main__":

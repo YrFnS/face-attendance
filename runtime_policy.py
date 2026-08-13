@@ -9,6 +9,17 @@ from gallery_release import (
     release_policy_issues,
     validate_installed_release,
 )
+from data_contract import (
+    MAX_EMBEDDING_DIMENSION,
+    MAX_EMBEDDINGS_PER_EMPLOYEE,
+    MAX_GALLERY_EMPLOYEES,
+    MAX_TOTAL_EMBEDDINGS,
+    bounded_limit,
+    strict_int,
+    validate_gallery_label,
+    validate_token,
+    validate_url_path,
+)
 from model_manifest import is_placeholder
 
 
@@ -35,9 +46,25 @@ def gallery_policy_issues(cfg):
         return ()
 
     issues = []
-    branch = _text(cfg.get("branch_name"))
-    model = _text(cfg.get("model"))
-    model_version = _text(cfg.get("model_version"))
+    try:
+        branch = validate_gallery_label(
+            cfg.get("branch_name"), "branch_name", required=False, max_chars=128
+        )
+    except GalleryError as exc:
+        branch = ""
+        issues.append(("branch_name_invalid", str(exc)))
+    try:
+        model = validate_token(cfg.get("model"), "model", required=False)
+    except GalleryError as exc:
+        model = ""
+        issues.append(("model_name_invalid", str(exc)))
+    try:
+        model_version = validate_token(
+            cfg.get("model_version"), "model_version", required=False
+        )
+    except GalleryError as exc:
+        model_version = ""
+        issues.append(("model_version_invalid", str(exc)))
 
     if is_placeholder(branch):
         issues.append(
@@ -89,17 +116,44 @@ def gallery_policy_issues(cfg):
             )
         )
     try:
-        max_age = int(cfg.get("embedding_max_age_seconds", 0))
-    except (TypeError, ValueError):
-        max_age = 0
-    if max_age <= 0:
-        issues.append(
-            (
-                "gallery_max_age_invalid",
-                "embedding_max_age_seconds must be greater than zero in production",
-            )
+        strict_int(
+            cfg.get("embedding_max_age_seconds", 86400),
+            "embedding_max_age_seconds",
+            minimum=1,
+            maximum=(1 << 31) - 1,
         )
+    except GalleryError as exc:
+        issues.append(("gallery_max_age_invalid", str(exc)))
+
+    try:
+        bounded_limit(
+            cfg.get("max_gallery_employees"),
+            "max_gallery_employees",
+            10000,
+            MAX_GALLERY_EMPLOYEES,
+        )
+        bounded_limit(
+            cfg.get("max_embeddings_per_employee"),
+            "max_embeddings_per_employee",
+            50,
+            MAX_EMBEDDINGS_PER_EMPLOYEE,
+        )
+        bounded_limit(
+            cfg.get("max_embedding_dimension"),
+            "max_embedding_dimension",
+            MAX_EMBEDDING_DIMENSION,
+            MAX_EMBEDDING_DIMENSION,
+        )
+        bounded_limit(
+            cfg.get("max_gallery_embeddings"),
+            "max_gallery_embeddings",
+            MAX_TOTAL_EMBEDDINGS,
+            MAX_TOTAL_EMBEDDINGS,
+        )
+    except GalleryError as exc:
+        issues.append(("gallery_limits_invalid", str(exc)))
     return tuple(issues)
+
 
 
 def strict_profile_issues(cfg):
@@ -195,19 +249,49 @@ def effective_gallery_options(cfg):
         )
 
     strict = production_enabled(cfg)
-    max_employees = _positive_int(
-        cfg.get("max_gallery_employees"), "max_gallery_employees", 10000
+    endpoint_value = cfg.get("embedding_gallery_path")
+    validate_url_path(
+        endpoint_value if endpoint_value not in (None, "") else "/api/faces/embeddings",
+        "embedding_gallery_path",
     )
-    max_embeddings = _positive_int(
+    model = validate_token(
+        cfg.get("model") or "buffalo_l", "model", required=True
+    )
+    model_version = validate_token(
+        cfg.get("model_version"), "model_version", required=False
+    )
+    branch = validate_gallery_label(
+        cfg.get("branch_name"), "branch_name", required=False, max_chars=128
+    )
+    max_employees = bounded_limit(
+        cfg.get("max_gallery_employees"),
+        "max_gallery_employees",
+        10000,
+        MAX_GALLERY_EMPLOYEES,
+    )
+    max_embeddings = bounded_limit(
         cfg.get("max_embeddings_per_employee"),
         "max_embeddings_per_employee",
         50,
+        MAX_EMBEDDINGS_PER_EMPLOYEE,
+    )
+    max_dimension = bounded_limit(
+        cfg.get("max_embedding_dimension"),
+        "max_embedding_dimension",
+        MAX_EMBEDDING_DIMENSION,
+        MAX_EMBEDDING_DIMENSION,
+    )
+    max_total_embeddings = bounded_limit(
+        cfg.get("max_gallery_embeddings"),
+        "max_gallery_embeddings",
+        MAX_TOTAL_EMBEDDINGS,
+        MAX_TOTAL_EMBEDDINGS,
     )
 
     return {
-        "expected_model": _text(cfg.get("model") or "buffalo_l"),
-        "expected_model_version": _text(cfg.get("model_version")),
-        "expected_branch": _text(cfg.get("branch_name")),
+        "expected_model": model,
+        "expected_model_version": model_version,
+        "expected_branch": branch,
         "require_model_match": (
             True if strict else bool(cfg.get("require_model_match", True))
         ),
@@ -223,7 +307,10 @@ def effective_gallery_options(cfg):
         ),
         "max_employees": max_employees,
         "max_embeddings_per_employee": max_embeddings,
+        "max_dimension": max_dimension,
+        "max_total_embeddings": max_total_embeddings,
     }
+
 
 
 def _as_utc_datetime(value):
@@ -244,14 +331,14 @@ def gallery_freshness_status(cfg, generated_at, *, path="", now=None):
         current = current.replace(tzinfo=timezone.utc)
     current = current.astimezone(timezone.utc)
 
-    try:
-        max_age = int(cfg.get("embedding_max_age_seconds", 86400))
-    except (TypeError, ValueError) as exc:
-        raise GalleryError("embedding_max_age_seconds must be an integer") from exc
-    if max_age <= 0 and production_enabled(cfg):
-        raise GalleryError(
-            "embedding_max_age_seconds must be greater than zero in production"
-        )
+    max_age_value = cfg.get("embedding_max_age_seconds", 86400)
+    minimum = 1 if production_enabled(cfg) else 0
+    max_age = strict_int(
+        max_age_value,
+        "embedding_max_age_seconds",
+        minimum=minimum,
+        maximum=(1 << 31) - 1,
+    )
 
     age_seconds = max(0, int((current - generated).total_seconds()))
     stale = bool(max_age > 0 and age_seconds > max_age)
@@ -279,6 +366,7 @@ def gallery_freshness_status(cfg, generated_at, *, path="", now=None):
         "policy_valid": policy_valid,
         "error": error,
     }
+
 
 
 def enforce_gallery_freshness(cfg, generated_at, *, path="", now=None):
