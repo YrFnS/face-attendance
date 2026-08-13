@@ -34,6 +34,8 @@ The camera still sends an image because it cannot send an InsightFace embedding.
 
 - `face_attendance.py` — recognition/check-in helpers and legacy diagnostic commands that refuse live processing.
 - `watch_service.py` — production FTP watcher with readiness, PAD, replay protection, and event state.
+- `runtime_policy.py` — shared strict gallery/profile policy used by sync, readiness, the watcher, and the web UI.
+- `model_runtime.py` — binds InsightFace to the manifest-verified `root/models/<model>` directory.
 - `embedding_gallery.py` — validates, normalizes, stores, and reloads galleries.
 - `secure_sync.py` — authoritative bounded gallery-sync client with authenticated, same-origin redirect validation.
 - `sync_embeddings.py` — manual or continuous gallery synchronization.
@@ -84,9 +86,12 @@ The attendance server receives embeddings and should normally have local enrollm
   "embedding_sync_interval_seconds": 300,
   "embedding_max_age_seconds": 86400,
   "embedding_max_redirects": 3,
+  "reject_stale_embedding_gallery": true,
   "require_model_match": true,
+  "require_model_version_match": true,
   "local_enrollment_enabled": false,
-  "model": "buffalo_l"
+  "model": "buffalo_l",
+  "model_version": "APPROVED-MODEL-BUILD"
 }
 ```
 
@@ -104,6 +109,30 @@ python watch_service.py --once --dry-run --allow-stale
 ```
 
 The synchronization timer refreshes the gallery, and the production watcher loads valid changes without restarting. A failed, empty, wrong-branch, wrong-model, malformed, or dimension-incompatible gallery is rejected while the previous working gallery remains active.
+
+### Strict production profile
+
+When `production_mode` is true, the application applies one effective policy everywhere. The sync client checks it before making a network request, `/readyz` and the dashboard inspect the same branch/model/version/freshness rules, and the watcher loads only a gallery accepted by that policy.
+
+Production requires a non-placeholder `branch_name`, `model`, and `model_version`; exact model and model-version matching; a nonempty gallery; positive gallery age limits; stale-gallery rejection; complete startup model verification; per-event fail-closed PAD; and no insecure or unauthenticated service overrides. Configuration flags cannot silently weaken these controls while production mode is enabled.
+
+The configured model directory must use InsightFace's native layout:
+
+```text
+<insightface-root>/models/<model>
+```
+
+For example:
+
+```json
+{
+  "model": "buffalo_l",
+  "model_version": "APPROVED-MODEL-BUILD",
+  "model_directory": "/srv/face-models/models/buffalo_l"
+}
+```
+
+The manifest verifier checks that exact directory, and the same derived `/srv/face-models` root is passed to `FaceAnalysis`. Startup then verifies that InsightFace actually reports the expected model directory before any camera processing begins. The runtime therefore cannot verify one directory and silently load another.
 
 ## Trusted enrollment/export server
 

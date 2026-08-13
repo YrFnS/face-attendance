@@ -14,6 +14,7 @@ from embedding_gallery import (
     write_gallery_atomic,
     write_sync_status,
 )
+from runtime_policy import effective_gallery_options
 
 
 DEFAULT_ENDPOINT = "/api/faces/embeddings"
@@ -207,24 +208,11 @@ def _read_limited_json(response, max_bytes):
 
 
 def _gallery_options(cfg):
-    return {
-        "expected_model": cfg.get("model"),
-        "expected_model_version": cfg.get("model_version"),
-        "expected_branch": _text(cfg.get("branch_name")),
-        "require_model_match": bool(cfg.get("require_model_match", True)),
-        "require_model_version_match": bool(
-            cfg.get("require_model_version_match", False)
-        ),
-        "allow_empty": bool(cfg.get("allow_empty_embedding_gallery", False)),
-        "max_employees": int(cfg.get("max_gallery_employees", 10000)),
-        "max_embeddings_per_employee": int(
-            cfg.get("max_embeddings_per_employee", 50)
-        ),
-    }
+    return effective_gallery_options(cfg)
 
 
-def _local_metadata(gallery_path, cfg):
-    _, metadata, _ = load_gallery(gallery_path, **_gallery_options(cfg))
+def _local_metadata(gallery_path, options):
+    _, metadata, _ = load_gallery(gallery_path, **options)
     return metadata
 
 
@@ -258,11 +246,12 @@ def _result_from_metadata(
 
 def sync_gallery(cfg, gallery_path, status_path, session=requests, sleep=time.sleep):
     attempted_at = utc_now()
+    options = _gallery_options(cfg)
     requested_url = _validate_source(cfg)
     resolved_url = requested_url
     gallery_path = Path(gallery_path)
     status = read_sync_status(status_path)
-    branch = _text(cfg.get("branch_name"))
+    branch = options["expected_branch"]
     params = {"branch": branch} if branch else None
     retries = max(0, int(cfg.get("embedding_sync_retries", 2)))
     retry_base = max(0.1, float(cfg.get("embedding_retry_base_seconds", 1.0)))
@@ -283,7 +272,7 @@ def sync_gallery(cfg, gallery_path, status_path, session=requests, sleep=time.sl
                     cfg=cfg,
                 )
                 if response.status_code == 304:
-                    metadata = _local_metadata(gallery_path, cfg)
+                    metadata = _local_metadata(gallery_path, options)
                     etag = _text(response.headers.get("ETag")) or _text(
                         status.get("etag")
                     )
@@ -311,10 +300,10 @@ def sync_gallery(cfg, gallery_path, status_path, session=requests, sleep=time.sl
                     payload = payload["data"]
 
                 sanitized, _, metadata = validate_gallery(
-                    payload, **_gallery_options(cfg)
+                    payload, **options
                 )
                 try:
-                    current = _local_metadata(gallery_path, cfg)
+                    current = _local_metadata(gallery_path, options)
                     current_checksum = current.get("checksum")
                 except GalleryError:
                     current_checksum = None
@@ -322,7 +311,7 @@ def sync_gallery(cfg, gallery_path, status_path, session=requests, sleep=time.sl
                 changed = current_checksum != metadata.get("checksum")
                 if changed:
                     write_gallery_atomic(
-                        gallery_path, sanitized, **_gallery_options(cfg)
+                        gallery_path, sanitized, **options
                     )
                 etag = _text(response.headers.get("ETag"))
                 if not etag and metadata.get("checksum"):

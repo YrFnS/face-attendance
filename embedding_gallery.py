@@ -414,6 +414,8 @@ class GalleryReloader:
         require_model_match=True,
         require_model_version_match=False,
         allow_empty=False,
+        max_employees=10000,
+        max_embeddings_per_employee=50,
     ):
         self.path = Path(path)
         self.expected_model = expected_model
@@ -422,7 +424,10 @@ class GalleryReloader:
         self.require_model_match = require_model_match
         self.require_model_version_match = require_model_version_match
         self.allow_empty = allow_empty
+        self.max_employees = int(max_employees)
+        self.max_embeddings_per_employee = int(max_embeddings_per_employee)
         self.signature = None
+        self.updated_unix = 0.0
         self.known = []
         self.metadata = {}
 
@@ -438,8 +443,14 @@ class GalleryReloader:
             require_model_match=self.require_model_match,
             require_model_version_match=self.require_model_version_match,
             allow_empty=self.allow_empty,
+            max_employees=self.max_employees,
+            max_embeddings_per_employee=self.max_embeddings_per_employee,
         )
         self.known = known
         self.metadata = metadata
         self.signature = gallery_signature(self.path)
+        try:
+            self.updated_unix = self.path.stat().st_mtime
+        except OSError:
+            self.updated_unix = 0.0
         return self.known, self.metadata, True

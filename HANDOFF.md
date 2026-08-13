@@ -25,7 +25,8 @@ Employee reference photos no longer need to be copied to attendance servers.
 
 - The central gallery is JSON, never a downloaded pickle.
 - Every vector is checked for finite values, non-zero length, and exact dimension.
-- Current branch/model validation coverage and limitations are tracked in the [platform plan baseline](docs/attendance-platform-plan.md#4-current-baseline).
+- In production, one shared policy requires explicit branch, model, model version, nonempty/fresh gallery state, and exact compatibility in sync, readiness, web status, and watcher loading.
+- The manifest-verified `root/models/<model>` directory is the directory passed to and confirmed by the InsightFace runtime.
 - Empty or malformed galleries are rejected.
 - Updates are written atomically.
 - The watcher reloads a valid changed gallery without a service restart.

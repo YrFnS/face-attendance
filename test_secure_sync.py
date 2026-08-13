@@ -9,13 +9,13 @@ from embedding_gallery import load_gallery, read_sync_status
 from secure_sync import sync_gallery
 
 
-def payload(*, dimension=3, version="sync-test"):
+def payload(*, dimension=3, version="sync-test", model_version=""):
     return {
         "schema_version": 1,
         "gallery_version": version,
         "generated_at": "2026-07-29T00:00:00Z",
         "model": "buffalo_l",
-        "model_version": "",
+        "model_version": model_version,
         "dimension": dimension,
         "normalized": True,
         "branch": "Baghdad",
@@ -75,6 +75,18 @@ class SecureSyncTests(unittest.TestCase):
 
     def tearDown(self):
         self.temp.cleanup()
+
+    def strict_config(self):
+        return dict(
+            self.cfg,
+            production_mode=True,
+            model_version="v1",
+            require_model_match=True,
+            require_model_version_match=True,
+            allow_empty_embedding_gallery=False,
+            reject_stale_embedding_gallery=True,
+            embedding_max_age_seconds=3600,
+        )
 
     def test_sync_writes_gallery_and_etag(self):
         session = FakeSession(
@@ -298,6 +310,39 @@ class SecureSyncTests(unittest.TestCase):
             )
         self.assertEqual(len(session.calls), 2)
         self.assertTrue(second.closed)
+
+    def test_strict_policy_is_checked_before_network(self):
+        cfg = self.strict_config()
+        cfg["require_model_version_match"] = False
+        session = FakeSession([])
+        with self.assertRaisesRegex(Exception, "strict production gallery policy"):
+            sync_gallery(
+                cfg,
+                self.gallery,
+                self.status,
+                session=session,
+                sleep=lambda _: None,
+            )
+        self.assertEqual(session.calls, [])
+
+    def test_strict_remote_model_version_mismatch_is_rejected(self):
+        session = FakeSession(
+            [
+                FakeResponse(
+                    body=payload(model_version="v2"),
+                    headers={"Content-Type": "application/json"},
+                )
+            ]
+        )
+        with self.assertRaisesRegex(Exception, "model version mismatch"):
+            sync_gallery(
+                self.strict_config(),
+                self.gallery,
+                self.status,
+                session=session,
+                sleep=lambda _: None,
+            )
+        self.assertFalse(self.gallery.exists())
 
 
 if __name__ == "__main__":
