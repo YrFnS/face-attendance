@@ -21,6 +21,7 @@ from werkzeug.utils import secure_filename
 
 from embedding_gallery import GalleryError, gallery_status, load_gallery, read_sync_status
 from production_readiness import check_production_readiness
+from runtime_policy import effective_gallery_options
 from runtime_state import RuntimeState, resolve_runtime_path
 from secure_sync import sync_gallery
 from web_security import (
@@ -121,12 +122,7 @@ def audit(action, detail=None, actor=None):
 def payload(cfg):
     return load_gallery(
         GALLERY,
-        expected_model=cfg.get("model"),
-        expected_model_version=cfg.get("model_version"),
-        expected_branch=cfg.get("branch_name"),
-        require_model_match=bool(cfg.get("require_model_match", True)),
-        require_model_version_match=bool(cfg.get("require_model_version_match", False)),
-        allow_empty=bool(cfg.get("allow_empty_embedding_gallery", False)),
+        **effective_gallery_options(cfg),
     )[2]
 
 
@@ -146,7 +142,12 @@ def employees(cfg):
 
 
 def readiness(cfg):
-    return check_production_readiness(cfg, ROOT, verify_model_files=False)
+    return check_production_readiness(
+        cfg,
+        ROOT,
+        verify_model_files=False,
+        gallery_path=GALLERY,
+    )
 
 
 @app.after_request
@@ -162,19 +163,20 @@ def health():
 @app.get("/readyz")
 def ready():
     cfg = load_config()
-    gallery = gallery_status(
-        GALLERY, max_age_seconds=cfg.get("embedding_max_age_seconds", 86400)
-    )
+    report = readiness(cfg)
+    gallery = report.gallery
     reasons = []
     if not auth_configured(cfg):
         reasons.append("admin authentication is not configured")
-    if not gallery.get("available"):
-        reasons.append(gallery.get("error") or "gallery unavailable")
-    if gallery.get("stale") and cfg.get("reject_stale_embedding_gallery"):
-        reasons.append("gallery stale")
-    report = readiness(cfg)
+    if not gallery.get("available") or not gallery.get(
+        "policy_valid", False
+    ):
+        reasons.append(
+            gallery.get("error") or "gallery unavailable"
+        )
     if bool(cfg.get("production_mode", False)):
         reasons.extend(issue.message for issue in report.blockers)
+    reasons = list(dict.fromkeys(reasons))
     return (
         jsonify(
             ok=not reasons,
@@ -264,18 +266,18 @@ def logout():
 @login_required
 def index():
     cfg = load_config()
+    report = readiness(cfg)
     return render_template_string(
         HOME,
         style=STYLE,
         cfg=cfg,
-        readiness=readiness(cfg),
-        gallery=gallery_status(
-            GALLERY, max_age_seconds=cfg.get("embedding_max_age_seconds", 86400)
-        ),
+        readiness=report,
+        gallery=report.gallery,
         sync=read_sync_status(SYNC_STATUS),
         employees=employees(cfg),
         sync_enabled=bool(
-            cfg.get("embedding_sync_enabled", True) and cfg.get("central_url")
+            cfg.get("embedding_sync_enabled", True)
+            and cfg.get("central_url")
         ),
         enroll=bool(cfg.get("local_enrollment_enabled", False)),
         user=admin_user(),

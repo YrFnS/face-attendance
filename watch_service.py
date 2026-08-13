@@ -333,6 +333,7 @@ def run(*, once=False, dry_run=False, allow_stale=False):
         cfg,
         ROOT,
         verify_model_files=bool(cfg.get("model_integrity_verify_on_start", True)),
+        gallery_path=ROOT / "embedding_gallery.json",
     )
     for issue in report.issues:
         attendance.log(
@@ -354,7 +355,15 @@ def run(*, once=False, dry_run=False, allow_stale=False):
     folder = Path(cfg.get("camera_uploads_dir", ROOT / "camera_uploads"))
     folder.mkdir(parents=True, exist_ok=True)
     state = state_for_config(cfg)
-    app = attendance.face_app()
+    verified_model_directory = (
+        report.model_integrity.get("model_directory")
+        if report.model_integrity.get("ok")
+        else None
+    )
+    app = attendance.face_app(
+        cfg=cfg,
+        verified_model_directory=verified_model_directory,
+    )
     gallery = attendance.GalleryRuntime(cfg)
     known = gallery.start()
     attendance.cleanup_old_audit_files(cfg)

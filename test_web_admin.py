@@ -1,6 +1,7 @@
 import json
 import tempfile
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
 
@@ -19,9 +20,11 @@ def payload():
     return {
         "schema_version": 1,
         "gallery_version": "web-test",
-        "generated_at": "2026-07-29T00:00:00Z",
+        "generated_at": datetime.now(timezone.utc)
+        .isoformat()
+        .replace("+00:00", "Z"),
         "model": "buffalo_l",
-        "model_version": "",
+        "model_version": "v1",
         "dimension": 3,
         "normalized": True,
         "branch": "Baghdad",
@@ -42,6 +45,11 @@ class WebAdminTests(unittest.TestCase):
         self.config.write_text(json.dumps({
             "branch_name": "Baghdad",
             "model": "buffalo_l",
+            "model_version": "v1",
+            "require_model_match": True,
+            "require_model_version_match": True,
+            "reject_stale_embedding_gallery": True,
+            "embedding_max_age_seconds": 3600,
             "embedding_export_enabled": True,
             "embedding_export_token": "secret",
             "local_enrollment_enabled": False,
@@ -114,6 +122,19 @@ class WebAdminTests(unittest.TestCase):
     def test_state_change_rejects_missing_csrf(self):
         self.login()
         self.assertEqual(self.client.post("/logout").status_code, 400)
+
+    def test_readyz_uses_strict_branch_policy(self):
+        invalid = payload()
+        invalid["branch"] = "Basra"
+        write_gallery_atomic(self.gallery, invalid)
+        response = self.client.get("/readyz")
+        self.assertEqual(response.status_code, 503)
+        self.assertTrue(
+            any(
+                "branch mismatch" in reason
+                for reason in response.get_json()["reasons"]
+            )
+        )
 
 
 if __name__ == "__main__":

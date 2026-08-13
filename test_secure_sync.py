@@ -2,6 +2,7 @@ import base64
 import json
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import requests
@@ -86,7 +87,11 @@ class SecureSyncTests(unittest.TestCase):
             **self.cfg,
             "production_mode": True,
             "model_version": "approved-v1",
+            "require_model_match": True,
             "require_model_version_match": True,
+            "allow_empty_embedding_gallery": False,
+            "reject_stale_embedding_gallery": True,
+            "embedding_max_age_seconds": 86400,
             "embedding_release_publisher": "central-enrollment",
             "embedding_release_trusted_keys": {
                 "key-2026": {
@@ -414,6 +419,96 @@ class SecureSyncTests(unittest.TestCase):
             sleep=lambda _: None,
         )
         self.assertNotIn("If-None-Match", second.calls[0][1]["headers"])
+
+
+    def test_strict_policy_is_checked_before_network(self):
+        cfg = dict(
+            self.release_cfg,
+            branch_name="",
+        )
+        session = FakeSession([])
+        with self.assertRaisesRegex(
+            Exception, "strict production gallery policy"
+        ):
+            sync_gallery(
+                cfg,
+                self.gallery,
+                self.status,
+                session=session,
+                sleep=lambda _: None,
+            )
+        self.assertEqual(session.calls, [])
+
+    def test_release_policy_is_checked_before_network(self):
+        cfg = dict(
+            self.release_cfg,
+            embedding_release_trusted_keys={},
+        )
+        session = FakeSession([])
+        with self.assertRaisesRegex(
+            Exception, "release policy is invalid"
+        ):
+            sync_gallery(
+                cfg,
+                self.gallery,
+                self.status,
+                session=session,
+                sleep=lambda _: None,
+            )
+        self.assertEqual(session.calls, [])
+
+    def test_stale_signed_release_preserves_current_gallery(self):
+        current = self.signed(1)
+        write_gallery_atomic(
+            self.gallery,
+            current,
+            expected_model="buffalo_l",
+            expected_model_version="approved-v1",
+            expected_branch="Baghdad",
+            require_model_version_match=True,
+        )
+        old_time = (
+            datetime.now(timezone.utc) - timedelta(hours=3)
+        ).isoformat().replace("+00:00", "Z")
+        stale = sign_gallery_payload(
+            dict(
+                payload(version="stale-release"),
+                model_version="approved-v1",
+            ),
+            self.private,
+            publisher="central-enrollment",
+            key_id="key-2026",
+            sequence=2,
+            generated_at=old_time,
+            validation_options={
+                "expected_model": "buffalo_l",
+                "expected_model_version": "approved-v1",
+                "expected_branch": "Baghdad",
+                "require_model_version_match": True,
+            },
+        )
+        cfg = dict(
+            self.release_cfg,
+            embedding_max_age_seconds=60,
+        )
+        session = FakeSession(
+            [
+                FakeResponse(
+                    body=stale,
+                    headers={"Content-Type": "application/json"},
+                )
+            ]
+        )
+        with self.assertRaisesRegex(Exception, "gallery is stale"):
+            sync_gallery(
+                cfg,
+                self.gallery,
+                self.status,
+                session=session,
+                sleep=lambda _: None,
+            )
+        _, metadata, _ = load_gallery(self.gallery)
+        self.assertEqual(metadata["release_sequence"], 1)
 
     def test_304_without_scoped_state_is_rejected(self):
         write_gallery_atomic(self.gallery, payload())

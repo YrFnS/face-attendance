@@ -443,17 +443,38 @@ def gallery_status(path, *, max_age_seconds=None):
     try:
         _, metadata, sanitized = load_gallery(path, require_model_match=False)
         release = _validate_runtime_release(path, sanitized)
-        stat = path.stat()
-        age_seconds = max(0, int(datetime.now().timestamp() - stat.st_mtime))
-        max_age = int(max_age_seconds or 0)
+        context = _runtime_release_context(path)
+        if context is not None:
+            cfg, _ = context
+            cfg = dict(cfg)
+            if max_age_seconds is not None:
+                cfg["embedding_max_age_seconds"] = int(max_age_seconds)
+            from runtime_policy import gallery_freshness_status
+
+            freshness = gallery_freshness_status(
+                cfg,
+                metada.get("generated_at"),
+                path=path,
+            )
+        else:
+            stat = path.stat()
+            age_seconds = max(
+                0, int(datetime.now().timestamp() - stat.st_mtime)
+            )
+            max_age = int(max_age_seconds or 0)
+            freshness = {
+                "path": str(path),
+                "updated_at": datetime.fromtimestamp(
+                    stat.st_mtime, timezone.utc
+                ).isoformat().replace("+00:00", "Z"),
+                "age_seconds": age_seconds,
+                "stale": bool(max_age and age_seconds > max_age),
+                "policy_valid": True,
+                "error": "",
+            }
         result = {
             "available": True,
-            "path": str(path),
-            "updated_at": datetime.fromtimestamp(
-                stat.st_mtime, timezone.utc
-            ).isoformat().replace("+00:00", "Z"),
-            "age_seconds": age_seconds,
-            "stale": bool(max_age and age_seconds > max_age),
+            **freshness,
             **metadata,
         }
         if release is not None:
@@ -487,6 +508,8 @@ class GalleryReloader:
         require_model_match=True,
         require_model_version_match=False,
         allow_empty=False,
+        max_employees=10000,
+        max_embeddings_per_employee=50,
     ):
         self.path = Path(path)
         self.expected_model = expected_model
@@ -495,9 +518,13 @@ class GalleryReloader:
         self.require_model_match = require_model_match
         self.require_model_version_match = require_model_version_match
         self.allow_empty = allow_empty
+        self.max_employees = int(max_employees)
+        self.max_embeddings_per_employee = int(max_embeddings_per_employee)
         self.signature = None
         self.known = []
         self.metadata = {}
+        self.generated_at = ""
+        self.updated_unix = 0.0
 
     def reload(self, force=False):
         signature = gallery_signature(self.path)
@@ -511,11 +538,17 @@ class GalleryReloader:
             require_model_match=self.require_model_match,
             require_model_version_match=self.require_model_version_match,
             allow_empty=self.allow_empty,
+            max_employees=self.max_employees,
+            max_embeddings_per_employee=self.max_embeddings_per_employee,
         )
         release = _validate_runtime_release(self.path, sanitized)
         if release is not None:
             metadata = dict(metadata)
             metadata["release_validation"] = release
+        from gallery_release import parse_generated_at
+
+        self.generated_at = str(metadata.get("generated_at") or "")
+        self.updated_unix = parse_generated_at(self.generated_at).timestamp()
         self.known = known
         self.metadata = metadata
         self.signature = gallery_signature(self.path)

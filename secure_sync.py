@@ -16,11 +16,16 @@ from embedding_gallery import (
 )
 from gallery_release import (
     record_acceptance,
+    release_policy_issues,
     release_scope,
     scope_state,
     scoped_etag,
     validate_installed_release,
     validate_release,
+)
+from runtime_policy import (
+    effective_gallery_options,
+    enforce_gallery_freshness,
 )
 
 
@@ -216,33 +221,7 @@ def _read_limited_json(response, max_bytes):
 
 
 def _gallery_options(cfg):
-    production = bool(cfg.get("production_mode", False))
-    if production:
-        branch = _text(cfg.get("branch_name"))
-        model = _text(cfg.get("model"))
-        model_version = _text(cfg.get("model_version"))
-        if not branch or not model or not model_version:
-            raise GalleryError(
-                "production sync requires branch_name, model, and model_version"
-            )
-    return {
-        "expected_model": cfg.get("model"),
-        "expected_model_version": cfg.get("model_version"),
-        "expected_branch": _text(cfg.get("branch_name")),
-        "require_model_match": True
-        if production
-        else bool(cfg.get("require_model_match", True)),
-        "require_model_version_match": True
-        if production
-        else bool(cfg.get("require_model_version_match", False)),
-        "allow_empty": False
-        if production
-        else bool(cfg.get("allow_empty_embedding_gallery", False)),
-        "max_employees": int(cfg.get("max_gallery_employees", 10000)),
-        "max_embeddings_per_employee": int(
-            cfg.get("max_embeddings_per_employee", 50)
-        ),
-    }
+    return effective_gallery_options(cfg)
 
 
 def _local_gallery(gallery_path, cfg):
@@ -315,9 +294,15 @@ def _write_success_status(
 
 def sync_gallery(cfg, gallery_path, status_path, session=requests, sleep=time.sleep):
     attempted_at = utc_now()
+    gallery_options = _gallery_options(cfg)
+    release_issues = release_policy_issues(cfg)
+    if release_issues:
+        raise GalleryError(
+            "embedding release policy is invalid: "
+            + "; ".join(message for _, message in release_issues)
+        )
     requested_url = _validate_source(cfg)
     resolved_url = requested_url
-    gallery_options = _gallery_options(cfg)
     gallery_path = Path(gallery_path)
     status = read_sync_status(status_path)
     scope_id, descriptor = release_scope(requested_url, cfg)
@@ -356,6 +341,11 @@ def sync_gallery(cfg, gallery_path, status_path, session=requests, sleep=time.sl
                         status,
                         source_url=requested_url,
                     )
+                    freshness = enforce_gallery_freshness(
+                        cfg,
+                        metadata.get("generated_at"),
+                        path=gallery_path,
+                    )
                     etag = _text(response.headers.get("ETag")) or scoped_etag(
                         status, scope_id
                     )
@@ -369,6 +359,8 @@ def sync_gallery(cfg, gallery_path, status_path, session=requests, sleep=time.sl
                         scope_id=scope_id,
                         not_modified=True,
                     )
+                    result["gallery_age_seconds"] = freshness["age_seconds"]
+                    result["gallery_stale"] = freshness["stale"]
                     result["history_limit"] = int(
                         cfg.get("embedding_release_history_limit", 32)
                     )
@@ -403,6 +395,11 @@ def sync_gallery(cfg, gallery_path, status_path, session=requests, sleep=time.sl
                     cfg,
                     previous_release,
                 )
+                freshness = enforce_gallery_freshness(
+                    cfg,
+                    metadata.get("generated_at"),
+                    path=gallery_path,
+                )
                 try:
                     current_metadata, _ = _local_gallery(gallery_path, cfg)
                     current_checksum = current_metadata.get("checksum")
@@ -426,6 +423,8 @@ def sync_gallery(cfg, gallery_path, status_path, session=requests, sleep=time.sl
                     etag=etag,
                     scope_id=scope_id,
                 )
+                result["gallery_age_seconds"] = freshness["age_seconds"]
+                result["gallery_stale"] = freshness["stale"]
                 result["history_limit"] = int(
                     cfg.get("embedding_release_history_limit", 32)
                 )

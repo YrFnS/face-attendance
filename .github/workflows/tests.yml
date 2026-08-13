@@ -41,6 +41,8 @@ jobs:
             test_secure_sync.py \
             test_gallery_release.py \
             test_legacy_gallery_converter.py \
+            test_runtime_policy.py \
+            test_model_runtime.py \
             test_runtime_state.py \
             test_web_security.py \
             test_web_admin.py \
