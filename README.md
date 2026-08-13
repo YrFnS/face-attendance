@@ -32,7 +32,7 @@ The camera still sends an image because it cannot send an InsightFace embedding.
 
 ## Main files
 
-- `face_attendance.py` — recognition/check-in helpers and legacy watcher commands.
+- `face_attendance.py` — recognition/check-in helpers and legacy diagnostic commands that refuse live processing.
 - `watch_service.py` — production FTP watcher with readiness, PAD, replay protection, and event state.
 - `embedding_gallery.py` — validates, normalizes, stores, and reloads galleries.
 - `secure_sync.py` — authoritative bounded gallery-sync client with authenticated, same-origin redirect validation.
@@ -61,7 +61,7 @@ face-attendance-web
 face-attendance-sync.timer
 ```
 
-On a fresh installation, FTP and the web UI start, but the live watcher stays stopped until a valid embedding gallery exists. This prevents accidental checkin creation before enrollment is verified.
+On a fresh installation, FTP and the web UI start, but the live watcher stays stopped until a valid `embedding_gallery.json` exists. A legacy `embeddings.pkl` never enables the watcher. This prevents accidental checkin creation before enrollment is verified.
 
 Edit the runtime config and restart services:
 
@@ -264,7 +264,7 @@ python watch_service.py --dry-run
 python watch_service.py --once --dry-run --allow-stale
 ```
 
-`face_attendance.py watch` and `watch-folder` are legacy compatibility paths. Do not use them for live production processing because they bypass the production event ledger, PAD, and readiness gate.
+`watch_service.py` is the only supported live watcher. The legacy `face_attendance.py watch` and `watch-folder` commands fail closed unless `--dry-run` is present, because they do not provide the production readiness, PAD, replay, and event-ledger controls.
 
 Service status and logs:
 

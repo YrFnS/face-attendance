@@ -58,7 +58,7 @@ python sync_embeddings.py --status
 
 ## Camera event replay protection
 
-The production watcher is `watch_service.py`, not the legacy direct folder command. It computes a SHA-256 digest for each completed camera upload and claims an event in SQLite before recognition. The same binary image from the same camera cannot be processed again, including after a restart.
+The only supported live watcher is `watch_service.py`. Linux systemd and every bundled Windows launcher execute that entry point. The legacy commands refuse execution unless `--dry-run` is present, so they cannot silently bypass readiness, PAD, replay protection, or event state. The canonical watcher computes a SHA-256 digest for each completed camera upload and claims an event in SQLite before recognition. The same binary image from the same camera cannot be processed again, including after a restart.
 
 The fail-safe behavior is intentional: an event left in `processing` after an abnormal crash remains blocked rather than risking a duplicate attendance record. Review the state before manual recovery.
 

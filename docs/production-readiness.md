@@ -135,7 +135,7 @@ sudo systemctl start face-attendance-sync.service
 journalctl -u face-attendance-watch -n 200 --no-pager
 ```
 
-In production mode, a live watcher start is refused when license acknowledgement, model integrity, PAD, admin authentication, HTTPS acknowledgement, protected camera transport, camera IDs, or required HTTPS service URLs are invalid. Dry-run mode remains available for controlled setup and diagnostics.
+The systemd service and bundled Windows launchers must execute `watch_service.py`. The legacy watcher paths refuse non-dry-run execution. In production mode, a canonical live watcher start is refused when license acknowledgement, model integrity, PAD, admin authentication, HTTPS acknowledgement, protected camera transport, camera IDs, or required HTTPS service URLs are invalid. Dry-run mode remains available for controlled setup and diagnostics.
 
 ## 6. Controlled acceptance tests
 

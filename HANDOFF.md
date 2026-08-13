@@ -44,7 +44,7 @@ embedding_gallery.json
 embedding_sync_status.json
 ```
 
-Both are ignored by Git and written with restrictive file permissions where supported. `embeddings.pkl` is legacy local state only. It is converted once when no JSON gallery exists.
+Both are ignored by Git and written with restrictive file permissions where supported. `embeddings.pkl` is legacy local state only. Service startup never deserializes it; migration requires the explicit provenance-checked offline converter documented in the README.
 
 ## Roles
 
@@ -144,7 +144,7 @@ Before enabling live checkin creation:
 pgrep -af "watch_service.py|face_attendance.py (watch-folder|watch)|ftp_receiver.py|frigate|rtsp_face_gate.py|ffmpeg" || true
 ```
 
-Run only the intended FTP receiver and this repository's watcher. Do not run old Frigate/RTSP recognition workers in parallel.
+Run only the intended FTP receiver and the canonical `watch_service.py` watcher. Stop any legacy, Frigate, or RTSP recognition worker before live delivery.
 
 ## Safe deployment sequence
 

@@ -79,11 +79,11 @@ sudo systemctl enable --now face-attendance-sync.timer
 sudo systemctl restart face-attendance-ftp face-attendance-web
 
 # Do not start live check-in creation on a fresh installation without a gallery.
-if [ -s "$APP_DIR/embedding_gallery.json" ] || [ -s "$APP_DIR/embeddings.pkl" ]; then
+if [ -s "$APP_DIR/embedding_gallery.json" ]; then
   sudo systemctl restart face-attendance-watch
 else
   sudo systemctl stop face-attendance-watch 2>/dev/null || true
-  echo "Watcher left stopped: configure and sync a valid embedding gallery first."
+  echo "Watcher left stopped: configure and sync a valid embedding_gallery.json first; a legacy pickle does not enable live processing."
 fi
 
 if [ "$SERVICE_USER" = "root" ]; then
