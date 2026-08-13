@@ -1,0 +1,40 @@
+
+    sanitized = {
+        "schema_version": SCHEMA_VERSION,
+        "gallery_version": gallery_version,
+        "generated_at": generated_at,
+        "model": model,
+        "model_version": model_version,
+        "dimension": dimension,
+        "normalized": True,
+        "branch": branch,
+        "employees": sanitized_employees,
+    }
+    release = _sanitize_release(payload.get("release"))
+    if release is not None:
+        sanitized["release"] = release
+    calculated_checksum = _gallery_checksum(sanitized)
+    if "checksum" in payload and payload.get("checksum") is not None:
+        supplied_checksum = validate_checksum(payload.get("checksum"), "checksum")
+        if supplied_checksum != calculated_checksum:
+            raise GalleryError("embedding gallery checksum does not match its content")
+    sanitized["checksum"] = calculated_checksum
+
+    metadata = {
+        key: value for key, value in sanitized.items() if key != "employees"
+    }
+    metadata["employee_count"] = len(sanitized_employees)
+    metadata["embedding_count"] = embedding_count
+    if release is not None:
+        metadata.update(
+            release_sequence=release["sequence"],
+            release_publisher=release["publisher"],
+            release_key_id=release["key_id"],
+            release_algorithm=release["algorithm"],
+        )
+    return sanitized, known, metadata
+
+
+def _local_vector(vector, *, field):
+    if isinstance(vector, np.ndarray):
+        vector = vector.tolist()
