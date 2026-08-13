@@ -1,0 +1,200 @@
+import hashlib
+import json
+import os
+import tempfile
+from datetime import datetime, timezone
+from pathlib import Path
+
+import numpy as np
+
+from data_contract import (
+    GalleryError,
+    MAX_EMBEDDING_DIMENSION,
+    MAX_EMBEDDINGS_PER_EMPLOYEE,
+    MAX_GALLERY_EMPLOYEES,
+    MAX_RELEASE_SEQUENCE,
+    MAX_TOTAL_EMBEDDINGS,
+    canonical_timestamp,
+    strict_int,
+    strict_json_loads,
+    validate_base64url_text,
+    validate_checksum,
+    validate_display_text,
+    validate_employee_id,
+    validate_employee_name,
+    validate_embedding_vector,
+    validate_gallery_label,
+    validate_token,
+)
+
+
+SCHEMA_VERSION = 1
+_TOP_LEVEL_FIELDS = frozenset(
+    {
+        "schema_version",
+        "gallery_version",
+        "generated_at",
+        "model",
+        "model_version",
+        "dimension",
+        "normalized",
+        "branch",
+        "employees",
+        "release",
+        "checksum",
+    }
+)
+_EMPLOYEE_FIELDS = frozenset(
+    {"employee", "person", "employee_name", "embeddings", "embedding"}
+)
+_RELEASE_FIELDS = frozenset(
+    {"sequence", "publisher", "key_id", "algorithm", "signature"}
+)
+
+
+def utc_now():
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def norm(vector):
+    try:
+        array = np.asarray(vector, dtype=np.float32)
+    except (TypeError, ValueError) as exc:
+        raise GalleryError("embedding must contain numeric values") from exc
+    if array.ndim != 1 or array.size == 0:
+        raise GalleryError("embedding must be a non-empty one-dimensional vector")
+    if array.size > MAX_EMBEDDING_DIMENSION:
+        raise GalleryError(
+            f"embedding dimension exceeds hard maximum {MAX_EMBEDDING_DIMENSION}"
+        )
+    if not np.all(np.isfinite(array)):
+        raise GalleryError("embedding contains NaN or infinite values")
+    length = float(np.linalg.norm(array))
+    if not np.isfinite(length) or length <= 1e-12:
+        raise GalleryError("embedding has zero length")
+    return array / length
+
+
+def match_employee(known, embedding):
+    embedding = norm(embedding)
+    scores = []
+    for item in known:
+        vectors = item.get("embeddings") or [item["embedding"]]
+        best = max(float(np.dot(norm(vector), embedding)) for vector in vectors)
+        scores.append((best, item["employee"]))
+    scores.sort(reverse=True)
+    best_score, employee = scores[0] if scores else (0.0, None)
+    second_score = scores[1][0] if len(scores) > 1 else 0.0
+    return best_score, employee, best_score - second_score
+
+
+def _unexpected_fields(value, allowed, field):
+    unexpected = sorted(set(value) - set(allowed))
+    if unexpected:
+        raise GalleryError(
+            f"{field} contains unsupported field(s): {', '.join(unexpected)}"
+        )
+
+
+def _limit(value, field, default, hard_maximum):
+    if value is None:
+        value = default
+    return strict_int(value, field, minimum=1, maximum=hard_maximum)
+
+
+def _employee_value(item, index):
+    has_employee = "employee" in item and item.get("employee") is not None
+    has_person = "person" in item and item.get("person") is not None
+    if has_employee and has_person:
+        employee = validate_employee_id(
+            item.get("employee"), f"employees[{index}].employee"
+        )
+        person = validate_employee_id(
+            item.get("person"), f"employees[{index}].person"
+        )
+        if employee != person:
+            raise GalleryError(
+                f"employees[{index}] has conflicting employee and person values"
+            )
+        return employee
+    value = item.get("employee") if has_employee else item.get("person")
+    return validate_employee_id(value, f"employees[{index}].employee")
+
+
+def _vectors_value(item, index, employee):
+    has_many = "embeddings" in item and item.get("embeddings") is not None
+    has_one = "embedding" in item and item.get("embedding") is not None
+    if has_many and has_one:
+        raise GalleryError(
+            f"employees[{index}] must not contain both embedding and embeddings"
+        )
+    vectors = item.get("embeddings") if has_many else None
+    if vectors is None and has_one:
+        vectors = [item.get("embedding")]
+    if not isinstance(vectors, list) or not vectors:
+        raise GalleryError(f"employee {employee} has no embeddings")
+    return vectors
+
+
+def _sanitize_release(value):
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise GalleryError("release must be a JSON object")
+    _unexpected_fields(value, _RELEASE_FIELDS, "release")
+    sequence = strict_int(
+        value.get("sequence"),
+        "release.sequence",
+        minimum=1,
+        maximum=MAX_RELEASE_SEQUENCE,
+    )
+    publisher = validate_token(
+        value.get("publisher"), "release.publisher", required=True
+    )
+    key_id = validate_token(value.get("key_id"), "release.key_id", required=True)
+    algorithm = validate_token(
+        value.get("algorithm"), "release.algorithm", required=True, max_chars=32
+    ).lower()
+    signature = validate_base64url_text(
+        value.get("signature"),
+        field="release.signature",
+        expected_decoded_bytes=64,
+        max_chars=128,
+    )
+    return {
+        "sequence": sequence,
+        "publisher": publisher,
+        "key_id": key_id,
+        "algorithm": algorithm,
+        "signature": signature,
+    }
+
+
+def _gallery_checksum(payload):
+    checksum_payload = dict(payload)
+    checksum_payload.pop("checksum", None)
+    encoded = json.dumps(
+        checksum_payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def validate_gallery(
+    payload,
+    *,
+    expected_model=None,
+    expected_model_version=None,
+    expected_branch=None,
+    require_model_match=True,
+    require_model_version_match=False,
+    allow_empty=False,
+    max_employees=10000,
+    max_embeddings_per_employee=50,
+    max_dimension=MAX_EMBEDDING_DIMENSION,
+    max_total_embeddings=MAX_TOTAL_EMBEDDINGS,
+):
+    if not isinstance(payload, dict):
