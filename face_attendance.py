@@ -23,6 +23,13 @@ from embedding_gallery import (
     sync_gallery,
     write_gallery_atomic,
 )
+from model_runtime import ModelRuntimeError, create_face_analysis
+from runtime_policy import (
+    effective_gallery_options,
+    enforce_gallery_freshness,
+    inspect_gallery,
+    load_runtime_gallery,
+)
 from watcher_entrypoints import require_legacy_dry_run
 
 
@@ -57,16 +64,24 @@ def load_config():
         raise SystemExit(f"Invalid JSON in {CONFIG}: {exc}") from exc
 
 
-def face_app(det_size=None):
-    cfg = load_config()
+def face_app(
+    det_size=None,
+    *,
+    cfg=None,
+    verified_model_directory=None,
+):
+    cfg = cfg or load_config()
     det_size = int(det_size or cfg.get("det_size", 640))
-    app = FaceAnalysis(
-        name=cfg.get("model", "buffalo_l"),
-        allowed_modules=cfg.get("allowed_modules", ["detection", "recognition"]),
-        providers=["CPUExecutionProvider"],
-    )
-    app.prepare(ctx_id=-1, det_size=(det_size, det_size))
-    return app
+    try:
+        return create_face_analysis(
+            FaceAnalysis,
+            cfg,
+            ROOT,
+            det_size=det_size,
+            verified_model_directory=verified_model_directory,
+        )
+    except (ModelRuntimeError, ValueError) as exc:
+        raise SystemExit(f"Face model runtime validation failed: {exc}") from exc
 
 
 def scaled_frame(frame, cfg):
@@ -137,7 +152,7 @@ def save_checkin_image(crop, employee, score, cfg):
 def build_embeddings():
     cfg = load_config()
     FACES.mkdir(exist_ok=True)
-    app = face_app(cfg.get("build_det_size", 640))
+    app = face_app(cfg.get("build_det_size", 640), cfg=cfg)
     employees = []
     min_score = float(cfg.get("build_min_detection_score", 0.6))
 
@@ -184,17 +199,7 @@ def build_embeddings():
     _, metadata = write_gallery_atomic(
         EMBEDDINGS,
         payload,
-        expected_model=cfg.get("model", "buffalo_l"),
-        expected_model_version=cfg.get("model_version"),
-        expected_branch=cfg.get("branch_name", ""),
-        require_model_match=True,
-        require_model_version_match=bool(
-            cfg.get("require_model_version_match", False)
-        ),
-        allow_empty=False,
-        max_embeddings_per_employee=int(
-            cfg.get("max_embeddings_per_employee", 50)
-        ),
+        **effective_gallery_options(cfg),
     )
     print(
         f"saved {EMBEDDINGS}: {metadata['employee_count']} employee(s), "
@@ -206,7 +211,7 @@ def enroll_from_camera(employee, photos, delay):
     cfg = load_config()
     if not bool(cfg.get("local_enrollment_enabled", False)):
         raise SystemExit("Local image enrollment is disabled in config.json")
-    app = face_app()
+    app = face_app(cfg=cfg)
     out_dir = FACES / employee
     out_dir.mkdir(parents=True, exist_ok=True)
     cap = cv2.VideoCapture(cfg["camera_url"], cv2.CAP_FFMPEG)
@@ -257,18 +262,7 @@ def migrate_legacy_embeddings(cfg):
 def load_embeddings():
     cfg = load_config()
     migrate_legacy_embeddings(cfg)
-    reloader = GalleryReloader(
-        EMBEDDINGS,
-        expected_model=cfg.get("model", "buffalo_l"),
-        expected_model_version=cfg.get("model_version"),
-        expected_branch=cfg.get("branch_name", ""),
-        require_model_match=bool(cfg.get("require_model_match", True)),
-        require_model_version_match=bool(
-            cfg.get("require_model_version_match", False)
-        ),
-        allow_empty=bool(cfg.get("allow_empty_embedding_gallery", False)),
-    )
-    known, _, _ = reloader.reload(force=True)
+    known, _, _, _ = load_runtime_gallery(cfg, EMBEDDINGS)
     return known
 
 
@@ -279,14 +273,7 @@ class GalleryRuntime:
         self.rejected_signature = None
         self.reloader = GalleryReloader(
             EMBEDDINGS,
-            expected_model=cfg.get("model", "buffalo_l"),
-            expected_model_version=cfg.get("model_version"),
-            expected_branch=cfg.get("branch_name", ""),
-            require_model_match=bool(cfg.get("require_model_match", True)),
-            require_model_version_match=bool(
-                cfg.get("require_model_version_match", False)
-            ),
-            allow_empty=bool(cfg.get("allow_empty_embedding_gallery", False)),
+            **effective_gallery_options(cfg),
         )
 
     def sync_enabled(self):
@@ -316,29 +303,31 @@ class GalleryRuntime:
             log(f"embedding sync failed; keeping current gallery: {exc}")
 
     def check_freshness(self):
-        max_age = int(self.cfg.get("embedding_max_age_seconds", 86400))
-        status = gallery_status(EMBEDDINGS, max_age_seconds=max_age)
+        status = enforce_gallery_freshness(
+            self.cfg,
+            self.reloader.generated_at,
+            path=EMBEDDINGS,
+        )
         if status.get("stale"):
-            message = (
-                f"embedding gallery is stale: age={status['age_seconds']}s "
-                f"max={max_age}s"
+            log(
+                "embedding gallery is stale but permitted outside strict "
+                f"production: age={status['age_seconds']}s "
+                f"max={status['max_age_seconds']}s"
             )
-            if bool(self.cfg.get("reject_stale_embedding_gallery", False)):
-                raise GalleryError(message)
-            log(message)
+        return status
 
     def start(self):
         migrate_legacy_embeddings(self.cfg)
         self.maybe_sync(force=True)
         try:
             known, metadata, _ = self.reloader.reload(force=True)
+            self.check_freshness()
         except GalleryError as exc:
             raise SystemExit(
                 f"No valid embedding gallery is available: {exc}. "
                 "Run 'python sync_embeddings.py' or enable local enrollment and run "
                 "'python face_attendance.py build'."
             ) from exc
-        self.check_freshness()
         log(
             f"embedding gallery loaded: version={metadata.get('gallery_version')} "
             f"employees={metadata.get('employee_count')} "
@@ -350,6 +339,7 @@ class GalleryRuntime:
         self.maybe_sync()
         try:
             known, metadata, changed = self.reloader.reload()
+            self.check_freshness()
             self.rejected_signature = None
             if changed:
                 log(
@@ -362,7 +352,10 @@ class GalleryRuntime:
             if self.reloader.known:
                 rejected_signature = gallery_signature(EMBEDDINGS)
                 if rejected_signature != self.rejected_signature:
-                    log(f"embedding reload rejected; keeping previous gallery: {exc}")
+                    log(
+                        "embedding reload rejected; keeping previous gallery: "
+                        f"{exc}"
+                    )
                     self.rejected_signature = rejected_signature
                 return self.reloader.known
             raise
@@ -841,10 +834,7 @@ def print_embedding_status():
     cfg = load_config()
     print(
         json.dumps(
-            gallery_status(
-                EMBEDDINGS,
-                max_age_seconds=cfg.get("embedding_max_age_seconds", 86400),
-            ),
+            inspect_gallery(cfg, EMBEDDINGS),
             ensure_ascii=False,
             indent=2,
         )

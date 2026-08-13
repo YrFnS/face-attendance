@@ -5,12 +5,14 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 from model_manifest import (
-    default_model_directory,
     is_placeholder,
     resolve_path,
+    runtime_model_binding,
     verify_manifest,
 )
 from pad import configuration_issues as pad_configuration_issues
+from runtime_policy import inspect_gallery, strict_profile_issues
+from web_security import auth_configuration_issues
 
 
 FTP_UPLOAD_ONLY_PERMISSIONS = frozenset("elw")
@@ -29,10 +31,13 @@ class ReadinessReport:
     ready: bool
     issues: tuple[ReadinessIssue, ...]
     model_integrity: dict
+    gallery: dict
 
     @property
     def blockers(self):
-        return tuple(issue for issue in self.issues if issue.severity == "blocker")
+        return tuple(
+            issue for issue in self.issues if issue.severity == "blocker"
+        )
 
     def to_dict(self):
         return {
@@ -40,6 +45,7 @@ class ReadinessReport:
             "ready": self.ready,
             "issues": [asdict(issue) for issue in self.issues],
             "model_integrity": self.model_integrity,
+            "gallery": self.gallery,
         }
 
 
@@ -64,26 +70,18 @@ def _https_issue(cfg, key, allow_key, code, label):
         return None
     parsed = urlparse(value)
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-        return ReadinessIssue(code, f"{label} must be an absolute HTTP(S) URL")
+        return ReadinessIssue(
+            code, f"{label} must be an absolute HTTP(S) URL"
+        )
     if (
         parsed.scheme != "https"
         and not _is_local_url(value)
         and not bool(cfg.get(allow_key, False))
     ):
-        return ReadinessIssue(code, f"{label} must use HTTPS outside localhost")
+        return ReadinessIssue(
+            code, f"{label} must use HTTPS outside localhost"
+        )
     return None
-
-
-def _admin_auth_configured(cfg):
-    username = _text(cfg.get("web_admin_username"))
-    password_hash = _text(cfg.get("web_admin_password_hash"))
-    session_secret = _text(cfg.get("web_session_secret"))
-    return bool(
-        username
-        and password_hash.startswith("scrypt$")
-        and len(session_secret) >= 32
-        and not is_placeholder(session_secret)
-    )
 
 
 def _ftp_permission_issues(cfg):
@@ -102,21 +100,36 @@ def _ftp_permission_issues(cfg):
             if not isinstance(item, dict):
                 issues.append(f"{label} configuration must be an object")
                 continue
-            rows.append((label, _text(item.get("permissions") or default_permissions)))
+            rows.append(
+                (
+                    label,
+                    _text(item.get("permissions") or default_permissions),
+                )
+            )
 
     for label, permissions in rows:
         if "w" not in permissions:
-            issues.append(f"{label} must include the upload permission 'w'")
-        unsupported = sorted(set(permissions) - FTP_UPLOAD_ONLY_PERMISSIONS)
+            issues.append(
+                f"{label} must include the upload permission 'w'"
+            )
+        unsupported = sorted(
+            set(permissions) - FTP_UPLOAD_ONLY_PERMISSIONS
+        )
         if unsupported:
             issues.append(
-                f"{label} grants non-upload permissions: {''.join(unsupported)}; "
-                "only e, l, and w are allowed"
+                f"{label} grants non-upload permissions: "
+                f"{''.join(unsupported)}; only e, l, and w are allowed"
             )
     return issues
 
 
-def check_production_readiness(cfg, root, *, verify_model_files=True):
+def check_production_readiness(
+    cfg,
+    root,
+    *,
+    verify_model_files=True,
+    gallery_path=None,
+):
     root = Path(root)
     production_mode = bool(cfg.get("production_mode", False))
     issues = []
@@ -129,6 +142,9 @@ def check_production_readiness(cfg, root, *, verify_model_files=True):
                 severity="warning",
             )
         )
+
+    for code, message in strict_profile_issues(cfg):
+        issues.append(ReadinessIssue(code, message))
 
     if not bool(cfg.get("model_license_acknowledged", False)):
         issues.append(
@@ -146,31 +162,72 @@ def check_production_readiness(cfg, root, *, verify_model_files=True):
             )
         )
 
+    try:
+        binding = runtime_model_binding(cfg, root)
+    except ValueError as exc:
+        binding = {}
+        issues.append(
+            ReadinessIssue("model_runtime_binding_invalid", str(exc))
+        )
+
     model_manifest_path = resolve_path(
         root, cfg.get("model_manifest_path"), "model_manifest.json"
     )
-    if verify_model_files:
-        integrity = verify_manifest(
-            model_manifest_path,
-            expected_model=cfg.get("model", "buffalo_l"),
-            expected_model_version=cfg.get("model_version", ""),
-            expected_model_directory=default_model_directory(cfg),
-            expected_license_reference=license_reference or None,
-            require_complete=bool(cfg.get("model_manifest_require_complete", True)),
+    integrity = verify_manifest(
+        model_manifest_path,
+        expected_model=cfg.get("model"),
+        expected_model_version=cfg.get("model_version"),
+        expected_model_directory=binding.get("model_directory"),
+        expected_license_reference=license_reference or None,
+        require_complete=bool(
+            cfg.get("model_manifest_require_complete", True)
+        ),
+        verify_files=verify_model_files,
+    )
+    if binding:
+        integrity.setdefault(
+            "configured_model_directory", binding["model_directory"]
         )
-        for message in integrity.get("errors", []):
-            issues.append(ReadinessIssue("model_integrity_failed", message))
-        for message in integrity.get("warnings", []):
-            issues.append(ReadinessIssue("model_integrity_warning", message, severity="warning"))
-    else:
-        integrity = {
-            "ok": None,
-            "manifest_path": str(model_manifest_path),
-            "skipped": True,
-        }
+        integrity.setdefault(
+            "configured_insightface_root", binding["insightface_root"]
+        )
+    for message in integrity.get("errors", []):
+        issues.append(ReadinessIssue("model_integrity_failed", message))
+    for message in integrity.get("warnings", []):
+        issues.append(
+            ReadinessIssue(
+                "model_integrity_warning",
+                message,
+                severity="warning",
+            )
+        )
+
+    gallery_path = (
+        Path(gallery_path)
+        if gallery_path is not None
+        else root / "embedding_gallery.json"
+    )
+    gallery = inspect_gallery(cfg, gallery_path)
+    if not gallery.get("available"):
+        issues.append(
+            ReadinessIssue(
+                "embedding_gallery_invalid",
+                gallery.get("error") or "embedding gallery is unavailable",
+            )
+        )
+    elif not gallery.get("policy_valid", False):
+        issues.append(
+            ReadinessIssue(
+                "embedding_gallery_policy_failed",
+                gallery.get("error")
+                or "embedding gallery does not satisfy runtime policy",
+            )
+        )
 
     for message in pad_configuration_issues(cfg):
-        issues.append(ReadinessIssue("pad_configuration_invalid", message))
+        issues.append(
+            ReadinessIssue("pad_configuration_invalid", message)
+        )
     if not bool(cfg.get("pad_required", False)):
         issues.append(
             ReadinessIssue(
@@ -193,12 +250,9 @@ def check_production_readiness(cfg, root, *, verify_model_files=True):
             )
         )
 
-    if not _admin_auth_configured(cfg):
+    for message in auth_configuration_issues(cfg):
         issues.append(
-            ReadinessIssue(
-                "web_admin_auth_unconfigured",
-                "web administration credentials and persistent session secret are not configured",
-            )
+            ReadinessIssue("web_admin_auth_invalid", message)
         )
     if _text(cfg.get("web_bind_host", "127.0.0.1")) not in {
         "127.0.0.1",
@@ -212,9 +266,19 @@ def check_production_readiness(cfg, root, *, verify_model_files=True):
             )
         )
     if not bool(cfg.get("web_cookie_secure", True)):
-        issues.append(ReadinessIssue("web_cookie_insecure", "web_cookie_secure must be true"))
+        issues.append(
+            ReadinessIssue(
+                "web_cookie_insecure",
+                "web_cookie_secure must be true",
+            )
+        )
     if not bool(cfg.get("web_hsts_enabled", True)):
-        issues.append(ReadinessIssue("web_hsts_disabled", "web_hsts_enabled must be true"))
+        issues.append(
+            ReadinessIssue(
+                "web_hsts_disabled",
+                "web_hsts_enabled must be true",
+            )
+        )
     if not bool(cfg.get("https_reverse_proxy_acknowledged", False)):
         issues.append(
             ReadinessIssue(
@@ -243,7 +307,9 @@ def check_production_readiness(cfg, root, *, verify_model_files=True):
         issues.append(frappe_issue)
 
     ftp_tls_enabled = bool(cfg.get("ftp_tls_enabled", False))
-    network_ack = bool(cfg.get("camera_network_isolated_acknowledged", False))
+    network_ack = bool(
+        cfg.get("camera_network_isolated_acknowledged", False)
+    )
     if not ftp_tls_enabled and not network_ack:
         issues.append(
             ReadinessIssue(
@@ -254,10 +320,26 @@ def check_production_readiness(cfg, root, *, verify_model_files=True):
     if ftp_tls_enabled:
         cert = resolve_path(root, cfg.get("ftp_tls_certfile"), "")
         key = resolve_path(root, cfg.get("ftp_tls_keyfile"), "")
-        if not _text(cfg.get("ftp_tls_certfile")) or not cert.is_file():
-            issues.append(ReadinessIssue("ftp_tls_cert_missing", f"FTPS certificate unavailable: {cert}"))
-        if not _text(cfg.get("ftp_tls_keyfile")) or not key.is_file():
-            issues.append(ReadinessIssue("ftp_tls_key_missing", f"FTPS private key unavailable: {key}"))
+        if (
+            not _text(cfg.get("ftp_tls_certfile"))
+            or not cert.is_file()
+        ):
+            issues.append(
+                ReadinessIssue(
+                    "ftp_tls_cert_missing",
+                    f"FTPS certificate unavailable: {cert}",
+                )
+            )
+        if (
+            not _text(cfg.get("ftp_tls_keyfile"))
+            or not key.is_file()
+        ):
+            issues.append(
+                ReadinessIssue(
+                    "ftp_tls_key_missing",
+                    f"FTPS private key unavailable: {key}",
+                )
+            )
         if not bool(cfg.get("ftp_tls_control_required", True)):
             issues.append(
                 ReadinessIssue(
@@ -283,7 +365,11 @@ def check_production_readiness(cfg, root, *, verify_model_files=True):
     for message in _ftp_permission_issues(cfg):
         issues.append(ReadinessIssue("ftp_permissions_unsafe", message))
 
-    camera_ids = cfg.get("camera_ids") if isinstance(cfg.get("camera_ids"), dict) else {}
+    camera_ids = (
+        cfg.get("camera_ids")
+        if isinstance(cfg.get("camera_ids"), dict)
+        else {}
+    )
     in_id = _text(camera_ids.get("in"))
     out_id = _text(camera_ids.get("out"))
     if not in_id or not out_id:
@@ -311,30 +397,51 @@ def check_production_readiness(cfg, root, *, verify_model_files=True):
             )
         )
 
-    blockers = [issue for issue in issues if issue.severity == "blocker"]
+    blockers = [
+        issue for issue in issues if issue.severity == "blocker"
+    ]
     return ReadinessReport(
         production_mode=production_mode,
         ready=not blockers,
         issues=tuple(issues),
         model_integrity=integrity,
+        gallery=gallery,
     )
 
 
-def enforce_production_readiness(cfg, root, *, dry_run=False, verify_model_files=True):
+def enforce_production_readiness(
+    cfg,
+    root,
+    *,
+    dry_run=False,
+    verify_model_files=True,
+    gallery_path=None,
+):
     report = check_production_readiness(
-        cfg, root, verify_model_files=verify_model_files
+        cfg,
+        root,
+        verify_model_files=verify_model_files,
+        gallery_path=gallery_path,
     )
-    if bool(cfg.get("production_mode", False)) and not dry_run and report.blockers:
+    if (
+        bool(cfg.get("production_mode", False))
+        and not dry_run
+        and report.blockers
+    ):
         raise ProductionReadinessError(report)
     return report
 
 
 def format_report(report):
     lines = [
-        f"production_mode={str(report.production_mode).lower()} ready={str(report.ready).lower()}"
+        "production_mode="
+        f"{str(report.production_mode).lower()} "
+        f"ready={str(report.ready).lower()}"
     ]
     for issue in report.issues:
-        lines.append(f"[{issue.severity}] {issue.code}: {issue.message}")
+        lines.append(
+            f"[{issue.severity}] {issue.code}: {issue.message}"
+        )
     return "\n".join(lines)
 
 
@@ -351,7 +458,9 @@ def load_config(path):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Check Face Attendance production readiness.")
+    parser = argparse.ArgumentParser(
+        description="Check Face Attendance production readiness."
+    )
     parser.add_argument(
         "--config",
         type=Path,
@@ -361,7 +470,7 @@ def main():
     parser.add_argument(
         "--skip-model-hash",
         action="store_true",
-        help="Skip model-file hashing for a quick configuration-only check.",
+        help="Validate manifest metadata and file inventory without hashing model files.",
     )
     parser.add_argument(
         "--strict",
@@ -375,8 +484,14 @@ def main():
         args.config.resolve().parent,
         verify_model_files=not args.skip_model_hash,
     )
-    print(json.dumps(report.to_dict(), ensure_ascii=False, indent=2) if args.json else format_report(report))
-    if report.blockers and (args.strict or bool(cfg.get("production_mode", False))):
+    print(
+        json.dumps(report.to_dict(), ensure_ascii=False, indent=2)
+        if args.json
+        else format_report(report)
+    )
+    if report.blockers and (
+        args.strict or bool(cfg.get("production_mode", False))
+    ):
         raise SystemExit(1)
 
 
