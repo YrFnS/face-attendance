@@ -25,11 +25,12 @@ jobs:
           from pathlib import Path
 
           path = Path('apply_h0_strict_profile.py')
+          quote = chr(39) * 3
           lines = []
           for line in path.read_text(encoding='utf-8').splitlines():
               if line.startswith('write("') and ", '" in line and line.endswith("')"):
                   prefix, payload = line.split(", '", 1)
-                  line = prefix + ', """' + payload[:-2] + '""")'
+                  line = prefix + ', ' + quote + payload[:-2] + quote + ')'
               lines.append(line)
           path.write_text('\n'.join(lines) + '\n', encoding='utf-8')
           PY
