@@ -1,0 +1,54 @@
+
+    for index, item in enumerate(employees):
+        if not isinstance(item, dict):
+            raise GalleryError(f"employees[{index}] must be an object")
+        _unexpected_fields(item, _EMPLOYEE_FIELDS, f"employees[{index}]")
+        employee = _employee_value(item, index)
+        if employee in seen:
+            raise GalleryError(f"duplicate employee in gallery: {employee}")
+        seen.add(employee)
+
+        vectors = _vectors_value(item, index, employee)
+        if len(vectors) > employee_embedding_limit:
+            raise GalleryError(
+                f"employee {employee} exceeds max_embeddings_per_employee="
+                f"{employee_embedding_limit}"
+            )
+        embedding_count += len(vectors)
+        if embedding_count > total_embedding_limit:
+            raise GalleryError(
+                f"gallery exceeds max_total_embeddings={total_embedding_limit}"
+            )
+
+        normalized = []
+        for vector_index, vector in enumerate(vectors):
+            field = f"employees[{index}].embeddings[{vector_index}]"
+            clean_values = validate_embedding_vector(
+                vector, field=field, dimension=dimension
+            )
+            try:
+                clean_vector = norm(clean_values)
+            except GalleryError as exc:
+                raise GalleryError(
+                    f"invalid embedding for {employee} at index {vector_index}: {exc}"
+                ) from exc
+            normalized.append(clean_vector)
+
+        employee_name = validate_employee_name(
+            item.get("employee_name"), f"employees[{index}].employee_name"
+        )
+        sanitized_item = {
+            "employee": employee,
+            "embeddings": [vector.tolist() for vector in normalized],
+        }
+        if employee_name:
+            sanitized_item["employee_name"] = employee_name
+        sanitized_employees.append(sanitized_item)
+        known.append(
+            {
+                "employee": employee,
+                "employee_name": employee_name,
+                "embedding": norm(np.mean(normalized, axis=0)),
+                "embeddings": normalized,
+            }
+        )
