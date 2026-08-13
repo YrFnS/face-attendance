@@ -91,7 +91,7 @@ The next stages should extend these controls instead of creating parallel implem
 - `camera_events` stores a coarse final status but not the individual face decisions, scores, gallery/model version, PAD evidence, ERPNext document, or delivery attempts.
 - A crash can leave an event in `processing` indefinitely; there is no lease, recovery classification, or operator resolution workflow.
 - ERPNext creation is synchronous. There is no durable outbound queue, retry schedule, dead-letter state, or reconciliation job.
-- A timeout after ERPNext accepts a check-in is ambiguous. Retrying safely requires a stable event ID enforced on the ERPNext side.
+- A timeout after ERPNext accepts a check-in is ambiguous. Retrying safely requires a stable per-check-in delivery ID enforced on the ERPNext side.
 - Check-in creation and crop attachment are coupled. Attachment failure after check-in creation can make a successful check-in appear failed.
 - Check-in time currently comes from the attendance server clock at delivery time rather than an explicitly validated event-time policy.
 - Cooldown state is a separate JSON file and lock rather than part of the transactional event policy.
@@ -142,7 +142,7 @@ Each source adapter emits one normalized `CapturedEvent` envelope containing cap
 Extend the current record with:
 
 - Immutable `received_at`, parsed `source_at` plus timezone/trust provenance, and immutable `effective_at`.
-- Separate capture ID, content hash, and delivery ID rather than treating the current camera/log-type/hash key as every identity.
+- Separate capture ID and content hash rather than treating the current camera/log-type/hash key as every identity.
 - Current lifecycle state and version.
 - Processing lease owner/expiry and recovery classification.
 - Gallery, recognition model, preprocessing, PAD provider, and policy versions.
@@ -157,7 +157,7 @@ Keep a minimal idempotency tombstone longer than detailed event/media retention.
 
 One row per detected face:
 
-- Event and face index.
+- Immutable recognition-decision ID, capture event ID, and face index.
 - Bounding-box and quality metadata.
 - Best employee, best score, runner-up score, and margin.
 - PAD result, score, model, evidence ID, and reason.
@@ -168,7 +168,7 @@ Do not store complete embeddings in the event ledger.
 
 ### `delivery_jobs` and `delivery_attempts`
 
-- Stable event/decision delivery key.
+- Immutable delivery ID for one accepted recognition decision, plus the capture event ID for traceability.
 - Target adapter and intended Employee Checkin payload.
 - States: `pending`, `delivering`, `delivered`, `retryable`, `uncertain`, `dead_letter`, or `cancelled`.
 - Attempt count, next attempt time, bounded error, ERPNext document name, and reconciliation result.
@@ -194,7 +194,7 @@ Create only if a verified camera workflow requires presence mode:
 ### External prerequisites
 
 - A supported ERPNext/HRMS version matrix, staging site, least-privilege service account, and documented Employee/Employee Checkin permissions.
-- An ERPNext-side atomic idempotency extension: either a unique external event field with duplicate-conflict lookup or a small whitelisted get-or-create endpoint. Client-side lookup alone is not exactly-once delivery.
+- An ERPNext-side atomic idempotency extension: either a unique `face_attendance_delivery_id` per Employee Checkin with duplicate-conflict lookup or a small whitelisted get-or-create endpoint keyed by that delivery ID. Retain `face_attendance_event_id` as non-unique capture trace metadata; client-side lookup alone is not exactly-once delivery.
 - Real HOLOWITS filenames and upload samples, documented NTP/timezone behavior, and an approved capture-time trust policy.
 - A selected, licensed, deployment-evaluated recognition model and PAD provider.
 - Named privacy/retention and operational owners.
@@ -229,7 +229,7 @@ Release A requires no Redis, Celery, PostgreSQL, or message broker. Introduce on
 - [ ] `P0-01` Document every deployed/planned camera: model, branch, direction, transport, filename/timestamp behavior, event frequency, and overlapping field of view.
 - [ ] `P0-02` Decide whether each site uses directional door events or true presence sessions. Do not support presence mode speculatively.
 - [ ] `P0-03` Document the ERPNext Employee Checkin API contract, custom fields, permissions, rate limits, outage behavior, and staging site.
-- [ ] `P0-04` Choose an atomic cross-system idempotency design: a server-enforced unique `face_attendance_event_id` with duplicate-conflict lookup, or a whitelisted get-or-create endpoint. Lookup-before-create alone is insufficient.
+- [ ] `P0-04` Choose an atomic cross-system idempotency design: a server-enforced unique `face_attendance_delivery_id` per Employee Checkin with duplicate-conflict lookup, or a whitelisted get-or-create endpoint keyed by that delivery ID. Keep `face_attendance_event_id` as non-unique capture trace metadata; lookup-before-create alone is insufficient.
 - [ ] `P0-05` Define event time: receipt time by default; accept a camera/source timestamp only after format, timezone, age, and authenticity checks.
 - [ ] `P0-06` Agree on image, crop, event, audit, and failed-delivery retention periods with the data owner.
 - [ ] `P0-07` Identify operator roles and which actions require a reason or second approval.
@@ -302,9 +302,9 @@ Phase 1 is not independently enabled for live delivery. Deploy Phases 1 and 2 to
 - [ ] `P2-01` Introduce an ERPNext adapter interface; keep API and local-bench transports explicit and independently tested.
 - [ ] `P2-02` Create `delivery_jobs` in the same transaction that accepts a recognition decision.
 - [ ] `P2-03` Implement a single-node delivery worker with leases, bounded exponential backoff, jitter, and retry budgets.
-- [ ] `P2-04` Enforce an atomic ERPNext idempotency contract for both REST and local-bench adapters: a unique `face_attendance_event_id` with duplicate-conflict lookup or a whitelisted get-or-create endpoint. Client lookup-before-create alone is race-prone. Treat connection loss after submission as `uncertain` until reconciliation proves the result.
+- [ ] `P2-04` Enforce an atomic ERPNext idempotency contract for both REST and local-bench adapters: a unique `face_attendance_delivery_id` per Employee Checkin with duplicate-conflict lookup or a whitelisted get-or-create endpoint keyed by that delivery ID. Keep `face_attendance_event_id` as non-unique capture trace metadata so multiple accepted faces in one capture can create independent check-ins. Client lookup-before-create alone is race-prone. Treat connection loss after submission as `uncertain` until reconciliation proves the result.
 - [ ] `P2-05` Separate Employee Checkin creation from private crop attachment. A failed attachment becomes its own retryable job, and any required private crop is protected from retention cleanup until that job reaches a terminal state.
-- [ ] `P2-06` Send the validated effective event time, camera ID, branch, decision version, and event ID to ERPNext where the agreed schema permits.
+- [ ] `P2-06` Send the validated effective event time, camera ID, branch, immutable decision ID and version, unique delivery ID, and non-unique capture event ID to ERPNext where the agreed schema permits.
 - [ ] `P2-07` Classify errors as retryable, permanent, authentication, validation, conflict, rate-limit, or uncertain; never retry permanent errors forever.
 - [ ] `P2-08` Add scheduled and manual reconciliation against ERPNext, including missing, duplicate, mismatched, externally changed, and externally deleted records. Treat ERP-owned edits as visible owned exceptions; never silently overwrite or recreate them.
 - [ ] `P2-09` Add a dead-letter workflow with actor, reason, retry/cancel controls, and complete audit history. Cancel applies only to undelivered local jobs; delivered Employee Checkin correction/deletion happens in ERPNext and is annotated locally.
@@ -313,8 +313,9 @@ Phase 1 is not independently enabled for live delivery. Deploy Phases 1 and 2 to
 
 **Acceptance**
 
-- An ERPNext outage sized from measured peak rate × the approved safety factor queues and later delivers every eligible event with zero loss, zero duplicate ERP IDs, bounded recovery time, and verified disk headroom.
+- An ERPNext outage sized from measured peak rate × the approved safety factor queues and later delivers every eligible accepted decision with zero loss, zero duplicate ERP IDs, bounded recovery time, and verified disk headroom.
 - A timeout after remote commit does not create a duplicate; without the atomic ERPNext dependency the product does not claim exactly-once delivery.
+- A multi-face capture can create one independently idempotent Employee Checkin for each eligible accepted decision; those check-ins have distinct delivery IDs and may share the same non-unique capture event ID.
 - Employee Checkin creation persists the returned ERP document name before attachment begins. Attachment failure never changes a delivered check-in to failed, and delivery always uses immutable `effective_at` rather than retry time.
 - Reconciliation reports zero unexplained differences for the controlled test window and surfaces ERP-owned changes without overwriting them.
 
@@ -432,7 +433,7 @@ Phase 1 is not independently enabled for live delivery. Deploy Phases 1 and 2 to
 **Purpose:** Prove the complete system under realistic failures before live check-ins.
 
 - [ ] `P8-01` Add an isolated integration harness: staged FTP upload -> watcher -> deterministic recognition/PAD doubles -> delivery worker -> fake ERPNext.
-- [ ] `P8-02` Test duplicate/re-encoded content, concurrent same-name FTP uploads, partial/malformed/multi-face uploads, stale/future events, NTP loss, gallery/manual-sync concurrency, PAD failure, ERPNext timeout-after-commit, attachment failure, event-pruning replay, and deterministic process-kill/disk-full/SQLite-busy points.
+- [ ] `P8-02` Test duplicate/re-encoded content, concurrent same-name FTP uploads, partial/malformed uploads, multi-face uploads with multiple accepted per-face decisions, stale/future events, NTP loss, gallery/manual-sync concurrency, PAD failure, ERPNext timeout-after-commit, attachment failure, event-pruning replay, and deterministic process-kill/disk-full/SQLite-busy points.
 - [ ] `P8-03` Test two processes against the supported single-node topology, corrupted-database recovery, and queue capacity. If horizontal multi-writer deployment is required, select PostgreSQL/a broker through a separate architecture decision and rerun the suite.
 - [ ] `P8-04` Add web/security end-to-end tests for login, roles, session expiry, CSRF, trusted-proxy throttling, auth matrix, upload/parser/path traversal, redirect/TLS policy, event review, enrollment, gallery publish/rollback, retry, and reconciliation.
 - [ ] `P8-05` Run a real staging trial with each camera model, the approved recognition/PAD models, protected transport, and a non-production ERPNext site.
@@ -529,13 +530,13 @@ Targets must be finalized in Phase 0, but the product should report at least:
 - Operator time to explain and resolve a failed/missing check-in.
 - Backup restore time and recovery-point evidence.
 
-A useful north-star operational target is: **every camera event ends as an explainable no-checkin/rejection, exactly one reconciled ERPNext check-in, or a visible and owned exception.**
+A useful north-star operational target is: **every camera event ends with all face decisions explainable, every accepted decision producing exactly one reconciled ERPNext check-in, or a visible and owned exception.**
 
 ## 13. Decisions required before implementation
 
 1. Which current pain is first: missing/duplicate check-ins, ERPNext outages, enrollment quality, camera visibility, or operator reporting?
 2. Is any deployed camera truly a presence camera, or are all cameras directional event cameras?
-3. Can ERPNext enforce a unique external face-attendance event ID?
+3. Can ERPNext enforce a unique external face-attendance delivery ID per Employee Checkin while retaining the capture event ID as non-unique trace metadata?
 4. Which timestamp is authoritative and trustworthy for each camera model?
 5. Which PAD provider and model can be licensed and evaluated?
 6. What biometric/audit retention policy and operator roles are approved?
