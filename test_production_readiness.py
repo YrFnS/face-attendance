@@ -125,6 +125,11 @@ class ProductionReadinessTests(unittest.TestCase):
             "pad_min_score": 0.8,
             "pad_http_url": "https://pad.example.test/v1/check",
             "pad_http_token": "secret",
+            "pad_expected_provider": "approved-provider",
+            "pad_allowed_models": ["liveness-v3"],
+            "pad_require_binding_echo": True,
+            "pad_require_evidence_id": True,
+            "pad_max_faces_per_event": 8,
             "pad_allow_insecure_url": False,
             "pad_allow_unauthenticated_local": False,
             "web_admin_username": "admin",
@@ -217,6 +222,21 @@ class ProductionReadinessTests(unittest.TestCase):
         self.assertTrue(
             report.gallery["release_validation"]["verified"]
         )
+
+    def test_missing_pad_provider_and_model_pins_are_blocked(self):
+        cfg = self.valid_config()
+        cfg.update(
+            pad_expected_provider="",
+            pad_allowed_models=[],
+            pad_require_binding_echo=False,
+            pad_require_evidence_id=False,
+        )
+        report = self.report(cfg, verify_model_files=False)
+        messages = " ".join(issue.message for issue in report.blockers)
+        self.assertIn("pin the approved PAD provider", messages)
+        self.assertIn("allowlist at least one", messages)
+        self.assertIn("pad_require_binding_echo", messages)
+        self.assertIn("pad_require_evidence_id", messages)
 
     def test_missing_strict_identity_is_blocked(self):
         cfg = self.valid_config()

@@ -15,6 +15,20 @@ from runtime_state import RuntimeState, file_sha256, make_event_id, resolve_runt
 ROOT = Path(__file__).resolve().parent
 
 
+class BoundFaceApp:
+    """Return the already PAD-evaluated faces exactly once to recognition."""
+
+    def __init__(self, faces):
+        self._faces = tuple(faces)
+        self.calls = 0
+
+    def get(self, _image):
+        self.calls += 1
+        if self.calls != 1:
+            raise RuntimeError("bound face set was requested more than once")
+        return list(self._faces)
+
+
 def service_config():
     cfg = attendance.load_config()
     # Network synchronization is deliberately separated from recognition. The
@@ -137,42 +151,69 @@ def finish_claim(state, claim, event_id, status, error=""):
         return False
 
 
-def evaluate_pad(image, app, cfg, pad_gate, context):
+def ordered_faces(faces):
+    return sorted(
+        list(faces or []),
+        key=lambda face: (
+            float(face.bbox[1]),
+            float(face.bbox[0]),
+            float(face.bbox[3]),
+            float(face.bbox[2]),
+        ),
+    )
+
+
+def face_bbox(face):
+    return [int(round(float(value))) for value in face.bbox]
+
+
+def evaluate_pad(detect_frame, faces, cfg, pad_gate, context):
     if not pad_gate.enabled and not pad_gate.required:
-        return None, None
-
-    detect_frame = attendance.scaled_frame(image, cfg)
-    faces = app.get(detect_frame)
+        return [], [], ""
     if not faces:
-        return PADResult(False, None, pad_gate.provider, reason="no_face_for_pad"), None
+        return [], [], "no_face_for_pad"
+    if len(faces) > int(pad_gate.max_faces):
+        return [], [], f"pad_face_limit_exceeded_{len(faces)}"
     if bool(cfg.get("pad_require_single_face", True)) and len(faces) != 1:
-        return (
-            PADResult(
-                False,
-                None,
-                pad_gate.provider,
-                reason=f"pad_expected_one_face_found_{len(faces)}",
-            ),
-            None,
+        return [], [], f"pad_expected_one_face_found_{len(faces)}"
+
+    results = []
+    crops = []
+    face_count = len(faces)
+    for index, face in enumerate(faces, start=1):
+        width, height = attendance.face_size(face)
+        if (
+            width < int(cfg.get("min_face_width", 65))
+            or height < int(cfg.get("min_face_height", 80))
+            or float(face.det_score) < float(cfg.get("min_detection_score", 0.5))
+        ):
+            results.append(
+                PADResult(
+                    False,
+                    None,
+                    pad_gate.expected_provider or pad_gate.provider,
+                    reason="pad_face_quality",
+                    face_index=index,
+                    face_count=face_count,
+                )
+            )
+            crops.append(None)
+            continue
+
+        crop = attendance.face_crop(
+            detect_frame,
+            face,
+            margin=float(cfg.get("pad_crop_margin", 0.25)),
         )
-
-    face = max(
-        faces,
-        key=lambda item: (item.bbox[2] - item.bbox[0])
-        * (item.bbox[3] - item.bbox[1]),
-    )
-    width, height = attendance.face_size(face)
-    if (
-        width < int(cfg.get("min_face_width", 65))
-        or height < int(cfg.get("min_face_height", 80))
-        or float(face.det_score) < float(cfg.get("min_detection_score", 0.5))
-    ):
-        return PADResult(False, None, pad_gate.provider, reason="pad_face_quality"), None
-
-    crop = attendance.face_crop(
-        detect_frame, face, margin=float(cfg.get("pad_crop_margin", 0.25))
-    )
-    return pad_gate.evaluate(crop, context), crop
+        face_context = dict(context)
+        face_context.update(
+            face_index=index,
+            face_count=face_count,
+            bbox=face_bbox(face),
+        )
+        results.append(pad_gate.evaluate(crop, face_context))
+        crops.append(crop)
+    return results, crops, ""
 
 
 def process_path(
@@ -241,9 +282,11 @@ def process_path(
             reject_file(path, "image_too_large", cfg, dry_run=dry_run)
             return False
 
-        pad_result, pad_crop = evaluate_pad(
-            image,
-            app,
+        detect_frame = attendance.scaled_frame(image, cfg)
+        faces = ordered_faces(app.get(detect_frame))
+        pad_results, pad_crops, pad_event_error = evaluate_pad(
+            detect_frame,
+            faces,
             cfg,
             pad_gate,
             {
@@ -254,37 +297,63 @@ def process_path(
                 "source_sha256": source_sha256,
             },
         )
-        if pad_result is not None:
-            score_text = "-" if pad_result.score is None else f"{pad_result.score:.3f}"
-            attendance.log(
-                f"ftp:{path.name}: pad provider={pad_result.provider} "
-                f"passed={int(pad_result.passed)} score={score_text} "
-                f"reason={pad_result.reason or '-'} evidence={pad_result.evidence_id or '-'}"
+        if pad_event_error:
+            claim_finalized = finish_claim(
+                state,
+                claim,
+                event_id,
+                status="rejected",
+                error=f"pad:{pad_event_error}"[:2000],
             )
-            if not pad_result.passed:
-                claim_finalized = finish_claim(
-                    state,
-                    claim,
-                    event_id,
-                    status="rejected",
-                    error=f"pad:{pad_result.reason}"[:2000],
-                )
-                if pad_crop is not None and getattr(pad_crop, "size", 0):
-                    attendance.save_rejected(pad_crop, "pad", cfg)
-                reject_file(path, "pad_rejected", cfg, dry_run=dry_run)
-                return False
+            reject_file(path, "pad_rejected", cfg, dry_run=dry_run)
+            return False
+
+        for result, crop in zip(pad_results, pad_crops):
+            score_text = "-" if result.score is None else f"{result.score:.3f}"
+            attendance.log(
+                f"ftp:{path.name}: pad face={result.face_index}/{result.face_count} "
+                f"provider={result.provider or '-'} model={result.model or '-'} "
+                f"passed={int(result.passed)} score={score_text} "
+                f"reason={result.reason or '-'} evidence={result.evidence_id or '-'} "
+                f"binding={result.binding_id[:16] or '-'}"
+            )
+            if not result.passed and crop is not None and getattr(crop, "size", 0):
+                attendance.save_rejected(crop, "pad", cfg)
+
+        strict_pad_evidence = bool(cfg.get("production_mode", False)) or pad_gate.required
+        if pad_results and not all(
+            result.passed and not (strict_pad_evidence and result.skipped)
+            for result in pad_results
+        ):
+            reasons = ",".join(
+                f"{result.face_index}:{result.reason or 'rejected'}"
+                for result in pad_results
+                if not result.passed or (strict_pad_evidence and result.skipped)
+            )
+            claim_finalized = finish_claim(
+                state,
+                claim,
+                event_id,
+                status="rejected",
+                error=f"pad:{reasons}"[:2000],
+            )
+            reject_file(path, "pad_rejected", cfg, dry_run=dry_run)
+            return False
 
         known = gallery.refresh()
+        bound_app = BoundFaceApp(faces)
         try:
             created = attendance.process_image(
                 image,
                 f"ftp:{path.name} event={event_id[:12]} camera={camera_id}",
-                app,
+                bound_app,
                 known,
                 cfg,
                 dry_run,
                 attach_source=path,
             )
+            if bound_app.calls != 1:
+                raise RuntimeError("recognition did not consume the bound face set exactly once")
         except Exception as exc:
             claim_finalized = finish_claim(
                 state, claim, event_id, status="failed", error=str(exc)
