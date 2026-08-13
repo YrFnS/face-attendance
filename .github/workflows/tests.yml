@@ -46,6 +46,7 @@ jobs:
             test_pad.py \
             test_production_readiness.py \
             test_watch_service.py \
+            test_canonical_watcher.py \
             test_install_linux.py
       - name: Validate configuration and shell templates
         run: |
