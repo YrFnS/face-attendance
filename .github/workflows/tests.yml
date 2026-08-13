@@ -74,16 +74,6 @@ jobs:
           TARGET_BRANCH: agent/h0-gallery-data-contract
         run: |
           git show "$BASE_SHA:.github/workflows/tests.yml" > .github/workflows/tests.yml
-          python - <<'PY'
-          from pathlib import Path
-          path = Path('.github/workflows/tests.yml')
-          source = path.read_text(encoding='utf-8')
-          needle = '            test_embedding_gallery.py \\\n'
-          replacement = needle + '            test_gallery_contract.py \\\n'
-          if source.count(needle) != 1:
-              raise SystemExit('could not update final test workflow')
-          path.write_text(source.replace(needle, replacement, 1), encoding='utf-8')
-          PY
           rm -rf .h0
           rm -f h0_apply_min.py h0_runtime_actual.py h0_web_import_actual.py
           git add -A
