@@ -17,12 +17,12 @@ path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 target = Path("secure_sync.py")
 source = target.read_text(encoding="utf-8")
 source = source.replace(
-    "def _gallery_options(cfg):\\n",
+    "def _gallery_options(cfg):\n",
     r"def _gallery_options(cfg):\n",
     1,
 )
 source = source.replace(
-    "\\n\\ndef _local_metadata",
+    "\n\ndef _local_metadata",
     r"\n\ndef _local_metadata",
     1,
 )
