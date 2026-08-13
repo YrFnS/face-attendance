@@ -6,6 +6,7 @@ on:
     branches:
       - master
       - agent/sync-embedding-gallery
+      - agent/h0-gallery-anti-rollback
 
 permissions:
   contents: read
