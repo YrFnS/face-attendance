@@ -23,6 +23,7 @@ from embedding_gallery import (
     sync_gallery,
     write_gallery_atomic,
 )
+from watcher_entrypoints import require_legacy_dry_run
 
 
 ROOT = Path(__file__).resolve().parent
@@ -693,6 +694,7 @@ def cleanup_old_audit_files(cfg):
 
 
 def watch(once=False, dry_run=False):
+    require_legacy_dry_run("watch", dry_run=dry_run)
     cfg = load_config()
     app = face_app()
     gallery = GalleryRuntime(cfg)
@@ -760,6 +762,7 @@ def wait_until_stable(path):
 
 
 def watch_folder(once=False, dry_run=False, scan_existing=False):
+    require_legacy_dry_run("watch-folder", dry_run=dry_run)
     cfg = load_config()
     folder = Path(cfg.get("camera_uploads_dir", ROOT / "camera_uploads"))
     folder.mkdir(parents=True, exist_ok=True)
@@ -860,13 +863,27 @@ def main():
     enroll.add_argument("--photos", type=int, default=5)
     enroll.add_argument("--delay", type=float, default=1.5)
 
-    run = sub.add_parser("watch")
+    run = sub.add_parser(
+        "watch",
+        help="Legacy RTSP diagnostics only; live processing is refused.",
+    )
     run.add_argument("--once", action="store_true")
-    run.add_argument("--dry-run", action="store_true")
+    run.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Required safety flag for the legacy RTSP diagnostic path.",
+    )
 
-    folder = sub.add_parser("watch-folder")
+    folder = sub.add_parser(
+        "watch-folder",
+        help="Legacy folder diagnostics only; live processing is refused.",
+    )
     folder.add_argument("--once", action="store_true")
-    folder.add_argument("--dry-run", action="store_true")
+    folder.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Required safety flag for the legacy folder diagnostic path.",
+    )
     folder.add_argument("--scan-existing", action="store_true")
     args = parser.parse_args()
 

@@ -1,12 +1,12 @@
 [Unit]
-Description=Face Attendance Replay-Resistant Folder Watcher
+Description=Face Attendance Canonical Replay-Resistant Folder Watcher
 After=network-online.target face-attendance-ftp.service
 Wants=network-online.target
 
 [Service]
 Type=simple
 WorkingDirectory=/opt/face-attendance
-ExecStart=/opt/face-attendance/.venv/bin/python -u watch_service.py
+ExecStart=/opt/face-attendance/.venv/bin/python -u /opt/face-attendance/watch_service.py
 Restart=on-failure
 RestartSec=3
 UMask=0077
