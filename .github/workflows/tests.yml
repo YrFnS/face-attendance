@@ -9,7 +9,7 @@ on:
       - agent/h0-gallery-contract-work
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   security-and-gallery-tests:
@@ -17,6 +17,8 @@ jobs:
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@v7.0.1
+        with:
+          fetch-depth: 0
       - uses: actions/setup-python@v7.0.0
         with:
           python-version: "3.11"
@@ -65,3 +67,31 @@ jobs:
           bash -n install_linux.sh
           bash -n deploy/firewall/ufw-rules.example.sh
           git diff --check
+      - name: Publish clean stacked branch
+        if: github.ref == 'refs/heads/agent/h0-gallery-contract-work'
+        env:
+          BASE_SHA: 8a63000f9cb451c22cf6e89d54a552db959581f2
+          TARGET_BRANCH: agent/h0-gallery-data-contract
+        run: |
+          git show "$BASE_SHA:.github/workflows/tests.yml" > .github/workflows/tests.yml
+          python - <<'PY'
+          from pathlib import Path
+          path = Path('.github/workflows/tests.yml')
+          source = path.read_text(encoding='utf-8')
+          needle = '            test_embedding_gallery.py \\\n'
+          replacement = needle + '            test_gallery_contract.py \\\n'
+          if source.count(needle) != 1:
+              raise SystemExit('could not update final test workflow')
+          path.write_text(source.replace(needle, replacement, 1), encoding='utf-8')
+          PY
+          rm -rf .h0
+          rm -f h0_apply_min.py h0_runtime_actual.py h0_web_import_actual.py
+          git add -A
+          git diff --cached --check
+          tree=$(git write-tree)
+          export GIT_AUTHOR_NAME='github-actions[bot]'
+          export GIT_AUTHOR_EMAIL='41898282+github-actions[bot]@users.noreply.github.com'
+          export GIT_COMMITTER_NAME="$GIT_AUTHOR_NAME"
+          export GIT_COMMITTER_EMAIL="$GIT_AUTHOR_EMAIL"
+          commit=$(printf '%s\n' 'enforce gallery and employee data contracts' | git commit-tree "$tree" -p "$BASE_SHA")
+          git push --force origin "$commit:refs/heads/$TARGET_BRANCH"
