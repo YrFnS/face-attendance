@@ -32,7 +32,8 @@ The camera still sends an image because it cannot send an InsightFace embedding.
 
 ## Main files
 
-- `face_attendance.py` — recognizes camera captures, reloads galleries, and creates checkins.
+- `face_attendance.py` — recognition/check-in helpers and legacy watcher commands.
+- `watch_service.py` — production FTP watcher with readiness, PAD, replay protection, and event state.
 - `embedding_gallery.py` — validates, normalizes, stores, synchronizes, and reloads galleries.
 - `sync_embeddings.py` — manual or continuous gallery synchronization.
 - `web_admin.py` — gallery status, manual sync, optional central enrollment UI, and optional export API.
@@ -55,6 +56,7 @@ The installer copies the app to `/opt/face-attendance`, creates a virtual enviro
 face-attendance-ftp
 face-attendance-watch
 face-attendance-web
+face-attendance-sync.timer
 ```
 
 On a fresh installation, FTP and the web UI start, but the live watcher stays stopped until a valid embedding gallery exists. This prevents accidental checkin creation before enrollment is verified.
@@ -94,10 +96,11 @@ cd /opt/face-attendance
 . .venv/bin/activate
 python sync_embeddings.py
 python sync_embeddings.py --status
-python face_attendance.py watch-folder --scan-existing --dry-run
+python production_readiness.py --strict
+python watch_service.py --once --dry-run --allow-stale
 ```
 
-The watcher also synchronizes automatically. A valid new gallery is written atomically and loaded without restarting the service. A failed, empty, wrong-branch, wrong-model, malformed, or dimension-incompatible gallery is rejected while the previous working gallery remains active.
+The synchronization timer refreshes the gallery, and the production watcher loads valid changes without restarting. A failed, empty, wrong-branch, wrong-model, malformed, or dimension-incompatible gallery is rejected while the previous working gallery remains active.
 
 ## Trusted enrollment/export server
 
@@ -218,19 +221,19 @@ Folder mapping is controlled by:
 # Sync and inspect the employee embedding gallery
 python sync_embeddings.py
 python sync_embeddings.py --status
-python face_attendance.py sync
 python face_attendance.py status
 
 # Central/local fallback enrollment only
 python face_attendance.py build
 python face_attendance.py enroll HR-EMP-00001 --photos 5
 
-# Camera processing
-python face_attendance.py watch-folder
-python face_attendance.py watch-folder --dry-run
-python face_attendance.py watch-folder --scan-existing --dry-run
-python face_attendance.py watch
+# Production camera processing
+python watch_service.py
+python watch_service.py --dry-run
+python watch_service.py --once --dry-run --allow-stale
 ```
+
+`face_attendance.py watch` and `watch-folder` are legacy compatibility paths. Do not use them for live production processing because they bypass the production event ledger, PAD, and readiness gate.
 
 Service status and logs:
 

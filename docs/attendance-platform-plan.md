@@ -72,7 +72,7 @@ The control plane may display read-only ERPNext summaries and links, but it must
 
 The repository already provides important foundations that must be preserved rather than rebuilt:
 
-- Bearer-authenticated central embedding export and a bounded synchronization client in `secure_sync.py`. Documented legacy CLI paths still reach a duplicate, less-bounded sync implementation and must be unified.
+- Bearer-authenticated central embedding export and a bounded synchronization client in `secure_sync.py`. The legacy `face_attendance.py sync` command still reaches a duplicate, less-bounded sync implementation and must be unified.
 - Configurable schema, vector, dimension, branch, model, and optional model-version validation. Model-version matching is disabled by default, and branch/model checks are not yet mandatory in every production configuration.
 - Atomic gallery file activation plus in-memory fallback to the last successfully loaded gallery. The repository does not yet retain versioned gallery files for operator rollback.
 - Multiple embeddings per employee, cosine threshold, second-best margin, face-size, detection-score, per-image duplicate, and cooldown controls.

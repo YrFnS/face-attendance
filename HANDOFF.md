@@ -25,7 +25,7 @@ Employee reference photos no longer need to be copied to attendance servers.
 
 - The central gallery is JSON, never a downloaded pickle.
 - Every vector is checked for finite values, non-zero length, and exact dimension.
-- Model and branch compatibility are verified.
+- Current branch/model validation coverage and limitations are tracked in the [platform plan baseline](docs/attendance-platform-plan.md#4-current-baseline).
 - Empty or malformed galleries are rejected.
 - Updates are written atomically.
 - The watcher reloads a valid changed gallery without a service restart.
@@ -35,13 +35,7 @@ Employee reference photos no longer need to be copied to attendance servers.
 
 ## Main files
 
-- `face_attendance.py` — watcher, recognition, checkin creation, local fallback build.
-- `embedding_gallery.py` — gallery schema, validation, safe storage, sync, matching helper, hot reload.
-- `sync_embeddings.py` — one-shot/status/continuous sync CLI.
-- `web_admin.py` — status and sync UI; optional enrollment and authenticated export endpoint.
-- `import_faces.py` — backward-compatible alias for embedding sync.
-- `ftp_receiver.py` — FTP receiver for IN/OUT camera folders.
-- `docs/embedding-api.md` — central API contract.
+See the authoritative [README file inventory](README.md#main-files).
 
 ## Runtime gallery files
 
@@ -69,7 +63,7 @@ Use:
 }
 ```
 
-The watcher syncs at startup and every `embedding_sync_interval_seconds`. It keeps operating from its current gallery when the central server is temporarily unavailable.
+Synchronization and production watcher behavior are documented in [Security and Production Hardening](docs/security-hardening.md#separate-synchronization-and-recognition).
 
 ### Trusted enrollment server
 
@@ -89,21 +83,7 @@ Upload images through the web UI, rebuild embeddings, and expose `/api/faces/emb
 
 ## Commands
 
-```bash
-python sync_embeddings.py
-python sync_embeddings.py --status
-python face_attendance.py sync
-python face_attendance.py status
-python face_attendance.py watch-folder --scan-existing --dry-run
-python face_attendance.py watch-folder
-```
-
-Central/local fallback enrollment:
-
-```bash
-python face_attendance.py build
-python face_attendance.py enroll HR-EMP-00001 --photos 5
-```
+See the authoritative [README command reference](README.md#commands).
 
 ## Matching rules
 
@@ -161,7 +141,7 @@ The previous production test used:
 Before enabling live checkin creation:
 
 ```bash
-pgrep -af "face_attendance.py watch-folder|ftp_receiver.py|frigate|rtsp_face_gate.py|ffmpeg" || true
+pgrep -af "watch_service.py|face_attendance.py (watch-folder|watch)|ftp_receiver.py|frigate|rtsp_face_gate.py|ffmpeg" || true
 ```
 
 Run only the intended FTP receiver and this repository's watcher. Do not run old Frigate/RTSP recognition workers in parallel.
@@ -172,7 +152,7 @@ Run only the intended FTP receiver and this repository's watcher. Do not run old
 2. Configure the central URL, token, branch, and model.
 3. Run `python sync_embeddings.py`.
 4. Confirm `python sync_embeddings.py --status` shows the correct branch, model, dimension, employee count, and embedding count.
-5. Run controlled `--scan-existing --dry-run` tests with a known employee and visitor.
+5. Run the controlled production-watcher dry run from the [README command reference](README.md#commands) with a known employee and visitor.
 6. Review threshold and margin logs.
 7. Start the watcher only after false-positive behavior is acceptable.
 8. Remove attendance-server enrollment photos after the central gallery is proven and a rollback decision is made.
