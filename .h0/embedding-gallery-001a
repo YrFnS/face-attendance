@@ -1,0 +1,106 @@
+        raise GalleryError("embedding gallery must be a JSON object")
+    _unexpected_fields(payload, _TOP_LEVEL_FIELDS, "embedding gallery")
+
+    schema_version = strict_int(
+        payload.get("schema_version"),
+        "schema_version",
+        minimum=1,
+        maximum=SCHEMA_VERSION,
+    )
+    if schema_version != SCHEMA_VERSION:
+        raise GalleryError(
+            f"unsupported schema_version {schema_version}; expected {SCHEMA_VERSION}"
+        )
+
+    model = validate_token(payload.get("model"), "model", required=True)
+    expected_model = validate_token(
+        expected_model, "expected_model", required=False
+    )
+    if require_model_match and expected_model and model != expected_model:
+        raise GalleryError(f"model mismatch: received {model}, expected {expected_model}")
+
+    model_version = validate_token(
+        payload.get("model_version"), "model_version", required=False
+    )
+    expected_model_version = validate_token(
+        expected_model_version, "expected_model_version", required=False
+    )
+    if (
+        require_model_version_match
+        and expected_model_version
+        and model_version != expected_model_version
+    ):
+        raise GalleryError(
+            "model version mismatch: "
+            f"received {model_version or '<missing>'}, expected {expected_model_version}"
+        )
+
+    branch = validate_gallery_label(
+        payload.get("branch"), "branch", required=False, max_chars=128
+    )
+    expected_branch = validate_gallery_label(
+        expected_branch, "expected_branch", required=False, max_chars=128
+    )
+    if expected_branch and branch != expected_branch:
+        raise GalleryError(
+            f"branch mismatch: received {branch!r}, expected {expected_branch!r}"
+        )
+
+    generated_at = canonical_timestamp(payload.get("generated_at"), "generated_at")
+    gallery_version = validate_token(
+        payload.get("gallery_version"),
+        "gallery_version",
+        required=False,
+        max_chars=128,
+    )
+    if not gallery_version:
+        gallery_version = generated_at
+
+    hard_dimension = _limit(
+        max_dimension,
+        "max_dimension",
+        MAX_EMBEDDING_DIMENSION,
+        MAX_EMBEDDING_DIMENSION,
+    )
+    dimension = strict_int(
+        payload.get("dimension"),
+        "dimension",
+        minimum=1,
+        maximum=hard_dimension,
+    )
+
+    normalized_value = payload.get("normalized")
+    if normalized_value is not None and not isinstance(normalized_value, bool):
+        raise GalleryError("normalized must be a boolean")
+
+    employee_limit = _limit(
+        max_employees,
+        "max_employees",
+        10000,
+        MAX_GALLERY_EMPLOYEES,
+    )
+    employee_embedding_limit = _limit(
+        max_embeddings_per_employee,
+        "max_embeddings_per_employee",
+        50,
+        MAX_EMBEDDINGS_PER_EMPLOYEE,
+    )
+    total_embedding_limit = _limit(
+        max_total_embeddings,
+        "max_total_embeddings",
+        MAX_TOTAL_EMBEDDINGS,
+        MAX_TOTAL_EMBEDDINGS,
+    )
+
+    employees = payload.get("employees")
+    if not isinstance(employees, list):
+        raise GalleryError("employees must be a list")
+    if not employees and not allow_empty:
+        raise GalleryError("refusing to activate an empty embedding gallery")
+    if len(employees) > employee_limit:
+        raise GalleryError(f"gallery exceeds max_employees={employee_limit}")
+
+    seen = set()
+    sanitized_employees = []
+    known = []
+    embedding_count = 0
