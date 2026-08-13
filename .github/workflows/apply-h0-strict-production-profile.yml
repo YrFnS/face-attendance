@@ -25,10 +25,13 @@ jobs:
           from pathlib import Path
 
           path = Path('apply_h0_strict_profile.py')
-          text = path.read_text(encoding='utf-8')
-          for token in (chr(36), 'self', 'unsafe-inline', 'none'):
-              text = text.replace("'" + token + "'", "\\'" + token + "\\'")
-          path.write_text(text, encoding='utf-8')
+          lines = []
+          for line in path.read_text(encoding='utf-8').splitlines():
+              if line.startswith('write("') and ", '" in line and line.endswith("')"):
+                  prefix, payload = line.split(", '", 1)
+                  line = prefix + ', """' + payload[:-2] + '""")'
+              lines.append(line)
+          path.write_text('\n'.join(lines) + '\n', encoding='utf-8')
           PY
           python -m py_compile apply_h0_strict_profile.py
 
