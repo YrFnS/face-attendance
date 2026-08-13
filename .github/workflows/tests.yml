@@ -37,6 +37,7 @@ jobs:
         run: |
           python -m unittest -v \
             test_embedding_gallery.py \
+            test_gallery_contract.py \
             test_match_employee.py \
             test_secure_sync.py \
             test_gallery_release.py \

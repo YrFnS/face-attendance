@@ -95,6 +95,8 @@
   "allow_insecure_central_url": false,
   "max_gallery_employees": 10000,
   "max_embeddings_per_employee": 50,
+  "max_gallery_embeddings": 500000,
+  "max_embedding_dimension": 4096,
   "local_enrollment_enabled": false,
   "max_enrollment_files_per_request": 20,
   "max_enrollment_image_bytes": 10485760,

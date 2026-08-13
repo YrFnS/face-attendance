@@ -23,6 +23,16 @@ from embedding_gallery import (
     sync_gallery,
     write_gallery_atomic,
 )
+from data_contract import (
+    employee_directory,
+    employee_filename_token,
+    employee_id_from_storage_component,
+    filename_token,
+    safe_log_message,
+    validate_employee_id,
+    validate_erp_docname,
+    validate_log_type,
+)
 from model_runtime import ModelRuntimeError, create_face_analysis
 from runtime_policy import (
     effective_gallery_options,
@@ -46,7 +56,7 @@ COOLDOWN_LOCK = ROOT / "cooldown_state.lock"
 
 def log(message):
     LOGS.mkdir(exist_ok=True)
-    line = f"{datetime.now():%Y-%m-%d %H:%M:%S} {message}"
+    line = f"{datetime.now():%Y-%m-%d %H:%M:%S} " + safe_log_message(message)
     with (LOGS / "watch.log").open("a", encoding="utf-8") as file:
         file.write(line + "\n")
     try:
@@ -125,7 +135,8 @@ def save_rejected(crop, reason, cfg, employee=None, score=None):
     folder = LOGS / "unknown"
     folder.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-    employee_part = employee or "unknown"
+    reason = filename_token(reason, "rejection reason")
+    employee_part = employee_filename_token(employee) if employee else "unknown"
     score_part = "" if score is None else f"_{score:.3f}"
     path = folder / f"{stamp}_{reason}_{employee_part}{score_part}.jpg"
     cv2.imwrite(str(path), crop)
@@ -142,7 +153,8 @@ def save_checkin_image(crop, employee, score, cfg):
     folder = LOGS / ("tmp" if temporary else "checkins")
     folder.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-    path = folder / f"{stamp}_{employee}_{score:.3f}.jpg"
+    employee = validate_employee_id(employee)
+    path = folder / f"{stamp}_{employee_filename_token(employee)}_{score:.3f}.jpg"
     if not cv2.imwrite(str(path), crop):
         log(f"could not save checkin crop: {path}")
         return None, False
@@ -157,8 +169,11 @@ def build_embeddings():
     min_score = float(cfg.get("build_min_detection_score", 0.6))
 
     for employee_dir in sorted(FACES.iterdir()):
+        if employee_dir.is_symlink():
+            raise SystemExit("Enrollment directory must not be a symbolic link")
         if not employee_dir.is_dir():
             continue
+        employee_id = employee_id_from_storage_component(employee_dir.name)
         vectors = []
         for image_path in sorted(employee_dir.glob("*")):
             image = cv2.imread(str(image_path))
@@ -180,7 +195,7 @@ def build_embeddings():
         if vectors:
             employees.append(
                 {
-                    "employee": employee_dir.name,
+                    "employee": employee_id,
                     "embedding": norm(np.mean(vectors, axis=0)),
                     "embeddings": vectors,
                 }
@@ -211,8 +226,9 @@ def enroll_from_camera(employee, photos, delay):
     cfg = load_config()
     if not bool(cfg.get("local_enrollment_enabled", False)):
         raise SystemExit("Local image enrollment is disabled in config.json")
+    employee = validate_employee_id(employee)
     app = face_app(cfg=cfg)
-    out_dir = FACES / employee
+    out_dir = employee_directory(FACES, employee)
     out_dir.mkdir(parents=True, exist_ok=True)
     cap = cv2.VideoCapture(cfg["camera_url"], cv2.CAP_FFMPEG)
     if not cap.isOpened():
@@ -497,6 +513,8 @@ def api_headers(json_request=True):
 
 
 def create_checkin_api(employee, log_type, image_path=None):
+    employee = validate_employee_id(employee)
+    log_type = validate_log_type(log_type)
     cfg = load_config()
     doc = {
         "employee": employee,
@@ -530,6 +548,8 @@ def create_checkin_api(employee, log_type, image_path=None):
 
 
 def create_checkin_bench(employee, log_type, image_path=None):
+    employee = validate_employee_id(employee)
+    log_type = validate_log_type(log_type)
     doc = {
         "doctype": "Employee Checkin",
         "employee": employee,
@@ -548,6 +568,8 @@ def create_checkin_bench(employee, log_type, image_path=None):
 
 
 def create_checkin(employee, log_type, image_path=None):
+    employee = validate_employee_id(employee)
+    log_type = validate_log_type(log_type)
     cfg = load_config()
     if (
         cfg.get("frappe_url")
@@ -561,7 +583,8 @@ def create_checkin(employee, log_type, image_path=None):
 def create_checkin_with_cooldown(
     employee, cfg, image_path, dry_run=False, log_type=None
 ):
-    log_type = log_type or cfg["log_type"]
+    employee = validate_employee_id(employee)
+    log_type = validate_log_type(log_type or cfg["log_type"])
     lock_fd = acquire_cooldown_lock()
     try:
         last_seen = load_cooldown_state()
@@ -585,10 +608,12 @@ def create_checkin_with_cooldown(
 
 def log_type_for_path(cfg, path):
     if not path:
-        return cfg["log_type"]
+        return validate_log_type(cfg["log_type"])
     parts = {part.lower() for part in Path(path).parts}
     folder = "out" if "out" in parts else "in" if "in" in parts else ""
-    return cfg.get("folder_log_types", {}).get(folder, cfg["log_type"])
+    return validate_log_type(
+        cfg.get("folder_log_types", {}).get(folder, cfg["log_type"])
+    )
 
 
 def process_image(
@@ -643,6 +668,7 @@ def process_image(
             save_rejected(crop, "unknown", cfg, employee, score)
             continue
 
+        employee = validate_employee_id(employee)
         seen_this_image.add(employee)
         image_path, temporary = save_checkin_image(crop, employee, score, cfg)
         attachment_path = (
