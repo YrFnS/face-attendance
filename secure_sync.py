@@ -14,6 +14,14 @@ from embedding_gallery import (
     write_gallery_atomic,
     write_sync_status,
 )
+from gallery_release import (
+    record_acceptance,
+    release_scope,
+    scope_state,
+    scoped_etag,
+    validate_installed_release,
+    validate_release,
+)
 
 
 DEFAULT_ENDPOINT = "/api/faces/embeddings"
@@ -62,7 +70,7 @@ def _validate_http_url(url, cfg, *, field):
     return parsed
 
 
-def _request_headers(cfg, status, *, conditional=True):
+def _request_headers(cfg, release_state, *, conditional=True):
     token = _text(cfg.get("central_api_token"))
     if token.upper() in PLACEHOLDER_TOKENS:
         token = ""
@@ -72,11 +80,11 @@ def _request_headers(cfg, status, *, conditional=True):
         )
     headers = {
         "Accept": "application/json",
-        "User-Agent": "face-attendance-embedding-sync/2",
+        "User-Agent": "face-attendance-embedding-sync/3",
     }
     if token:
         headers["Authorization"] = f"Bearer {token}"
-    etag = _text(status.get("etag"))
+    etag = _text(release_state.get("etag"))
     if conditional and etag:
         headers["If-None-Match"] = etag
     return headers
@@ -187,10 +195,11 @@ def _read_limited_json(response, max_bytes):
 
     chunks = []
     total = 0
-    if hasattr(response, "iter_content"):
-        iterator = response.iter_content(chunk_size=64 * 1024)
-    else:
-        iterator = [getattr(response, "content", b"")]
+    iterator = (
+        response.iter_content(chunk_size=64 * 1024)
+        if hasattr(response, "iter_content")
+        else [getattr(response, "content", b"")]
+    )
     for chunk in iterator:
         if not chunk:
             continue
@@ -207,15 +216,28 @@ def _read_limited_json(response, max_bytes):
 
 
 def _gallery_options(cfg):
+    production = bool(cfg.get("production_mode", False))
+    if production:
+        branch = _text(cfg.get("branch_name"))
+        model = _text(cfg.get("model"))
+        model_version = _text(cfg.get("model_version"))
+        if not branch or not model or not model_version:
+            raise GalleryError(
+                "production sync requires branch_name, model, and model_version"
+            )
     return {
         "expected_model": cfg.get("model"),
         "expected_model_version": cfg.get("model_version"),
         "expected_branch": _text(cfg.get("branch_name")),
-        "require_model_match": bool(cfg.get("require_model_match", True)),
-        "require_model_version_match": bool(
-            cfg.get("require_model_version_match", False)
-        ),
-        "allow_empty": bool(cfg.get("allow_empty_embedding_gallery", False)),
+        "require_model_match": True
+        if production
+        else bool(cfg.get("require_model_match", True)),
+        "require_model_version_match": True
+        if production
+        else bool(cfg.get("require_model_version_match", False)),
+        "allow_empty": False
+        if production
+        else bool(cfg.get("allow_empty_embedding_gallery", False)),
         "max_employees": int(cfg.get("max_gallery_employees", 10000)),
         "max_embeddings_per_employee": int(
             cfg.get("max_embeddings_per_employee", 50)
@@ -223,18 +245,20 @@ def _gallery_options(cfg):
     }
 
 
-def _local_metadata(gallery_path, cfg):
-    _, metadata, _ = load_gallery(gallery_path, **_gallery_options(cfg))
-    return metadata
+def _local_gallery(gallery_path, cfg):
+    _, metadata, sanitized = load_gallery(gallery_path, **_gallery_options(cfg))
+    return metadata, sanitized
 
 
 def _result_from_metadata(
     metadata,
+    release_info,
     *,
     url,
     attempted_at,
     changed,
     etag,
+    scope_id,
     not_modified=False,
 ):
     return {
@@ -244,24 +268,60 @@ def _result_from_metadata(
         "attempted_at": attempted_at,
         "last_success_at": utc_now(),
         "source_url": url,
+        "release_scope_id": scope_id,
         "branch": metadata.get("branch"),
         "gallery_version": metadata.get("gallery_version"),
         "checksum": metadata.get("checksum"),
         "etag": etag,
         "model": metadata.get("model"),
+        "model_version": metadata.get("model_version"),
         "dimension": metadata.get("dimension"),
         "employee_count": metadata.get("employee_count"),
         "embedding_count": metadata.get("embedding_count"),
+        "release_verified": bool(release_info.get("verified")),
+        "release_sequence": release_info.get("sequence"),
+        "release_publisher": release_info.get("publisher", ""),
+        "release_key_id": release_info.get("key_id", ""),
+        "release_generated_at": release_info.get("generated_at", ""),
         "error": "",
     }
+
+
+def _write_success_status(
+    status_path,
+    status,
+    scope_id,
+    descriptor,
+    release_info,
+    result,
+):
+    scopes = record_acceptance(
+        status,
+        scope_id,
+        descriptor,
+        release_info,
+        etag=result.get("etag"),
+        accepted_at=result.get("last_success_at"),
+        history_limit=int(result.get("history_limit") or 32),
+    )
+    clean = dict(result)
+    clean.pop("history_limit", None)
+    return write_sync_status(
+        status_path,
+        release_scopes=scopes,
+        **clean,
+    )
 
 
 def sync_gallery(cfg, gallery_path, status_path, session=requests, sleep=time.sleep):
     attempted_at = utc_now()
     requested_url = _validate_source(cfg)
     resolved_url = requested_url
+    gallery_options = _gallery_options(cfg)
     gallery_path = Path(gallery_path)
     status = read_sync_status(status_path)
+    scope_id, descriptor = release_scope(requested_url, cfg)
+    previous_release = scope_state(status, scope_id)
     branch = _text(cfg.get("branch_name"))
     params = {"branch": branch} if branch else None
     retries = max(0, int(cfg.get("embedding_sync_retries", 2)))
@@ -276,26 +336,51 @@ def sync_gallery(cfg, gallery_path, status_path, session=requests, sleep=time.sl
                     session,
                     requested_url,
                     headers=_request_headers(
-                        cfg, status, conditional=gallery_path.exists()
+                        cfg,
+                        previous_release,
+                        conditional=gallery_path.exists(),
                     ),
                     params=params,
                     timeout=_timeouts(cfg),
                     cfg=cfg,
                 )
                 if response.status_code == 304:
-                    metadata = _local_metadata(gallery_path, cfg)
-                    etag = _text(response.headers.get("ETag")) or _text(
-                        status.get("etag")
+                    if not previous_release:
+                        raise GalleryError(
+                            "embedding server returned 304 without matching scoped release state"
+                        )
+                    metadata, sanitized = _local_gallery(gallery_path, cfg)
+                    release_info = validate_installed_release(
+                        sanitized,
+                        cfg,
+                        status,
+                        source_url=requested_url,
+                    )
+                    etag = _text(response.headers.get("ETag")) or scoped_etag(
+                        status, scope_id
                     )
                     result = _result_from_metadata(
                         metadata,
+                        release_info,
                         url=resolved_url,
                         attempted_at=attempted_at,
                         changed=False,
                         etag=etag,
+                        scope_id=scope_id,
                         not_modified=True,
                     )
-                    write_sync_status(status_path, **result)
+                    result["history_limit"] = int(
+                        cfg.get("embedding_release_history_limit", 32)
+                    )
+                    _write_success_status(
+                        status_path,
+                        status,
+                        scope_id,
+                        descriptor,
+                        release_info,
+                        result,
+                    )
+                    result.pop("history_limit", None)
                     return result
 
                 if response.status_code >= 500 and attempt < retries:
@@ -311,30 +396,48 @@ def sync_gallery(cfg, gallery_path, status_path, session=requests, sleep=time.sl
                     payload = payload["data"]
 
                 sanitized, _, metadata = validate_gallery(
-                    payload, **_gallery_options(cfg)
+                    payload, **gallery_options
+                )
+                release_info = validate_release(
+                    sanitized,
+                    cfg,
+                    previous_release,
                 )
                 try:
-                    current = _local_metadata(gallery_path, cfg)
-                    current_checksum = current.get("checksum")
+                    current_metadata, _ = _local_gallery(gallery_path, cfg)
+                    current_checksum = current_metadata.get("checksum")
                 except GalleryError:
                     current_checksum = None
 
                 changed = current_checksum != metadata.get("checksum")
                 if changed:
                     write_gallery_atomic(
-                        gallery_path, sanitized, **_gallery_options(cfg)
+                        gallery_path, sanitized, **gallery_options
                     )
                 etag = _text(response.headers.get("ETag"))
                 if not etag and metadata.get("checksum"):
                     etag = f'"{metadata["checksum"]}"'
                 result = _result_from_metadata(
                     metadata,
+                    release_info,
                     url=resolved_url,
                     attempted_at=attempted_at,
                     changed=changed,
                     etag=etag,
+                    scope_id=scope_id,
                 )
-                write_sync_status(status_path, **result)
+                result["history_limit"] = int(
+                    cfg.get("embedding_release_history_limit", 32)
+                )
+                _write_success_status(
+                    status_path,
+                    status,
+                    scope_id,
+                    descriptor,
+                    release_info,
+                    result,
+                )
+                result.pop("history_limit", None)
                 return result
             except requests.RequestException:
                 if attempt >= retries:
@@ -351,6 +454,7 @@ def sync_gallery(cfg, gallery_path, status_path, session=requests, sleep=time.sl
             ok=False,
             attempted_at=attempted_at,
             source_url=resolved_url,
+            release_scope_id=scope_id,
             error=str(exc),
         )
         if isinstance(exc, GalleryError):

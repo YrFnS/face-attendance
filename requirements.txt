@@ -2,6 +2,7 @@ opencv-python-headless>=4.10.0,<5
 insightface==0.7.3
 onnxruntime>=1.20.0,<2
 numpy>=1.26.4
+cryptography>=43,<48
 flask>=3.0.3,<4
 gunicorn>=26.0.0,<27
 pyftpdlib>=2.0.1,<3

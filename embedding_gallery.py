@@ -51,6 +51,34 @@ def _clean_text(value, field, required=False):
     return text
 
 
+def _sanitize_release(value):
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise GalleryError("release must be a JSON object")
+    try:
+        sequence = int(value.get("sequence"))
+    except (TypeError, ValueError) as exc:
+        raise GalleryError("release.sequence must be an integer") from exc
+    if sequence <= 0:
+        raise GalleryError("release.sequence must be greater than zero")
+    publisher = _clean_text(value.get("publisher"), "release.publisher", required=True)
+    key_id = _clean_text(value.get("key_id"), "release.key_id", required=True)
+    algorithm = _clean_text(
+        value.get("algorithm"), "release.algorithm", required=True
+    ).lower()
+    signature = _clean_text(
+        value.get("signature"), "release.signature", required=True
+    )
+    return {
+        "sequence": sequence,
+        "publisher": publisher,
+        "key_id": key_id,
+        "algorithm": algorithm,
+        "signature": signature,
+    }
+
+
 def _gallery_checksum(payload):
     checksum_payload = dict(payload)
     checksum_payload.pop("checksum", None)
@@ -112,6 +140,13 @@ def validate_gallery(
         raise GalleryError(
             f"branch mismatch: received {branch!r}, expected {expected_branch!r}"
         )
+
+    generated_at = _clean_text(
+        payload.get("generated_at"), "generated_at", required=True
+    )
+    gallery_version = _clean_text(payload.get("gallery_version"), "gallery_version")
+    if not gallery_version:
+        gallery_version = generated_at
 
     try:
         dimension = int(payload.get("dimension"))
@@ -191,10 +226,8 @@ def validate_gallery(
 
     sanitized = {
         "schema_version": SCHEMA_VERSION,
-        "gallery_version": _clean_text(payload.get("gallery_version"), "gallery_version")
-        or utc_now(),
-        "generated_at": _clean_text(payload.get("generated_at"), "generated_at")
-        or utc_now(),
+        "gallery_version": gallery_version,
+        "generated_at": generated_at,
         "model": model,
         "model_version": model_version,
         "dimension": dimension,
@@ -202,6 +235,9 @@ def validate_gallery(
         "branch": branch,
         "employees": sanitized_employees,
     }
+    release = _sanitize_release(payload.get("release"))
+    if release is not None:
+        sanitized["release"] = release
     sanitized["checksum"] = _gallery_checksum(sanitized)
 
     metadata = {
@@ -209,6 +245,13 @@ def validate_gallery(
     }
     metadata["employee_count"] = len(sanitized_employees)
     metadata["embedding_count"] = embedding_count
+    if release is not None:
+        metadata.update(
+            release_sequence=release["sequence"],
+            release_publisher=release["publisher"],
+            release_key_id=release["key_id"],
+            release_algorithm=release["algorithm"],
+        )
     return sanitized, known, metadata
 
 
@@ -345,29 +388,6 @@ def gallery_signature(path):
     return stat.st_mtime_ns, stat.st_size
 
 
-def gallery_status(path, *, max_age_seconds=None):
-    path = Path(path)
-    if not path.exists():
-        return {"available": False, "path": str(path), "error": "gallery not found"}
-    try:
-        _, metadata, _ = load_gallery(path, require_model_match=False)
-        stat = path.stat()
-        age_seconds = max(0, int(datetime.now().timestamp() - stat.st_mtime))
-        max_age = int(max_age_seconds or 0)
-        return {
-            "available": True,
-            "path": str(path),
-            "updated_at": datetime.fromtimestamp(
-                stat.st_mtime, timezone.utc
-            ).isoformat().replace("+00:00", "Z"),
-            "age_seconds": age_seconds,
-            "stale": bool(max_age and age_seconds > max_age),
-            **metadata,
-        }
-    except (GalleryError, OSError) as exc:
-        return {"available": False, "path": str(path), "error": str(exc)}
-
-
 def read_sync_status(path):
     try:
         data = json.loads(Path(path).read_text(encoding="utf-8"))
@@ -386,12 +406,65 @@ def write_sync_status(path, **values):
     return current
 
 
-def sync_gallery(cfg, gallery_path, status_path, session=None, sleep=None):
-    """Compatibility wrapper for callers that have not moved to secure_sync yet.
+def _runtime_release_context(path):
+    path = Path(path)
+    config_path = path.parent / "config.json"
+    if not config_path.is_file():
+        return None
+    try:
+        cfg = json.loads(config_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(cfg, dict):
+        return None
+    status = read_sync_status(path.parent / "embedding_sync_status.json")
+    return cfg, status
 
-    The network implementation lives only in secure_sync.py. Import lazily to
-    avoid a circular import while secure_sync imports gallery validation helpers.
-    """
+
+def _validate_runtime_release(path, sanitized):
+    context = _runtime_release_context(path)
+    if context is None:
+        return None
+    cfg, status = context
+    from gallery_release import configured_source_url, validate_installed_release
+
+    return validate_installed_release(
+        sanitized,
+        cfg,
+        status,
+        source_url=configured_source_url(cfg),
+    )
+
+
+def gallery_status(path, *, max_age_seconds=None):
+    path = Path(path)
+    if not path.exists():
+        return {"available": False, "path": str(path), "error": "gallery not found"}
+    try:
+        _, metadata, sanitized = load_gallery(path, require_model_match=False)
+        release = _validate_runtime_release(path, sanitized)
+        stat = path.stat()
+        age_seconds = max(0, int(datetime.now().timestamp() - stat.st_mtime))
+        max_age = int(max_age_seconds or 0)
+        result = {
+            "available": True,
+            "path": str(path),
+            "updated_at": datetime.fromtimestamp(
+                stat.st_mtime, timezone.utc
+            ).isoformat().replace("+00:00", "Z"),
+            "age_seconds": age_seconds,
+            "stale": bool(max_age and age_seconds > max_age),
+            **metadata,
+        }
+        if release is not None:
+            result["release_validation"] = release
+        return result
+    except (GalleryError, OSError) as exc:
+        return {"available": False, "path": str(path), "error": str(exc)}
+
+
+def sync_gallery(cfg, gallery_path, status_path, session=None, sleep=None):
+    """Compatibility wrapper for callers that have not moved to secure_sync yet."""
 
     from secure_sync import sync_gallery as secure_sync_gallery
 
@@ -430,7 +503,7 @@ class GalleryReloader:
         signature = gallery_signature(self.path)
         if not force and signature == self.signature and self.known:
             return self.known, self.metadata, False
-        known, metadata, _ = load_gallery(
+        known, metadata, sanitized = load_gallery(
             self.path,
             expected_model=self.expected_model,
             expected_model_version=self.expected_model_version,
@@ -439,6 +512,10 @@ class GalleryReloader:
             require_model_version_match=self.require_model_version_match,
             allow_empty=self.allow_empty,
         )
+        release = _validate_runtime_release(self.path, sanitized)
+        if release is not None:
+            metadata = dict(metadata)
+            metadata["release_validation"] = release
         self.known = known
         self.metadata = metadata
         self.signature = gallery_signature(self.path)
