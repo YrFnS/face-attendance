@@ -1,0 +1,553 @@
+name: Apply H0 canonical watcher enforcement
+
+on:
+  push:
+    branches:
+      - agent/h0-canonical-watcher
+
+permissions:
+  contents: write
+
+jobs:
+  apply-canonical-watcher:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          ref: agent/h0-canonical-watcher
+          fetch-depth: 0
+
+      - name: Apply canonical watcher changes
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+
+          ROOT = Path('.')
+
+
+          def replace_once(path, old, new):
+              path = ROOT / path
+              text = path.read_text(encoding='utf-8')
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(
+                      f"expected exactly one match in {path} but found {count}: {old[:120]!r}"
+                  )
+              path.write_text(text.replace(old, new), encoding='utf-8')
+
+
+          watcher_policy = '''"""Production and legacy watcher entry-point policy."""
+
+CANONICAL_WATCHER = "watch_service.py"
+LEGACY_WATCHER_COMMANDS = frozenset({"watch", "watch-folder"})
+
+
+def require_legacy_dry_run(command, *, dry_run):
+    """Refuse legacy watcher commands unless they are explicitly non-delivering."""
+
+    command = str(command or "").strip()
+    if command not in LEGACY_WATCHER_COMMANDS:
+        raise ValueError(f"unknown legacy watcher command: {command or '<empty>'}")
+    if bool(dry_run):
+        return
+    raise SystemExit(
+        f"Refusing live legacy watcher '{command}'. It bypasses production "
+        "readiness, PAD, replay protection, and the durable event ledger. "
+        f"Use 'python {CANONICAL_WATCHER}' for live processing. For controlled "
+        f"diagnostics only, rerun 'python face_attendance.py {command} --dry-run'."
+    )
+'''
+          (ROOT / 'watcher_entrypoints.py').write_text(watcher_policy, encoding='utf-8')
+
+          replace_once(
+              'face_attendance.py',
+              '''    write_gallery_atomic,\n)\n\n\nROOT = Path(__file__).resolve().parent\n''',
+              '''    write_gallery_atomic,\n)\nfrom watcher_entrypoints import require_legacy_dry_run\n\n\nROOT = Path(__file__).resolve().parent\n''',
+          )
+          replace_once(
+              'face_attendance.py',
+              '''def watch(once=False, dry_run=False):\n    cfg = load_config()\n''',
+              '''def watch(once=False, dry_run=False):\n    require_legacy_dry_run("watch", dry_run=dry_run)\n    cfg = load_config()\n''',
+          )
+          replace_once(
+              'face_attendance.py',
+              '''def watch_folder(once=False, dry_run=False, scan_existing=False):\n    cfg = load_config()\n''',
+              '''def watch_folder(once=False, dry_run=False, scan_existing=False):\n    require_legacy_dry_run("watch-folder", dry_run=dry_run)\n    cfg = load_config()\n''',
+          )
+          replace_once(
+              'face_attendance.py',
+              '''    run = sub.add_parser("watch")\n    run.add_argument("--once", action="store_true")\n    run.add_argument("--dry-run", action="store_true")\n\n    folder = sub.add_parser("watch-folder")\n    folder.add_argument("--once", action="store_true")\n    folder.add_argument("--dry-run", action="store_true")\n''',
+              '''    run = sub.add_parser(\n        "watch",\n        help="Legacy RTSP diagnostics only; live processing is refused.",\n    )\n    run.add_argument("--once", action="store_true")\n    run.add_argument(\n        "--dry-run",\n        action="store_true",\n        help="Required safety flag for the legacy RTSP diagnostic path.",\n    )\n\n    folder = sub.add_parser(\n        "watch-folder",\n        help="Legacy folder diagnostics only; live processing is refused.",\n    )\n    folder.add_argument("--once", action="store_true")\n    folder.add_argument(\n        "--dry-run",\n        action="store_true",\n        help="Required safety flag for the legacy folder diagnostic path.",\n    )\n''',
+          )
+
+          start_face_attendance = r'''$ErrorActionPreference = 'Stop'
+
+$Project = if ($env:FACE_ATTENDANCE_DIR) {
+    [System.IO.Path]::GetFullPath($env:FACE_ATTENDANCE_DIR)
+} else {
+    $PSScriptRoot
+}
+$Python = Join-Path $Project '.venv\Scripts\python.exe'
+$FtpReceiver = Join-Path $Project 'ftp_receiver.py'
+$Watcher = Join-Path $Project 'watch_service.py'
+$LogDir = Join-Path $Project 'logs'
+
+foreach ($RequiredPath in @($Python, $FtpReceiver, $Watcher)) {
+    if (-not (Test-Path -LiteralPath $RequiredPath -PathType Leaf)) {
+        throw "Required file not found: $RequiredPath"
+    }
+}
+
+function Get-RunningPythonProcess([string] $ScriptName) {
+    $Pattern = [regex]::Escape($ScriptName)
+    Get-CimInstance Win32_Process -Filter "name = 'python.exe' or name = 'pythonw.exe'" |
+        Where-Object { $_.CommandLine -and $_.CommandLine -match $Pattern } |
+        Select-Object -First 1
+}
+
+function Start-PythonBackground([string] $ScriptPath, [string] $LogStem) {
+    $QuotedScript = '"' + $ScriptPath.Replace('"', '\"') + '"'
+    Start-Process `
+        -FilePath $Python `
+        -ArgumentList @('-u', $QuotedScript) `
+        -WorkingDirectory $Project `
+        -WindowStyle Hidden `
+        -RedirectStandardOutput (Join-Path $LogDir "$LogStem.out.log") `
+        -RedirectStandardError (Join-Path $LogDir "$LogStem.err.log")
+}
+
+New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
+
+if (-not (Get-RunningPythonProcess 'ftp_receiver.py')) {
+    Start-PythonBackground $FtpReceiver 'ftp'
+}
+if (Get-RunningPythonProcess 'watch_service.py') {
+    throw 'The canonical watch_service.py process is already running.'
+}
+
+Push-Location $Project
+try {
+    & $Python -u $Watcher `
+        1>> (Join-Path $LogDir 'watch.out.log') `
+        2>> (Join-Path $LogDir 'watch.err.log')
+    exit $LASTEXITCODE
+} finally {
+    Pop-Location
+}
+'''
+          (ROOT / 'start_face_attendance.ps1').write_text(
+              start_face_attendance, encoding='utf-8'
+          )
+
+          start_ftp_only = r'''$ErrorActionPreference = 'Stop'
+
+$Project = if ($env:FACE_ATTENDANCE_DIR) {
+    [System.IO.Path]::GetFullPath($env:FACE_ATTENDANCE_DIR)
+} else {
+    $PSScriptRoot
+}
+$Python = Join-Path $Project '.venv\Scripts\python.exe'
+$FtpReceiver = Join-Path $Project 'ftp_receiver.py'
+$Watcher = Join-Path $Project 'watch_service.py'
+$LogDir = Join-Path $Project 'logs'
+
+foreach ($RequiredPath in @($Python, $FtpReceiver, $Watcher)) {
+    if (-not (Test-Path -LiteralPath $RequiredPath -PathType Leaf)) {
+        throw "Required file not found: $RequiredPath"
+    }
+}
+
+function Get-RunningPythonProcess([string] $ScriptName) {
+    $Pattern = [regex]::Escape($ScriptName)
+    Get-CimInstance Win32_Process -Filter "name = 'python.exe' or name = 'pythonw.exe'" |
+        Where-Object { $_.CommandLine -and $_.CommandLine -match $Pattern } |
+        Select-Object -First 1
+}
+
+function Start-PythonBackground([string] $ScriptPath, [string] $LogStem) {
+    $QuotedScript = '"' + $ScriptPath.Replace('"', '\"') + '"'
+    Start-Process `
+        -FilePath $Python `
+        -ArgumentList @('-u', $QuotedScript) `
+        -WorkingDirectory $Project `
+        -WindowStyle Hidden `
+        -RedirectStandardOutput (Join-Path $LogDir "$LogStem.out.log") `
+        -RedirectStandardError (Join-Path $LogDir "$LogStem.err.log")
+}
+
+New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
+
+if (-not (Get-RunningPythonProcess 'ftp_receiver.py')) {
+    Start-PythonBackground $FtpReceiver 'ftp'
+}
+if (-not (Get-RunningPythonProcess 'watch_service.py')) {
+    Start-PythonBackground $Watcher 'watch'
+}
+
+Write-Host 'Canonical FTP receiver and watch_service.py are running.'
+'''
+          (ROOT / 'start_ftp_only.ps1').write_text(start_ftp_only, encoding='utf-8')
+
+          install_auto_start = r'''$ErrorActionPreference = 'Stop'
+
+$Project = if ($env:FACE_ATTENDANCE_DIR) {
+    [System.IO.Path]::GetFullPath($env:FACE_ATTENDANCE_DIR)
+} else {
+    $PSScriptRoot
+}
+$Python = Join-Path $Project '.venv\Scripts\python.exe'
+$FtpReceiver = Join-Path $Project 'ftp_receiver.py'
+$Watcher = Join-Path $Project 'watch_service.py'
+
+foreach ($RequiredPath in @($Python, $FtpReceiver, $Watcher)) {
+    if (-not (Test-Path -LiteralPath $RequiredPath -PathType Leaf)) {
+        throw "Required file not found: $RequiredPath"
+    }
+}
+
+$Trigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
+$Settings = New-ScheduledTaskSettingsSet `
+    -RestartCount 999 `
+    -RestartInterval (New-TimeSpan -Minutes 1) `
+    -ExecutionTimeLimit ([TimeSpan]::Zero) `
+    -MultipleInstances IgnoreNew
+
+$Tasks = @(
+    @{
+        Name = 'Face Attendance FTP Receiver'
+        Script = $FtpReceiver
+        Description = 'Receives staged HOLOWITS FTP captures for the face-attendance node.'
+    },
+    @{
+        Name = 'Face Attendance Watcher'
+        Script = $Watcher
+        Description = 'Runs the canonical replay-resistant watcher with readiness, PAD, and event-state controls.'
+    }
+)
+
+foreach ($Task in $Tasks) {
+    $ScriptPath = [string] $Task.Script
+    $Arguments = "-u `"$ScriptPath`""
+    $Action = New-ScheduledTaskAction `
+        -Execute $Python `
+        -Argument $Arguments `
+        -WorkingDirectory $Project
+
+    Register-ScheduledTask `
+        -TaskName ([string] $Task.Name) `
+        -Action $Action `
+        -Trigger $Trigger `
+        -Settings $Settings `
+        -Description ([string] $Task.Description) `
+        -Force | Out-Null
+
+    Start-ScheduledTask -TaskName ([string] $Task.Name)
+    Write-Host "Installed and started: $($Task.Name)"
+}
+'''
+          (ROOT / 'install_auto_start.ps1').write_text(
+              install_auto_start, encoding='utf-8'
+          )
+
+          stop_auto_start = r'''$ErrorActionPreference = 'Stop'
+
+$TaskNames = @(
+    'Face Attendance Watcher',
+    'Face Attendance FTP Receiver'
+)
+
+foreach ($TaskName in $TaskNames) {
+    Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+    Unregister-ScheduledTask `
+        -TaskName $TaskName `
+        -Confirm:$false `
+        -ErrorAction SilentlyContinue
+    Write-Host "Stopped and removed: $TaskName"
+}
+'''
+          (ROOT / 'stop_auto_start.ps1').write_text(stop_auto_start, encoding='utf-8')
+
+          systemd_service = '''[Unit]
+Description=Face Attendance Canonical Replay-Resistant Folder Watcher
+After=network-online.target face-attendance-ftp.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/face-attendance
+ExecStart=/opt/face-attendance/.venv/bin/python -u /opt/face-attendance/watch_service.py
+Restart=on-failure
+RestartSec=3
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+
+[Install]
+WantedBy=multi-user.target
+'''
+          (ROOT / 'deploy/systemd/face-attendance-watch.service').write_text(
+              systemd_service, encoding='utf-8'
+          )
+
+          replace_once(
+              'install_linux.sh',
+              '''  --exclude embeddings.pkl \\\n  --exclude model_manifest.json \\\n''',
+              '''  --exclude embeddings.pkl \\\n  --exclude legacy_backups \\\n  --exclude legacy_quarantine \\\n  --exclude model_manifest.json \\\n''',
+          )
+          replace_once(
+              'install_linux.sh',
+              '''if [ -s "$APP_DIR/embedding_gallery.json" ] || [ -s "$APP_DIR/embeddings.pkl" ]; then
+  sudo systemctl restart face-attendance-watch
+else
+  sudo systemctl stop face-attendance-watch 2>/dev/null || true
+  echo "Watcher left stopped: configure and sync a valid embedding gallery first."
+fi
+''',
+              '''if [ -s "$APP_DIR/embedding_gallery.json" ]; then
+  sudo systemctl restart face-attendance-watch
+else
+  sudo systemctl stop face-attendance-watch 2>/dev/null || true
+  echo "Watcher left stopped: configure and sync a valid embedding_gallery.json first."
+  if [ -s "$APP_DIR/embeddings.pkl" ]; then
+    echo "Legacy embeddings.pkl detected; it does not enable the watcher. Use the explicit trusted converter or sync a fresh gallery."
+  fi
+fi
+''',
+          )
+
+          replace_once(
+              'README.md',
+              '- `face_attendance.py` — recognition/check-in helpers and legacy watcher commands.\n',
+              '- `face_attendance.py` — recognition/check-in helpers and legacy diagnostic commands that refuse live processing.\n',
+          )
+          replace_once(
+              'README.md',
+              'On a fresh installation, FTP and the web UI start, but the live watcher stays stopped until a valid embedding gallery exists. This prevents accidental checkin creation before enrollment is verified.\n',
+              'On a fresh installation, FTP and the web UI start, but the live watcher stays stopped until a valid `embedding_gallery.json` exists. A legacy `embeddings.pkl` never enables the watcher. This prevents accidental checkin creation before enrollment is verified.\n',
+          )
+          replace_once(
+              'README.md',
+              '''# Production camera processing
+python watch_service.py
+python watch_service.py --dry-run
+python watch_service.py --once --dry-run --allow-stale
+```
+
+`face_attendance.py watch` and `watch-folder` are legacy compatibility paths. Do not use them for live production processing because they bypass the production event ledger, PAD, and readiness gate.
+
+Service status and logs:
+''',
+              '''# Production camera processing
+python watch_service.py
+python watch_service.py --dry-run
+python watch_service.py --once --dry-run --allow-stale
+
+# Legacy diagnostics only; both refuse non-dry-run execution
+python face_attendance.py watch --dry-run
+python face_attendance.py watch-folder --scan-existing --dry-run
+```
+
+`watch_service.py` is the only supported live watcher. The legacy `face_attendance.py watch` and `watch-folder` commands now fail closed unless `--dry-run` is present, because they do not provide the production readiness, PAD, replay, and event-ledger controls.
+
+### Native Windows launchers
+
+The bundled PowerShell launchers resolve the repository from their own location instead of a hard-coded user path. Set `FACE_ATTENDANCE_DIR` only when the scripts are stored outside the application directory.
+
+```powershell
+# Foreground canonical watcher; starts the FTP receiver when needed
+.\\start_face_attendance.ps1
+
+# Start both canonical processes hidden
+.\\start_ftp_only.ps1
+
+# Register separate restartable logon tasks for FTP and the canonical watcher
+.\\install_auto_start.ps1
+```
+
+All three launch paths execute `watch_service.py`; none can start the legacy RTSP or direct-folder watcher. Configure a valid Windows `camera_uploads_dir`, synchronize the gallery, and run readiness checks before enabling live delivery.
+
+Service status and logs:
+''',
+          )
+
+          replace_once(
+              'HANDOFF.md',
+              'Both are ignored by Git and written with restrictive file permissions where supported. `embeddings.pkl` is legacy local state only. It is converted once when no JSON gallery exists.\n',
+              'Both are ignored by Git and written with restrictive file permissions where supported. `embeddings.pkl` is legacy local state only. Service startup never deserializes it; migration requires the explicit provenance-checked offline converter documented in the README.\n',
+          )
+          replace_once(
+              'HANDOFF.md',
+              'Run only the intended FTP receiver and this repository\'s watcher. Do not run old Frigate/RTSP recognition workers in parallel.\n',
+              'Run only the intended FTP receiver and the canonical `watch_service.py` watcher. Stop any `face_attendance.py watch`, `face_attendance.py watch-folder`, Frigate, or RTSP recognition worker before live delivery; the bundled legacy commands are diagnostics-only and refuse non-dry-run execution.\n',
+          )
+
+          replace_once(
+              'docs/security-hardening.md',
+              'The production watcher is `watch_service.py`, not the legacy direct folder command. It computes a SHA-256 digest for each completed camera upload and claims an event in SQLite before recognition. The same binary image from the same camera cannot be processed again, including after a restart.\n',
+              'The only supported live watcher is `watch_service.py`. Linux systemd and every bundled Windows launcher execute that entry point. The legacy `face_attendance.py watch` and `watch-folder` commands refuse execution unless `--dry-run` is present, so they cannot silently bypass readiness, PAD, replay protection, or event state. The canonical watcher computes a SHA-256 digest for each completed camera upload and claims an event in SQLite before recognition. The same binary image from the same camera cannot be processed again, including after a restart.\n',
+          )
+
+          replace_once(
+              'docs/production-readiness.md',
+              'In production mode, a live watcher start is refused when license acknowledgement, model integrity, PAD, admin authentication, HTTPS acknowledgement, protected camera transport, camera IDs, or required HTTPS service URLs are invalid. Dry-run mode remains available for controlled setup and diagnostics.\n',
+              'The systemd service and bundled Windows launchers must execute `watch_service.py`. The legacy `face_attendance.py watch` and `watch-folder` paths refuse non-dry-run execution. In production mode, a canonical live watcher start is refused when license acknowledgement, model integrity, PAD, admin authentication, HTTPS acknowledgement, protected camera transport, camera IDs, or required HTTPS service URLs are invalid. Dry-run mode remains available for controlled setup and diagnostics.\n',
+          )
+
+          canonical_tests = r'''import ast
+import unittest
+from pathlib import Path
+
+from watcher_entrypoints import CANONICAL_WATCHER, require_legacy_dry_run
+
+
+ROOT = Path(__file__).resolve().parent
+
+
+class CanonicalWatcherTests(unittest.TestCase):
+    def test_live_legacy_commands_are_refused(self):
+        for command in ("watch", "watch-folder"):
+            with self.subTest(command=command):
+                with self.assertRaisesRegex(SystemExit, "watch_service.py"):
+                    require_legacy_dry_run(command, dry_run=False)
+
+    def test_legacy_dry_run_remains_available(self):
+        for command in ("watch", "watch-folder"):
+            with self.subTest(command=command):
+                self.assertIsNone(require_legacy_dry_run(command, dry_run=True))
+
+    def test_unknown_legacy_command_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "unknown legacy watcher"):
+            require_legacy_dry_run("unexpected", dry_run=True)
+
+    def test_face_attendance_guards_before_watcher_side_effects(self):
+        tree = ast.parse((ROOT / "face_attendance.py").read_text(encoding="utf-8"))
+        functions = {
+            node.name: node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef)
+        }
+        for function_name, command in (
+            ("watch", "watch"),
+            ("watch_folder", "watch-folder"),
+        ):
+            with self.subTest(function=function_name):
+                first = functions[function_name].body[0]
+                self.assertIsInstance(first, ast.Expr)
+                call = first.value
+                self.assertIsInstance(call, ast.Call)
+                self.assertIsInstance(call.func, ast.Name)
+                self.assertEqual(call.func.id, "require_legacy_dry_run")
+                self.assertEqual(call.args[0].value, command)
+                keyword = next(item for item in call.keywords if item.arg == "dry_run")
+                self.assertIsInstance(keyword.value, ast.Name)
+                self.assertEqual(keyword.value.id, "dry_run")
+
+    def test_windows_launchers_use_only_the_canonical_watcher(self):
+        launchers = (
+            "start_face_attendance.ps1",
+            "start_ftp_only.ps1",
+            "install_auto_start.ps1",
+        )
+        for filename in launchers:
+            with self.subTest(filename=filename):
+                text = (ROOT / filename).read_text(encoding="utf-8")
+                self.assertIn(CANONICAL_WATCHER, text)
+                self.assertNotIn("face_attendance.py", text)
+                self.assertIn("$PSScriptRoot", text)
+                self.assertNotIn(r"C:\Users\E2NEXT", text)
+
+    def test_windows_scheduled_tasks_cover_ftp_and_watcher(self):
+        install = (ROOT / "install_auto_start.ps1").read_text(encoding="utf-8")
+        stop = (ROOT / "stop_auto_start.ps1").read_text(encoding="utf-8")
+        for task_name in (
+            "Face Attendance FTP Receiver",
+            "Face Attendance Watcher",
+        ):
+            self.assertIn(task_name, install)
+            self.assertIn(task_name, stop)
+        self.assertIn("-MultipleInstances IgnoreNew", install)
+
+    def test_linux_service_and_installer_use_canonical_watcher(self):
+        service = (
+            ROOT / "deploy/systemd/face-attendance-watch.service"
+        ).read_text(encoding="utf-8")
+        installer = (ROOT / "install_linux.sh").read_text(encoding="utf-8")
+        self.assertIn(
+            "ExecStart=/opt/face-attendance/.venv/bin/python -u "
+            "/opt/face-attendance/watch_service.py",
+            service,
+        )
+        self.assertIn(
+            'if [ -s "$APP_DIR/embedding_gallery.json" ]; then',
+            installer,
+        )
+        self.assertNotIn(
+            '|| [ -s "$APP_DIR/embeddings.pkl" ]',
+            installer,
+        )
+        self.assertIn("does not enable the watcher", installer)
+
+    def test_operator_docs_name_one_live_entry_point(self):
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+        security = (ROOT / "docs/security-hardening.md").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("only supported live watcher", readme)
+        self.assertIn("only supported live watcher", security)
+        self.assertIn("refuse non-dry-run", readme)
+
+
+if __name__ == "__main__":
+    unittest.main()
+'''
+          (ROOT / 'test_canonical_watcher.py').write_text(
+              canonical_tests, encoding='utf-8'
+          )
+
+          replace_once(
+              '.github/workflows/tests.yml',
+              '''            test_watch_service.py \\\n            test_install_linux.py\n''',
+              '''            test_watch_service.py \\\n            test_canonical_watcher.py \\\n            test_install_linux.py\n''',
+          )
+          PY
+
+      - name: Validate focused changes
+        shell: bash
+        run: |
+          python -m py_compile watcher_entrypoints.py test_canonical_watcher.py
+          python -m unittest -v test_canonical_watcher.py test_install_linux.py
+          bash -n install_linux.sh
+
+      - name: Commit canonical watcher implementation
+        shell: bash
+        run: |
+          rm -f .github/workflows/apply-h0-canonical-watcher.yml
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add \
+            .github/workflows/tests.yml \
+            HANDOFF.md \
+            README.md \
+            deploy/systemd/face-attendance-watch.service \
+            docs/production-readiness.md \
+            docs/security-hardening.md \
+            face_attendance.py \
+            install_auto_start.ps1 \
+            install_linux.sh \
+            start_face_attendance.ps1 \
+            start_ftp_only.ps1 \
+            stop_auto_start.ps1 \
+            test_canonical_watcher.py \
+            watcher_entrypoints.py \
+            .github/workflows/apply-h0-canonical-watcher.yml
+          git commit -m 'enforce canonical production watcher'
+          git push origin HEAD:agent/h0-canonical-watcher
