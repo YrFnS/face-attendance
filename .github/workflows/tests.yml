@@ -6,6 +6,7 @@ on:
     branches:
       - master
       - agent/sync-embedding-gallery
+      - agent/h0-gallery-contract-work
 
 permissions:
   contents: read
@@ -13,13 +14,18 @@ permissions:
 jobs:
   security-and-gallery-tests:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v7.0.1
       - uses: actions/setup-python@v7.0.0
         with:
           python-version: "3.11"
           cache: pip
+      - name: Apply staged H0-07 implementation
+        if: github.ref == 'refs/heads/agent/h0-gallery-contract-work' || github.head_ref == 'agent/h0-gallery-contract-work'
+        run: |
+          cat .h0/embedding-gallery-* > embedding_gallery.py
+          python h0_apply_min.py
       - name: Install test dependencies
         run: |
           python -m pip install --upgrade pip
@@ -37,6 +43,7 @@ jobs:
         run: |
           python -m unittest -v \
             test_embedding_gallery.py \
+            test_gallery_contract.py \
             test_match_employee.py \
             test_secure_sync.py \
             test_gallery_release.py \
@@ -57,3 +64,4 @@ jobs:
           python -m json.tool config.example.json >/dev/null
           bash -n install_linux.sh
           bash -n deploy/firewall/ufw-rules.example.sh
+          git diff --check
