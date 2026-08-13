@@ -38,6 +38,7 @@ jobs:
             test_embedding_gallery.py \
             test_match_employee.py \
             test_secure_sync.py \
+            test_legacy_gallery_converter.py \
             test_runtime_state.py \
             test_web_security.py \
             test_web_admin.py \

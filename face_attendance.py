@@ -1,7 +1,6 @@
 import argparse
 import json
 import os
-import pickle
 import shlex
 import subprocess
 import time
@@ -242,33 +241,16 @@ def enroll_from_camera(employee, photos, delay):
 
 
 def migrate_legacy_embeddings(cfg):
+    del cfg
     if EMBEDDINGS.exists() or not LEGACY_EMBEDDINGS.exists():
         return False
-    try:
-        legacy = pickle.loads(LEGACY_EMBEDDINGS.read_bytes())
-        payload = build_gallery_payload(
-            legacy,
-            model=cfg.get("model", "buffalo_l"),
-            model_version=cfg.get("model_version", ""),
-            branch=cfg.get("branch_name", ""),
-            gallery_version=f"legacy-migration-{int(time.time())}",
-        )
-        write_gallery_atomic(
-            EMBEDDINGS,
-            payload,
-            expected_model=cfg.get("model", "buffalo_l"),
-            expected_model_version=cfg.get("model_version"),
-            expected_branch=cfg.get("branch_name", ""),
-            require_model_match=True,
-            require_model_version_match=bool(
-                cfg.get("require_model_version_match", False)
-            ),
-            allow_empty=False,
-        )
-        log(f"migrated local {LEGACY_EMBEDDINGS.name} to {EMBEDDINGS.name}")
-        return True
-    except Exception as exc:
-        raise GalleryError(f"could not migrate legacy embeddings: {exc}") from exc
+    raise GalleryError(
+        "automatic embeddings.pkl migration is disabled because pickle "
+        "deserialization can execute code. Stop attendance services, verify "
+        "the file SHA-256 from a trusted record, and run "
+        "'python legacy_gallery_converter.py --expected-sha256 <sha256> "
+        "--acknowledge-pickle-code-execution-risk'"
+    )
 
 
 def load_embeddings():

@@ -18,6 +18,7 @@ from embedding_gallery import (
 
 DEFAULT_ENDPOINT = "/api/faces/embeddings"
 PLACEHOLDER_TOKENS = {"", "CHANGE_ME", "REPLACE_ME", "CHANGEME"}
+REDIRECT_STATUSES = {301, 302, 303, 307, 308}
 
 
 def utc_now():
@@ -32,6 +33,33 @@ def _text(value):
 
 def _local_url(parsed):
     return parsed.hostname in {"localhost", "127.0.0.1", "::1"}
+
+
+def _effective_port(parsed):
+    if parsed.port is not None:
+        return parsed.port
+    return 443 if parsed.scheme == "https" else 80
+
+
+def _origin(parsed):
+    return parsed.scheme, (parsed.hostname or "").lower(), _effective_port(parsed)
+
+
+def _validate_http_url(url, cfg, *, field):
+    parsed = urlparse(url)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise GalleryError(f"{field} must be an absolute HTTP(S) URL")
+    if parsed.username or parsed.password:
+        raise GalleryError(f"{field} must not contain embedded credentials")
+    if (
+        parsed.scheme != "https"
+        and not _local_url(parsed)
+        and not bool(cfg.get("allow_insecure_central_url", False))
+    ):
+        raise GalleryError(
+            f"{field} must use HTTPS; allow insecure HTTP only on a trusted VPN/LAN"
+        )
+    return parsed
 
 
 def _request_headers(cfg, status, *, conditional=True):
@@ -58,25 +86,84 @@ def _validate_source(cfg):
     central_url = _text(cfg.get("central_url"))
     if not central_url:
         raise GalleryError("central_url is not configured")
-    parsed = urlparse(central_url)
-    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-        raise GalleryError("central_url must be an absolute HTTP(S) URL")
-    if (
-        parsed.scheme != "https"
-        and not _local_url(parsed)
-        and not bool(cfg.get("allow_insecure_central_url", False))
-    ):
-        raise GalleryError(
-            "central_url must use HTTPS; allow insecure HTTP only on a trusted VPN/LAN"
-        )
+    _validate_http_url(central_url, cfg, field="central_url")
     endpoint = _text(cfg.get("embedding_gallery_path")) or DEFAULT_ENDPOINT
-    return urljoin(central_url.rstrip("/") + "/", endpoint.lstrip("/"))
+    url = urljoin(central_url.rstrip("/") + "/", endpoint.lstrip("/"))
+    _validate_http_url(url, cfg, field="embedding gallery URL")
+    return url
+
+
+def _validate_redirect(current_url, location, cfg):
+    location = _text(location)
+    if not location:
+        raise GalleryError("embedding sync redirect is missing a Location header")
+    target_url = urljoin(current_url, location)
+    current = _validate_http_url(current_url, cfg, field="embedding gallery URL")
+    target = urlparse(target_url)
+    if target.scheme not in {"http", "https"} or not target.netloc:
+        raise GalleryError("embedding redirect URL must be an absolute HTTP(S) URL")
+    if target.username or target.password:
+        raise GalleryError("embedding redirect URL must not contain embedded credentials")
+    if current.scheme == "https" and target.scheme != "https":
+        raise GalleryError("embedding sync refused an HTTPS-to-HTTP redirect")
+    target = _validate_http_url(target_url, cfg, field="embedding redirect URL")
+    if _origin(current) != _origin(target):
+        raise GalleryError("embedding sync refused a cross-origin redirect")
+    return target_url
 
 
 def _timeouts(cfg):
     connect = max(0.25, float(cfg.get("embedding_connect_timeout_seconds", 5)))
     read = max(1.0, float(cfg.get("embedding_read_timeout_seconds", 30)))
     return connect, read
+
+
+def _request_with_validated_redirects(
+    session,
+    url,
+    *,
+    headers,
+    params,
+    timeout,
+    cfg,
+):
+    current_url = url
+    max_redirects = min(10, max(0, int(cfg.get("embedding_max_redirects", 3))))
+    redirects = 0
+
+    while True:
+        response = session.get(
+            current_url,
+            headers=headers,
+            params=params if redirects == 0 else None,
+            timeout=timeout,
+            stream=True,
+            allow_redirects=False,
+        )
+        if response.status_code in REDIRECT_STATUSES:
+            if redirects >= max_redirects:
+                response.close()
+                raise GalleryError(
+                    f"embedding sync exceeded maximum redirects ({max_redirects})"
+                )
+            try:
+                next_url = _validate_redirect(
+                    current_url, response.headers.get("Location"), cfg
+                )
+            except Exception:
+                response.close()
+                raise
+            response.close()
+            current_url = next_url
+            redirects += 1
+            continue
+        if 300 <= response.status_code < 400 and response.status_code != 304:
+            response.close()
+            raise GalleryError(
+                f"embedding sync received unsupported redirect status "
+                f"{response.status_code}"
+            )
+        return response, current_url
 
 
 def _read_limited_json(response, max_bytes):
@@ -171,7 +258,8 @@ def _result_from_metadata(
 
 def sync_gallery(cfg, gallery_path, status_path, session=requests, sleep=time.sleep):
     attempted_at = utc_now()
-    url = _validate_source(cfg)
+    requested_url = _validate_source(cfg)
+    resolved_url = requested_url
     gallery_path = Path(gallery_path)
     status = read_sync_status(status_path)
     branch = _text(cfg.get("branch_name"))
@@ -184,14 +272,15 @@ def sync_gallery(cfg, gallery_path, status_path, session=requests, sleep=time.sl
     try:
         for attempt in range(retries + 1):
             try:
-                response = session.get(
-                    url,
+                response, resolved_url = _request_with_validated_redirects(
+                    session,
+                    requested_url,
                     headers=_request_headers(
                         cfg, status, conditional=gallery_path.exists()
                     ),
                     params=params,
                     timeout=_timeouts(cfg),
-                    stream=True,
+                    cfg=cfg,
                 )
                 if response.status_code == 304:
                     metadata = _local_metadata(gallery_path, cfg)
@@ -200,7 +289,7 @@ def sync_gallery(cfg, gallery_path, status_path, session=requests, sleep=time.sl
                     )
                     result = _result_from_metadata(
                         metadata,
-                        url=url,
+                        url=resolved_url,
                         attempted_at=attempted_at,
                         changed=False,
                         etag=etag,
@@ -211,6 +300,7 @@ def sync_gallery(cfg, gallery_path, status_path, session=requests, sleep=time.sl
 
                 if response.status_code >= 500 and attempt < retries:
                     response.close()
+                    response = None
                     delay = retry_base * (2**attempt) + random.uniform(0, retry_base)
                     sleep(delay)
                     continue
@@ -239,7 +329,7 @@ def sync_gallery(cfg, gallery_path, status_path, session=requests, sleep=time.sl
                     etag = f'"{metadata["checksum"]}"'
                 result = _result_from_metadata(
                     metadata,
-                    url=url,
+                    url=resolved_url,
                     attempted_at=attempted_at,
                     changed=changed,
                     etag=etag,
@@ -260,7 +350,7 @@ def sync_gallery(cfg, gallery_path, status_path, session=requests, sleep=time.sl
             status_path,
             ok=False,
             attempted_at=attempted_at,
-            source_url=url,
+            source_url=resolved_url,
             error=str(exc),
         )
         if isinstance(exc, GalleryError):

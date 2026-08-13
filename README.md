@@ -34,8 +34,10 @@ The camera still sends an image because it cannot send an InsightFace embedding.
 
 - `face_attendance.py` — recognition/check-in helpers and legacy watcher commands.
 - `watch_service.py` — production FTP watcher with readiness, PAD, replay protection, and event state.
-- `embedding_gallery.py` — validates, normalizes, stores, synchronizes, and reloads galleries.
+- `embedding_gallery.py` — validates, normalizes, stores, and reloads galleries.
+- `secure_sync.py` — authoritative bounded gallery-sync client with authenticated, same-origin redirect validation.
 - `sync_embeddings.py` — manual or continuous gallery synchronization.
+- `legacy_gallery_converter.py` — explicit offline converter for a trusted legacy `embeddings.pkl`; never used during service startup.
 - `web_admin.py` — gallery status, manual sync, optional central enrollment UI, and optional export API.
 - `ftp_receiver.py` — receives camera FTP uploads.
 - `import_faces.py` — compatibility wrapper; now syncs embeddings instead of downloading images.
@@ -81,13 +83,14 @@ The attendance server receives embeddings and should normally have local enrollm
   "embedding_sync_enabled": true,
   "embedding_sync_interval_seconds": 300,
   "embedding_max_age_seconds": 86400,
+  "embedding_max_redirects": 3,
   "require_model_match": true,
   "local_enrollment_enabled": false,
   "model": "buffalo_l"
 }
 ```
 
-Use HTTPS. Plain HTTP to a non-local host is rejected unless `allow_insecure_central_url` is explicitly enabled for a trusted VPN or isolated LAN.
+Use HTTPS. Plain HTTP to a non-local host is rejected unless `allow_insecure_central_url` is explicitly enabled for a trusted VPN or isolated LAN. Redirects are followed manually and only when they stay on the same origin; HTTPS downgrades and cross-origin redirects are rejected before the bearer token can be sent to the redirected destination.
 
 Run the first sync before enabling live checkins:
 
@@ -131,7 +134,7 @@ Authorization: Bearer <token>
 
 For a separate central dashboard, implement the same contract described in `docs/embedding-api.md`.
 
-## Migration from image synchronization
+## Migration from image synchronization and legacy pickle files
 
 Older deployments used:
 
@@ -140,7 +143,30 @@ python import_faces.py
 python face_attendance.py build
 ```
 
-`import_faces.py` now invokes embedding synchronization and no longer downloads central employee images. If a local `embeddings.pkl` exists and `embedding_gallery.json` does not, the watcher converts that local legacy file once into the validated JSON format. Remote pickle files are never accepted.
+`import_faces.py` now invokes the bounded embedding synchronization client and no longer downloads central employee images.
+
+Service startup **never deserializes `embeddings.pkl`**. If a legacy pickle exists while `embedding_gallery.json` does not, startup stops with an actionable error. The preferred migration is to rebuild or synchronize a fresh JSON gallery. Use the converter only when the local pickle is genuinely required and its provenance can be verified from a trusted inventory, backup record, or release record.
+
+Pickle deserialization can execute code. Stop attendance services, isolate the host from untrusted networks, compare the file with the trusted SHA-256 record, and then run the explicit one-shot converter:
+
+```bash
+cd /opt/face-attendance
+. .venv/bin/activate
+sudo systemctl stop face-attendance-watch face-attendance-web face-attendance-sync.timer
+
+sha256sum embeddings.pkl
+# Compare the result with the trusted pre-recorded digest. Do not treat a digest
+# calculated from an untrusted file as proof that the file itself is trustworthy.
+
+python legacy_gallery_converter.py \
+  --expected-sha256 <TRUSTED_64_CHARACTER_SHA256> \
+  --acknowledge-pickle-code-execution-risk
+
+python sync_embeddings.py --status
+python production_readiness.py --strict
+```
+
+The converter refuses to overwrite an existing JSON gallery, creates a mode-`0600` backup before deserialization, validates and atomically writes the JSON gallery, and moves the original pickle into `legacy_quarantine/` by default. Keep the backup and quarantine only for the approved rollback window, then dispose of them under the biometric-retention policy. When no trusted provenance record exists, do not deserialize the pickle; rebuild or synchronize the gallery instead.
 
 After a successful central sync and controlled tests, the attendance server's `faces/` directory can be removed. Keep it only on the trusted enrollment server or while retaining a temporary rollback path.
 
@@ -223,6 +249,11 @@ python sync_embeddings.py
 python sync_embeddings.py --status
 python face_attendance.py status
 
+# Explicit offline migration of a trusted legacy pickle only
+python legacy_gallery_converter.py \
+  --expected-sha256 <TRUSTED_64_CHARACTER_SHA256> \
+  --acknowledge-pickle-code-execution-risk
+
 # Central/local fallback enrollment only
 python face_attendance.py build
 python face_attendance.py enroll HR-EMP-00001 --photos 5
@@ -254,9 +285,11 @@ The following contain local state or biometric data and are ignored by Git:
 - `embedding_gallery.json`
 - `embedding_sync_status.json`
 - legacy `embeddings.pkl`
+- `legacy_backups/`
+- `legacy_quarantine/`
 - `faces/`
 - `camera_uploads/`
 - `logs/`
 - `cooldown_state.json`
 
-Do not commit employee photos, embeddings, camera captures, logs, API tokens, or passwords.
+Do not commit employee photos, embeddings, camera captures, legacy pickle backups, logs, API tokens, or passwords.

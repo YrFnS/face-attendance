@@ -4,15 +4,11 @@ import os
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
-from urllib.parse import urljoin, urlparse
 
 import numpy as np
-import requests
 
 
 SCHEMA_VERSION = 1
-DEFAULT_ENDPOINT = "/api/faces/embeddings"
-PLACEHOLDER_TOKENS = {"CHANGE_ME", "REPLACE_ME", "CHANGEME"}
 
 
 class GalleryError(ValueError):
@@ -390,143 +386,21 @@ def write_sync_status(path, **values):
     return current
 
 
-def _is_local_url(parsed):
-    return parsed.hostname in {"localhost", "127.0.0.1", "::1"}
+def sync_gallery(cfg, gallery_path, status_path, session=None, sleep=None):
+    """Compatibility wrapper for callers that have not moved to secure_sync yet.
 
+    The network implementation lives only in secure_sync.py. Import lazily to
+    avoid a circular import while secure_sync imports gallery validation helpers.
+    """
 
-def _request_headers(cfg):
-    token = _clean_text(cfg.get("central_api_token"), "central_api_token")
-    allow_unauthenticated = bool(cfg.get("allow_unauthenticated_embedding_sync", False))
-    if token.upper() in PLACEHOLDER_TOKENS:
-        token = ""
-    if not token and not allow_unauthenticated:
-        raise GalleryError(
-            "central_api_token must be configured with a non-placeholder value"
-        )
-    headers = {"Accept": "application/json"}
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
-    return headers
+    from secure_sync import sync_gallery as secure_sync_gallery
 
-
-def sync_gallery(cfg, gallery_path, status_path, session=requests):
-    attempted_at = utc_now()
-    central_url = _clean_text(cfg.get("central_url"), "central_url", required=True)
-    parsed = urlparse(central_url)
-    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-        raise GalleryError("central_url must be an absolute HTTP(S) URL")
-    if (
-        parsed.scheme != "https"
-        and not _is_local_url(parsed)
-        and not bool(cfg.get("allow_insecure_central_url", False))
-    ):
-        raise GalleryError(
-            "central_url must use HTTPS; set allow_insecure_central_url only on a trusted VPN/LAN"
-        )
-
-    endpoint = _clean_text(cfg.get("embedding_gallery_path"), "embedding_gallery_path")
-    endpoint = endpoint or DEFAULT_ENDPOINT
-    url = urljoin(central_url.rstrip("/") + "/", endpoint.lstrip("/"))
-    timeout = float(cfg.get("embedding_request_timeout_seconds", 30))
-    branch = _clean_text(cfg.get("branch_name"), "branch_name")
-    params = {"branch": branch} if branch else None
-
-    try:
-        response = session.get(
-            url,
-            headers=_request_headers(cfg),
-            params=params,
-            timeout=timeout,
-        )
-        response.raise_for_status()
-        payload = response.json()
-        if isinstance(payload, dict) and isinstance(payload.get("data"), dict):
-            payload = payload["data"]
-
-        sanitized, _, metadata = validate_gallery(
-            payload,
-            expected_model=cfg.get("model"),
-            expected_model_version=cfg.get("model_version"),
-            expected_branch=branch,
-            require_model_match=bool(cfg.get("require_model_match", True)),
-            require_model_version_match=bool(
-                cfg.get("require_model_version_match", False)
-            ),
-            allow_empty=bool(cfg.get("allow_empty_embedding_gallery", False)),
-            max_employees=int(cfg.get("max_gallery_employees", 10000)),
-            max_embeddings_per_employee=int(
-                cfg.get("max_embeddings_per_employee", 50)
-            ),
-        )
-
-        current_checksum = None
-        try:
-            _, current_metadata, _ = load_gallery(
-                gallery_path,
-                expected_model=cfg.get("model"),
-                expected_model_version=cfg.get("model_version"),
-                expected_branch=branch,
-                require_model_match=bool(cfg.get("require_model_match", True)),
-                require_model_version_match=bool(
-                    cfg.get("require_model_version_match", False)
-                ),
-                allow_empty=bool(cfg.get("allow_empty_embedding_gallery", False)),
-            )
-            current_checksum = current_metadata.get("checksum")
-        except GalleryError:
-            pass
-
-        changed = current_checksum != metadata.get("checksum")
-        if changed:
-            write_gallery_atomic(
-                gallery_path,
-                sanitized,
-                expected_model=cfg.get("model"),
-                expected_model_version=cfg.get("model_version"),
-                expected_branch=branch,
-                require_model_match=bool(cfg.get("require_model_match", True)),
-                require_model_version_match=bool(
-                    cfg.get("require_model_version_match", False)
-                ),
-                allow_empty=bool(cfg.get("allow_empty_embedding_gallery", False)),
-                max_employees=int(cfg.get("max_gallery_employees", 10000)),
-                max_embeddings_per_employee=int(
-                    cfg.get("max_embeddings_per_employee", 50)
-                ),
-            )
-
-        result = {
-            "ok": True,
-            "changed": changed,
-            "attempted_at": attempted_at,
-            "last_success_at": utc_now(),
-            "source_url": url,
-            "branch": metadata.get("branch"),
-            "gallery_version": metadata.get("gallery_version"),
-            "checksum": metadata.get("checksum"),
-            "model": metadata.get("model"),
-            "dimension": metadata.get("dimension"),
-            "employee_count": metadata.get("employee_count"),
-            "embedding_count": metadata.get("embedding_count"),
-            "error": "",
-        }
-        write_sync_status(status_path, **result)
-        return result
-    except Exception as exc:
-        write_sync_status(
-            status_path,
-            ok=False,
-            attempted_at=attempted_at,
-            source_url=url,
-            error=str(exc),
-        )
-        if isinstance(exc, GalleryError):
-            raise
-        if isinstance(exc, requests.RequestException):
-            raise GalleryError(f"embedding sync request failed: {exc}") from exc
-        if isinstance(exc, (ValueError, TypeError)):
-            raise GalleryError(f"embedding sync response is invalid: {exc}") from exc
-        raise
+    kwargs = {}
+    if session is not None:
+        kwargs["session"] = session
+    if sleep is not None:
+        kwargs["sleep"] = sleep
+    return secure_sync_gallery(cfg, gallery_path, status_path, **kwargs)
 
 
 class GalleryReloader:
