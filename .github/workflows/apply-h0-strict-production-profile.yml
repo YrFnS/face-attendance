@@ -26,8 +26,8 @@ jobs:
 
           path = Path('apply_h0_strict_profile.py')
           text = path.read_text(encoding='utf-8')
-          for token in ('self', 'unsafe-inline', 'none'):
-              text = text.replace(f"'{token}'", f"\\'{token}\\'")
+          for token in (chr(36), 'self', 'unsafe-inline', 'none'):
+              text = text.replace("'" + token + "'", "\\'" + token + "\\'")
           path.write_text(text, encoding='utf-8')
           PY
           python -m py_compile apply_h0_strict_profile.py
