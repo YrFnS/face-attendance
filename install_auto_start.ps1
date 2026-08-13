@@ -1,24 +1,56 @@
-$ErrorActionPreference = "Stop"
+$ErrorActionPreference = 'Stop'
 
-$taskName = "Face Attendance Watcher"
-$python = "C:\Users\E2NEXT\face-attendance\.venv\Scripts\python.exe"
-$workDir = "C:\Users\E2NEXT\face-attendance"
+$Project = if ($env:FACE_ATTENDANCE_DIR) {
+    [System.IO.Path]::GetFullPath($env:FACE_ATTENDANCE_DIR)
+} else {
+    $PSScriptRoot
+}
+$Python = Join-Path $Project '.venv\Scripts\python.exe'
+$FtpReceiver = Join-Path $Project 'ftp_receiver.py'
+$Watcher = Join-Path $Project 'watch_service.py'
 
-$action = New-ScheduledTaskAction `
-  -Execute $python `
-  -Argument "-u face_attendance.py watch" `
-  -WorkingDirectory $workDir
+foreach ($RequiredPath in @($Python, $FtpReceiver, $Watcher)) {
+    if (-not (Test-Path -LiteralPath $RequiredPath -PathType Leaf)) {
+        throw "Required file not found: $RequiredPath"
+    }
+}
 
-$trigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
-$settings = New-ScheduledTaskSettingsSet -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) -ExecutionTimeLimit (New-TimeSpan -Days 0)
+$Trigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
+$Settings = New-ScheduledTaskSettingsSet `
+    -RestartCount 999 `
+    -RestartInterval (New-TimeSpan -Minutes 1) `
+    -ExecutionTimeLimit ([TimeSpan]::Zero) `
+    -MultipleInstances IgnoreNew
 
-Register-ScheduledTask `
-  -TaskName $taskName `
-  -Action $action `
-  -Trigger $trigger `
-  -Settings $settings `
-  -Description "Runs the local RTSP face recognition watcher and creates Frappe Employee Checkin records." `
-  -Force | Out-Null
+$Tasks = @(
+    @{
+        Name = 'Face Attendance FTP Receiver'
+        Script = $FtpReceiver
+        Description = 'Receives staged HOLOWITS FTP captures for the face-attendance node.'
+    },
+    @{
+        Name = 'Face Attendance Watcher'
+        Script = $Watcher
+        Description = 'Runs the canonical replay-resistant watcher with readiness, PAD, and event-state controls.'
+    }
+)
 
-Start-ScheduledTask -TaskName $taskName
-Write-Host "Installed and started: $taskName"
+foreach ($Task in $Tasks) {
+    $ScriptPath = [string] $Task.Script
+    $Arguments = "-u `"$ScriptPath`""
+    $Action = New-ScheduledTaskAction `
+        -Execute $Python `
+        -Argument $Arguments `
+        -WorkingDirectory $Project
+
+    Register-ScheduledTask `
+        -TaskName ([string] $Task.Name) `
+        -Action $Action `
+        -Trigger $Trigger `
+        -Settings $Settings `
+        -Description ([string] $Task.Description) `
+        -Force | Out-Null
+
+    Start-ScheduledTask -TaskName ([string] $Task.Name)
+    Write-Host "Installed and started: $($Task.Name)"
+}
