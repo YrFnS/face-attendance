@@ -1,0 +1,174 @@
+def read_sync_status(path):
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (FileNotFoundError, OSError, json.JSONDecodeError):
+        return {}
+
+
+def write_sync_status(path, **values):
+    current = read_sync_status(path)
+    current.update(values)
+    _atomic_write_text(
+        path,
+        json.dumps(
+            current, ensure_ascii=False, indent=2, allow_nan=False
+        )
+        + "\n",
+    )
+    return current
+
+
+def _runtime_release_context(path):
+    path = Path(path)
+    config_path = path.parent / "config.json"
+    if not config_path.is_file():
+        return None
+    try:
+        cfg = json.loads(config_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(cfg, dict):
+        return None
+    status = read_sync_status(path.parent / "embedding_sync_status.json")
+    return cfg, status
+
+
+def _validate_runtime_release(path, sanitized):
+    context = _runtime_release_context(path)
+    if context is None:
+        return None
+    cfg, status = context
+    from gallery_release import configured_source_url, validate_installed_release
+
+    return validate_installed_release(
+        sanitized,
+        cfg,
+        status,
+        source_url=configured_source_url(cfg),
+    )
+
+
+def gallery_status(path, *, max_age_seconds=None):
+    path = Path(path)
+    if not path.exists():
+        return {"available": False, "path": str(path), "error": "gallery not found"}
+    try:
+        _, metadata, sanitized = load_gallery(path, require_model_match=False)
+        release = _validate_runtime_release(path, sanitized)
+        context = _runtime_release_context(path)
+        if context is not None:
+            cfg, _ = context
+            cfg = dict(cfg)
+            if max_age_seconds is not None:
+                cfg["embedding_max_age_seconds"] = int(max_age_seconds)
+            from runtime_policy import gallery_freshness_status
+
+            freshness = gallery_freshness_status(
+                cfg,
+                metadata.get("generated_at"),
+                path=path,
+            )
+        else:
+            stat = path.stat()
+            age_seconds = max(
+                0, int(datetime.now().timestamp() - stat.st_mtime)
+            )
+            max_age = int(max_age_seconds or 0)
+            freshness = {
+                "path": str(path),
+                "updated_at": datetime.fromtimestamp(
+                    stat.st_mtime, timezone.utc
+                ).isoformat().replace("+00:00", "Z"),
+                "age_seconds": age_seconds,
+                "stale": bool(max_age and age_seconds > max_age),
+                "policy_valid": True,
+                "error": "",
+            }
+        result = {
+            "available": True,
+            **freshness,
+            **metadata,
+        }
+        if release is not None:
+            result["release_validation"] = release
+        return result
+    except (GalleryError, OSError) as exc:
+        return {"available": False, "path": str(path), "error": str(exc)}
+
+
+def sync_gallery(cfg, gallery_path, status_path, session=None, sleep=None):
+    """Compatibility wrapper for callers that have not moved to secure_sync yet."""
+
+    from secure_sync import sync_gallery as secure_sync_gallery
+
+    kwargs = {}
+    if session is not None:
+        kwargs["session"] = session
+    if sleep is not None:
+        kwargs["sleep"] = sleep
+    return secure_sync_gallery(cfg, gallery_path, status_path, **kwargs)
+
+
+class GalleryReloader:
+    def __init__(
+        self,
+        path,
+        *,
+        expected_model=None,
+        expected_model_version=None,
+        expected_branch=None,
+        require_model_match=True,
+        require_model_version_match=False,
+        allow_empty=False,
+        max_employees=10000,
+        max_embeddings_per_employee=50,
+        max_dimension=MAX_EMBEDDING_DIMENSION,
+        max_total_embeddings=MAX_TOTAL_EMBEDDINGS,
+    ):
+        self.path = Path(path)
+        self.expected_model = expected_model
+        self.expected_model_version = expected_model_version
+        self.expected_branch = expected_branch
+        self.require_model_match = require_model_match
+        self.require_model_version_match = require_model_version_match
+        self.allow_empty = allow_empty
+        self.max_employees = int(max_employees)
+        self.max_embeddings_per_employee = int(max_embeddings_per_employee)
+        self.max_dimension = int(max_dimension)
+        self.max_total_embeddings = int(max_total_embeddings)
+        self.signature = None
+        self.known = []
+        self.metadata = {}
+        self.generated_at = ""
+        self.updated_unix = 0.0
+
+    def reload(self, force=False):
+        signature = gallery_signature(self.path)
+        if not force and signature == self.signature and self.known:
+            return self.known, self.metadata, False
+        known, metadata, sanitized = load_gallery(
+            self.path,
+            expected_model=self.expected_model,
+            expected_model_version=self.expected_model_version,
+            expected_branch=self.expected_branch,
+            require_model_match=self.require_model_match,
+            require_model_version_match=self.require_model_version_match,
+            allow_empty=self.allow_empty,
+            max_employees=self.max_employees,
+            max_embeddings_per_employee=self.max_embeddings_per_employee,
+            max_dimension=self.max_dimension,
+            max_total_embeddings=self.max_total_embeddings,
+        )
+        release = _validate_runtime_release(self.path, sanitized)
+        if release is not None:
+            metadata = dict(metadata)
+            metadata["release_validation"] = release
+        from gallery_release import parse_generated_at
+
+        self.generated_at = str(metadata.get("generated_at") or "")
+        self.updated_unix = parse_generated_at(self.generated_at).timestamp()
+        self.known = known
+        self.metadata = metadata
+        self.signature = gallery_signature(self.path)
+        return self.known, self.metadata, True
