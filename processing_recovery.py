@@ -755,7 +755,7 @@ class ProcessingRecoveryMixin:
                 UPDATE camera_events
                 SET lease_heartbeat_at = ?, lease_expires_unix = ?
                 WHERE event_id = ? AND lease_owner = ?
-                  AND lease_expires_unix >= ?
+                  AND lease_expires_unix > ?
                   AND lifecycle_state NOT IN ('processed', 'checkin_created', 'rejected', 'failed', 'uncertain', 'dismissed')
                 """,
                 (stamp, now + lease_seconds, event_id, owner, now),
@@ -801,7 +801,7 @@ class ProcessingRecoveryMixin:
                 raise ProcessingLeaseError(f"event does not exist: {event_id}")
             if row["lease_owner"] != owner or float(
                 row["lease_expires_unix"] or 0
-            ) < now:
+            ) <= now:
                 raise ProcessingLeaseError(
                     "cannot begin delivery without the active processing lease"
                 )

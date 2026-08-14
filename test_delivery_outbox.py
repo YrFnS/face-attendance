@@ -13,6 +13,7 @@ from event_ledger import (
     EventLedgerValidationError,
     make_capture_id,
 )
+from processing_recovery import ProcessingLeaseError
 from runtime_state import (
     MIGRATION_BY_VERSION,
     RUNTIME_SCHEMA_VERSION,
@@ -251,6 +252,52 @@ class DeliveryOutboxTests(unittest.TestCase):
         self.assertEqual(delivered["remote_docname"], "CHK-0001")
         self.assertEqual(delivered["lease_owner"], "")
         self.assertTrue(delivered["delivered_at"])
+
+    def test_exact_lease_expiry_blocks_renewal_and_delivery(self):
+        self.record_event()
+        lease = self.state.acquire_event_lease(
+            self.event_id,
+            owner="watcher-a",
+            lease_seconds=60,
+            now=1000.0,
+        )
+        decision_id = self.record_decision(decision_version=lease.attempt)
+        self.assertFalse(
+            self.state.event_lease_is_current(
+                self.event_id,
+                owner="watcher-a",
+                now=1060.0,
+            )
+        )
+        with self.assertRaisesRegex(
+            ProcessingLeaseError,
+            "missing, expired, or owned by another worker",
+        ):
+            self.state.renew_event_lease(
+                self.event_id,
+                owner="watcher-a",
+                lease_seconds=60,
+                now=1060.0,
+            )
+        with self.assertRaisesRegex(
+            ProcessingLeaseError,
+            "active processing lease",
+        ):
+            self.state.begin_delivery_attempt(
+                self.event_id,
+                owner="watcher-a",
+                decision_id=decision_id,
+                lease_seconds=60,
+                transport="rest",
+                now=1060.0,
+            )
+        job = self.state.delivery_job_for_decision(decision_id)
+        self.assertEqual(job["state"], "pending")
+        self.assertEqual(job["attempt_count"], 0)
+        self.assertEqual(
+            self.state.get_event(self.event_id)["processing_phase"],
+            "pre_delivery",
+        )
 
     def test_expired_delivery_marks_event_and_job_uncertain(self):
         self.record_event()
