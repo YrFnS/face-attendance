@@ -1,6 +1,6 @@
 # Event inspection and audited operator workflows
 
-`event_admin.py` provides the Phase 1 operator boundary for the local attendance event ledger. It supports read-only investigation and tightly constrained local event actions. It does **not** retry or cancel ERPNext delivery. Delivery controls begin only after Phase 2 adds durable delivery jobs, server-enforced delivery IDs, and reconciliation.
+`event_admin.py` provides the Phase 1 operator boundary for the local attendance event ledger. It supports read-only investigation and tightly constrained local event actions. It does **not** retry or cancel ERPNext delivery. Delivery controls begin only after Phase 2 adds durable delivery jobs, server-enforced delivery IDs, and reconciliation. Accepted Phase 1 recognition decisions already carry a stable precomputed delivery ID, but the current ERPNext endpoint does not enforce it yet.
 
 ## Safety model
 

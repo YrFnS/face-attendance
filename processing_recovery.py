@@ -792,6 +792,25 @@ class ProcessingRecoveryMixin:
                 raise ProcessingLeaseError(
                     "cannot begin delivery without the active processing lease"
                 )
+            decision = connection.execute(
+                """
+                SELECT event_id, accepted, delivery_id
+                FROM recognition_decisions
+                WHERE decision_id = ?
+                """,
+                (decision_id,),
+            ).fetchone()
+            if (
+                decision is None
+                or decision["event_id"] != event_id
+                or int(decision["accepted"] or 0) != 1
+                or not str(decision["delivery_id"] or "")
+            ):
+                raise ProcessingLeaseError(
+                    "delivery requires a persisted accepted recognition decision "
+                    "with a stable delivery_id"
+                )
+            delivery_id = str(decision["delivery_id"])
             self._transition_tx(
                 connection,
                 row,
@@ -800,6 +819,7 @@ class ProcessingRecoveryMixin:
                 detail={
                     "kind": "delivery_started",
                     "decision_id": decision_id,
+                    "delivery_id": delivery_id,
                     "attempt": int(row["processing_attempt"]),
                 },
                 compatibility_status="processing",

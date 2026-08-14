@@ -259,6 +259,13 @@ class EventLedgerTests(unittest.TestCase):
             reason_code="unknown_employee",
             retention_state="not_retained",
         )
+        self.state.transition_event(
+            self.event_id,
+            to_state="processed",
+            reason_code="processed_no_checkin",
+            event_updates={"retention_state": "not_retained"},
+            compatibility_status="processed_no_checkin",
+        )
         connection = sqlite3.connect(self.database)
         try:
             connection.execute(
@@ -270,6 +277,7 @@ class EventLedgerTests(unittest.TestCase):
             connection.close()
         self.assertEqual(self.state.prune_events(1), 1)
         self.assertIsNone(self.state.get_event(self.event_id))
+        self.assertIsNotNone(self.state.get_event_tombstone(self.event_id))
         connection = sqlite3.connect(self.database)
         try:
             decision_count = connection.execute(

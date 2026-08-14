@@ -158,13 +158,16 @@ Do not start the newer application against a deliberately restored older schema:
 
 Backups contain operational and potentially biometric-adjacent metadata. Apply the approved encryption, access, retention, and expiry policy before production use.
 
-## Current schema additions
+## Current schema generations and frozen compatibility fixtures
 
-The current runtime schema is version 4:
+The current runtime schema is version 5:
 
 - version 1 adopts the original runtime-state tables;
-- version 2 adds the versioned event ledger and immutable recognition evidence;
-- version 3 adds processing leases, startup recovery, and transactional attendance policy state;
-- version 4 adds source/retention path summaries and audited event operator metadata used by `event_admin.py`.
+- version 2 adds normalized events, recognition decisions, transitions, and operator actions;
+- version 3 adds renewable processing leases and transactional attendance-policy state;
+- version 4 adds audited event inspection/reprocessing metadata and immutable retained-source paths;
+- version 5 adds explicit identifier schemes, accepted-decision delivery IDs, and permanent minimal replay tombstones.
 
-Migration 4 does not change or remove existing event, decision, transition, policy, or audit rows. Existing version-3 events receive blank source/retention paths and remain readable; an operator must supply `--media-path` before reprocessing one of those older events.
+Migration 4 preserves existing rows and gives older events blank source/retention paths; an operator must supply `--media-path` before reprocessing one of those migrated events. Migration 5 also preserves historical primary keys, labels them as legacy schemes rather than recomputing them, and backfills one minimal tombstone for every retained event.
+
+Frozen synthetic databases for released versions 1–4 live under `tests/fixtures/`. Their manifest records the source commit, released migration checksum, raw database digest, compressed digest, and size. Tests materialize those exact committed bytes and run the normal verified backup-before-migrate path to version 5. See `docs/event-identity-tombstones.md` for the identifier and retention contract.

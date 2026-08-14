@@ -61,7 +61,7 @@ The mutable `camera_events.lifecycle_state` is a summary only; explanations come
 
 An append-only operator record for future reprocess, quarantine, dismissal, and review actions. The table is protected here; the audited inspection, reprocess, quarantine-resolution, and dismissal commands are documented in `docs/event-operations.md`.
 
-Update and direct-delete triggers prevent decisions, transitions, and operator actions from being rewritten. Normal parent-event retention deletion may cascade to detailed history. Long-lived replay tombstones are intentionally deferred to `P1-10`.
+Update and direct-delete triggers prevent decisions, transitions, and operator actions from being rewritten. Normal parent-event retention deletion may cascade to detailed history. Schema version 5 preserves the minimal camera/content/capture identity in `event_tombstones`, so pruning detailed rows does not re-enable an old upload.
 
 ## Stable reason codes
 
@@ -141,4 +141,8 @@ The next ledger slices are:
 - `P1-06`: transactional cooldown and policy state.
 - `P1-07`: read-only list, inspect, and explain commands.
 - `P1-08`: audited reprocess, quarantine resolution, and dismissal.
-- `P1-10`: long-lived idempotency tombstones after detailed-event pruning.
+- Schema version 5: receipt-time and migrated idempotency tombstones survive detailed-event pruning. See `docs/event-identity-tombstones.md`.
+
+## Final identifier semantics
+
+Phase 1 finishes with separate, versioned identifiers for exact content bytes, one camera capture envelope, one camera/direction event, one face decision in a numbered attempt, and one future ERPNext delivery. Accepted decisions persist the delivery ID before the synchronous delivery boundary; Phase 2 will make that ID unique on the server. See `docs/event-identity-tombstones.md`.

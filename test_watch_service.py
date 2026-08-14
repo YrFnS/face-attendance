@@ -754,5 +754,52 @@ class WatchServiceTests(unittest.TestCase):
         self.assertEqual(event["retention_path"], str(target))
         self.assertGreaterEqual(event["recovery_count"], 1)
 
+    def test_tombstoned_upload_is_blocked_before_detection_and_removed(self):
+        first_app = FakeApp([])
+        self.assertFalse(
+            watch_service.process_path(
+                self.image_path,
+                first_app,
+                [],
+                StaticGallery([]),
+                self.cfg,
+                self.state,
+                self.pad_gate,
+                sources=self.sources,
+            )
+        )
+        event_id = self.event_id()
+        connection = sqlite3.connect(self.state.path)
+        try:
+            connection.execute(
+                "UPDATE camera_events SET created_unix = 0 WHERE event_id = ?",
+                (event_id,),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+        self.assertEqual(self.state.prune_events(1), 1)
+        self.assertIsNotNone(self.state.get_event_tombstone(event_id))
+
+        self.cfg["delete_camera_uploads_after_processing"] = True
+        self.cfg["delete_duplicate_camera_uploads"] = True
+        replay_app = FakeApp([FakeFace()])
+        self.assertFalse(
+            watch_service.process_path(
+                self.image_path,
+                replay_app,
+                [],
+                StaticGallery([]),
+                self.cfg,
+                self.state,
+                self.pad_gate,
+                sources=self.sources,
+            )
+        )
+        self.assertEqual(replay_app.calls, 0)
+        self.assertFalse(self.image_path.exists())
+        self.assertFalse(receipt_path(self.image_path).exists())
+
+
 if __name__ == "__main__":
     unittest.main()

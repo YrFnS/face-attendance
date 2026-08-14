@@ -419,6 +419,51 @@ class RuntimeStateTests(unittest.TestCase):
         self.assertEqual(second.reason, "duplicate")
         self.assertEqual(second.existing_status, "processing")
 
+    def test_legacy_compatibility_source_key_is_not_labeled_sha256(self):
+        event_id = make_event_id("legacy-camera", "IN", "legacy-key")
+        claim = self.state.claim_event(
+            event_id=event_id,
+            camera_id="legacy-camera",
+            log_type="IN",
+            source_sha256="legacy-key",
+            source_name="legacy.jpg",
+            source_mtime=1,
+            source_size=10,
+        )
+        self.assertTrue(claim.accepted)
+        event = self.state.get_event(event_id)
+        self.assertEqual(
+            event["content_hash_algorithm"],
+            "legacy-source-key-v1",
+        )
+        tombstone = self.state.get_event_tombstone(event_id)
+        self.assertEqual(
+            tombstone["content_hash_algorithm"],
+            "legacy-source-key-v1",
+        )
+
+    def test_legacy_compatibility_hex_key_is_not_claimed_as_byte_hash(self):
+        legacy_key = "a" * 64
+        event_id = make_event_id("legacy-camera", "IN", legacy_key)
+        claim = self.state.claim_event(
+            event_id=event_id,
+            camera_id="legacy-camera",
+            log_type="IN",
+            source_sha256=legacy_key,
+            source_name="legacy.jpg",
+            source_mtime=1,
+            source_size=10,
+        )
+        self.assertTrue(claim.accepted)
+        self.assertEqual(
+            self.state.get_event(event_id)["content_hash_algorithm"],
+            "legacy-source-key-v1",
+        )
+        self.assertEqual(
+            self.state.get_event_tombstone(event_id)["content_hash_algorithm"],
+            "legacy-source-key-v1",
+        )
+
     def test_same_image_from_different_camera_is_distinct(self):
         first_id = make_event_id("camera-in", "IN", "abc")
         second_id = make_event_id("camera-out", "OUT", "abc")

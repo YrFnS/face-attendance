@@ -304,3 +304,7 @@ python event_admin.py explain EVENT_ID --database runtime_state.sqlite3
 ```
 
 Audited reprocess, quarantine-resolution, and dismissal commands require an actor, a human reason, and explicit confirmation. They never retry or cancel ERPNext delivery. See `docs/event-operations.md` for the complete safety and recovery workflow.
+
+### Event identity and replay retention
+
+Runtime schema version 5 stores domain-separated capture, event, recognition-decision, and future ERPNext delivery IDs. A minimal camera/content tombstone is written with every receipt and survives detailed event pruning, so an old upload does not become eligible again merely because its verbose history expired. Frozen synthetic databases for released schema versions 1–4 exercise the real backup-before-migrate path. See `docs/event-identity-tombstones.md`.

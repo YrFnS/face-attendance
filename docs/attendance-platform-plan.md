@@ -260,7 +260,7 @@ Release A requires no Redis, Celery, PostgreSQL, or message broker. Introduce on
 - [x] `H0-07` Constrain and encode employee IDs and all gallery string/numeric fields before filesystem, URL, log, or ERP use. Add path-traversal, length, character, dimension, and count tests.
 - [x] `H0-08` Bind PAD evidence to each face that can create a check-in. In production require exactly one face unless every recognized face receives its own PAD result; pin/allowlist PAD provider and model versions.
 - [x] `H0-09` Bind each upload credential and source route to one camera, direction/policy, branch, and allowed network. Use unique credentials and document stronger device authentication when supported; content hashing alone does not stop re-encoded replay.
-- [ ] `H0-10` Route every supported Linux and Windows launcher through `watch_service.py` or refuse live operation. Legacy RTSP and direct `watch-folder` modes remain dry-run/non-production until they enter the same ledger/PAD/readiness path.
+- [x] `H0-10` Route every supported Linux and Windows launcher through `watch_service.py` or refuse live operation. Legacy RTSP and direct `watch-folder` modes remain dry-run/non-production until they enter the same ledger/PAD/readiness path.
 - [x] `H0-11` Add scoped/rotatable gallery credentials, export audit/rate limits, trusted-proxy-aware login throttling, secret-manager/systemd credential support, and a roadmap/adapter point for organizational SSO/MFA.
 - [ ] `H0-12` Default source/crop/ERP attachment retention to the minimum justified by the DPIA; enumerate and test cleanup for quarantine, logs, enrollment media, reports, audit state, PAD copies, and backups.
 
@@ -282,9 +282,9 @@ Release A requires no Redis, Celery, PostgreSQL, or message broker. Introduce on
 - [x] `P1-06` Move cooldown and event-policy state into the transactional store. Scope cooldown deliberately by employee, direction, branch, and policy; eliminate crash-stranded lock files.
 - [x] `P1-07` Add read-only CLI commands to list, inspect, and explain events without exposing secrets or biometric vectors.
 - [x] `P1-08` Add audited event reprocess, quarantine-resolution, and dismissal commands with required reasons. Delivery retry/cancel begins only after Phase 2 creates delivery jobs.
-- [ ] `P1-09` Keep old event rows readable through the retention window and test migration from a real copy of the current schema.
-- [ ] `P1-10` Retain minimal content/capture idempotency tombstones after detailed event/media expiry so normal pruning cannot make an old upload eligible again.
-- [ ] `P1-11` Define and test distinct capture ID, content hash, recognition-decision ID, and delivery ID semantics.
+- [x] `P1-09` Keep old event rows readable through the retention window and test migration from a real copy of the current schema.
+- [x] `P1-10` Retain minimal content/capture idempotency tombstones after detailed event/media expiry so normal pruning cannot make an old upload eligible again.
+- [x] `P1-11` Define and test distinct capture ID, content hash, recognition-decision ID, and delivery ID semantics.
 
 **Acceptance**
 
