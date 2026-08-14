@@ -4,6 +4,7 @@ import time
 from pathlib import Path
 
 from embedding_gallery import GalleryError, gallery_status
+from secret_store import ConfigLoadError, load_runtime_config
 from secure_sync import sync_gallery
 
 
@@ -15,14 +16,9 @@ SYNC_STATUS = ROOT / "embedding_sync_status.json"
 
 def load_config():
     try:
-        data = json.loads(CONFIG.read_text(encoding="utf-8"))
-    except FileNotFoundError as exc:
-        raise SystemExit(f"missing config: {CONFIG}") from exc
-    except json.JSONDecodeError as exc:
-        raise SystemExit(f"invalid JSON in {CONFIG}: {exc}") from exc
-    if not isinstance(data, dict):
-        raise SystemExit(f"config must contain a JSON object: {CONFIG}")
-    return data
+        return load_runtime_config(CONFIG)
+    except ConfigLoadError as exc:
+        raise SystemExit(str(exc)) from exc
 
 
 def sync_once(cfg):
@@ -35,7 +31,8 @@ def sync_once(cfg):
         f"embedding gallery {action}: "
         f"{result['employee_count']} employee(s), "
         f"{result['embedding_count']} embedding(s), "
-        f"version={result['gallery_version']}"
+        f"version={result['gallery_version']} "
+        f"credential={result.get('credential_id') or '-'}"
     )
     return result
 
