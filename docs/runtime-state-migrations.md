@@ -160,11 +160,12 @@ Backups contain operational and potentially biometric-adjacent metadata. Apply t
 
 ## Current schema additions
 
-The current runtime schema is version 4:
+The current runtime schema is version 5:
 
 - version 1 adopts the original runtime-state tables;
 - version 2 adds the versioned event ledger and immutable recognition evidence;
 - version 3 adds processing leases, startup recovery, and transactional attendance policy state;
-- version 4 adds source/retention path summaries and audited event operator metadata used by `event_admin.py`.
+- version 4 adds source/retention path summaries and audited event operator metadata used by `event_admin.py`;
+- version 5 adds minimal replay tombstones and the database guard that prevents a pruned exact-content event from being inserted again.
 
-Migration 4 does not change or remove existing event, decision, transition, policy, or audit rows. Existing version-3 events receive blank source/retention paths and remain readable; an operator must supply `--media-path` before reprocessing one of those older events.
+Migration 5 does not remove or rewrite existing event history. Normal pruning creates the tombstone and deletes eligible detailed history in the same transaction. Rollback requires the matching schema-v4 application revision and verified pre-migration backup; restoring schema v4 also removes any tombstones created after the migration.

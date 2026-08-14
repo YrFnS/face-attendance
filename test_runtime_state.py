@@ -7,8 +7,10 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest.mock import patch
 
+from test_event_identity import EventIdentityTests
 from test_event_ledger import EventLedgerTests
 from test_event_operations import EventOperationsTests
+from test_idempotency_tombstones import IdempotencyTombstoneTests
 from test_processing_recovery import ProcessingRecoveryTests
 from runtime_state import (
     MIGRATION_BY_VERSION,

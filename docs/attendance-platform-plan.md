@@ -283,14 +283,16 @@ Release A requires no Redis, Celery, PostgreSQL, or message broker. Introduce on
 - [x] `P1-07` Add read-only CLI commands to list, inspect, and explain events without exposing secrets or biometric vectors.
 - [x] `P1-08` Add audited event reprocess, quarantine-resolution, and dismissal commands with required reasons. Delivery retry/cancel begins only after Phase 2 creates delivery jobs.
 - [ ] `P1-09` Keep old event rows readable through the retention window and test migration from a real copy of the current schema.
-- [ ] `P1-10` Retain minimal content/capture idempotency tombstones after detailed event/media expiry so normal pruning cannot make an old upload eligible again.
-- [ ] `P1-11` Define and test distinct capture ID, content hash, recognition-decision ID, and delivery ID semantics.
+- [x] `P1-10` Retain minimal content/capture idempotency tombstones after detailed event/media expiry so normal pruning cannot make an old upload eligible again.
+- [x] `P1-11` Define and test distinct capture ID, content hash, recognition-decision ID, and delivery ID semantics.
 
 **Acceptance**
 
 - Killing the watcher at each stage produces either a safe retry or an explicit `uncertain` event, never silent loss.
 - Every accepted or rejected face has a stable reason and the exact model/gallery/PAD/policy versions used.
 - Migration, restore, and rollback are tested from the previous released database format.
+- Detailed-event pruning leaves a minimal immutable replay tombstone, so an old exact-content upload cannot become eligible solely because its event history expired.
+- Capture, exact-content, face-decision, and delivery identifiers have distinct tested scopes; only the per-decision delivery ID is eligible to become the Phase 2 ERPNext idempotency key.
 - A repeat IN inside the configured anti-bounce window is deterministically suppressed, while a legitimate IN-to-OUT transition inside that interval remains eligible; a process kill cannot strand the policy lock.
 
 Phase 1 is not independently enabled for live delivery. Deploy Phases 1 and 2 together in shadow mode first because the existing synchronous ERPNext call remains ambiguous until the durable outbox is active.
@@ -302,9 +304,9 @@ Phase 1 is not independently enabled for live delivery. Deploy Phases 1 and 2 to
 - [ ] `P2-01` Introduce an ERPNext adapter interface; keep API and local-bench transports explicit and independently tested.
 - [ ] `P2-02` Create `delivery_jobs` in the same transaction that accepts a recognition decision.
 - [ ] `P2-03` Implement a single-node delivery worker with leases, bounded exponential backoff, jitter, and retry budgets.
-- [ ] `P2-04` Enforce an atomic ERPNext idempotency contract for both REST and local-bench adapters: a unique `face_attendance_delivery_id` per Employee Checkin with duplicate-conflict lookup or a whitelisted get-or-create endpoint keyed by that delivery ID. Keep `face_attendance_event_id` as non-unique capture trace metadata so multiple accepted faces in one capture can create independent check-ins. Client lookup-before-create alone is race-prone. Treat connection loss after submission as `uncertain` until reconciliation proves the result.
+- [ ] `P2-04` Enforce an atomic ERPNext idempotency contract for both REST and local-bench adapters: a unique `face_attendance_delivery_id` per Employee Checkin with duplicate-conflict lookup or a whitelisted get-or-create endpoint keyed by that delivery ID. Keep a non-unique `face_attendance_capture_id` as capture trace metadata; when an existing ERPNext schema only has `face_attendance_event_id`, populate it explicitly with the local `capture_id`, never the content-scoped local `event_id`. Multiple accepted faces in one capture must create independent check-ins. Client lookup-before-create alone is race-prone. Treat connection loss after submission as `uncertain` until reconciliation proves the result.
 - [ ] `P2-05` Separate Employee Checkin creation from private crop attachment. A failed attachment becomes its own retryable job, and any required private crop is protected from retention cleanup until that job reaches a terminal state.
-- [ ] `P2-06` Send the validated effective event time, camera ID, branch, immutable decision ID and version, unique delivery ID, and non-unique capture event ID to ERPNext where the agreed schema permits.
+- [ ] `P2-06` Send the validated effective event time, camera ID, branch, immutable decision ID and version, unique delivery ID, and non-unique capture ID to ERPNext where the agreed schema permits.
 - [ ] `P2-07` Classify errors as retryable, permanent, authentication, validation, conflict, rate-limit, or uncertain; never retry permanent errors forever.
 - [ ] `P2-08` Add scheduled and manual reconciliation against ERPNext, including missing, duplicate, mismatched, externally changed, and externally deleted records. Treat ERP-owned edits as visible owned exceptions; never silently overwrite or recreate them.
 - [ ] `P2-09` Add a dead-letter workflow with actor, reason, retry/cancel controls, and complete audit history. Cancel applies only to undelivered local jobs; delivered Employee Checkin correction/deletion happens in ERPNext and is annotated locally.
@@ -315,7 +317,7 @@ Phase 1 is not independently enabled for live delivery. Deploy Phases 1 and 2 to
 
 - An ERPNext outage sized from measured peak rate × the approved safety factor queues and later delivers every eligible accepted decision with zero loss, zero duplicate ERP IDs, bounded recovery time, and verified disk headroom.
 - A timeout after remote commit does not create a duplicate; without the atomic ERPNext dependency the product does not claim exactly-once delivery.
-- A multi-face capture can create one independently idempotent Employee Checkin for each eligible accepted decision; those check-ins have distinct delivery IDs and may share the same non-unique capture event ID.
+- A multi-face capture can create one independently idempotent Employee Checkin for each eligible accepted decision; those check-ins have distinct delivery IDs and may share the same non-unique capture ID.
 - Employee Checkin creation persists the returned ERP document name before attachment begins. Attachment failure never changes a delivered check-in to failed, and delivery always uses immutable `effective_at` rather than retry time.
 - Reconciliation reports zero unexplained differences for the controlled test window and surfaces ERP-owned changes without overwriting them.
 

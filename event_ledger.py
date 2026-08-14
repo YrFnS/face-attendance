@@ -7,6 +7,12 @@ import unicodedata
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
+from event_identity import (
+    make_capture_id as canonical_make_capture_id,
+    make_delivery_id,
+    make_recognition_decision_id as canonical_make_recognition_decision_id,
+)
+
 
 HEX64_RE = re.compile(r"^[0-9a-f]{64}$")
 
@@ -532,26 +538,21 @@ def _json_text(value, field, *, max_bytes=32768):
 
 
 def make_capture_id(camera_id, source_sha256, source_name, source_size, source_mtime):
-    value = "\0".join(
-        (
-            str(camera_id),
-            str(source_sha256),
-            str(source_name),
-            str(int(source_size)),
-            f"{float(source_mtime):.6f}",
-        )
+    return canonical_make_capture_id(
+        camera_id,
+        source_sha256,
+        source_name,
+        source_size,
+        source_mtime,
     )
-    return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
 def make_recognition_decision_id(event_id, face_index, decision_version=1):
-    event_id = _identifier(event_id, "event_id")
-    face_index = _integer(face_index, "face_index", minimum=1)
-    decision_version = _integer(
-        decision_version, "decision_version", minimum=1, maximum=1_000_000
+    return canonical_make_recognition_decision_id(
+        event_id,
+        face_index,
+        decision_version,
     )
-    value = "\0".join((event_id, str(face_index), str(decision_version)))
-    return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
 def _parse_json_column(row, key):
@@ -694,6 +695,26 @@ class EventLedgerMixin:
         connection = self._connect()
         try:
             connection.execute("BEGIN IMMEDIATE")
+            tombstone = connection.execute(
+                """
+                SELECT event_id, capture_id
+                FROM event_idempotency_tombstones
+                WHERE event_id = ?
+                   OR capture_id = ?
+                   OR (camera_id = ? AND source_sha256 = ?)
+                LIMIT 1
+                """,
+                (event_id, capture_id, camera_id, source_sha256),
+            ).fetchone()
+            if tombstone:
+                connection.rollback()
+                return LedgerClaim(
+                    False,
+                    tombstone["event_id"],
+                    reason="tombstone",
+                    existing_status="pruned",
+                    capture_id=tombstone["capture_id"],
+                )
             existing = connection.execute(
                 """
                 SELECT event_id, status, capture_id
@@ -1120,6 +1141,12 @@ class EventLedgerMixin:
                     (event_id,),
                 ).fetchall()
             ]
+            for item in decisions:
+                item["delivery_id"] = (
+                    make_delivery_id(item["decision_id"])
+                    if bool(item.get("accepted"))
+                    else ""
+                )
             actions = [
                 dict(item)
                 for item in connection.execute(

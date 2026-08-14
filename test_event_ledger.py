@@ -259,16 +259,30 @@ class EventLedgerTests(unittest.TestCase):
             reason_code="unknown_employee",
             retention_state="not_retained",
         )
+        self.state.transition_event(
+            self.event_id,
+            to_state="rejected",
+            reason_code="unknown_employee",
+            event_updates={"retention_state": "not_retained"},
+            compatibility_status="rejected",
+        )
         connection = sqlite3.connect(self.database)
         try:
             connection.execute(
-                "UPDATE camera_events SET created_unix = 0 WHERE event_id = ?",
+                """
+                UPDATE camera_events
+                SET created_unix = 0, received_unix = 0
+                WHERE event_id = ?
+                """,
                 (self.event_id,),
             )
             connection.commit()
         finally:
             connection.close()
-        self.assertEqual(self.state.prune_events(1), 1)
+        self.assertEqual(
+            self.state.prune_events(1, now=2_000_000_000),
+            1,
+        )
         self.assertIsNone(self.state.get_event(self.event_id))
         connection = sqlite3.connect(self.database)
         try:

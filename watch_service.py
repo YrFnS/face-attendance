@@ -695,6 +695,22 @@ def process_path(
                     cfg.get("attendance_policy_version") or "directional-v1"
                 ),
             )
+            if (
+                not receipt_claim.accepted
+                and receipt_claim.reason == "tombstone"
+            ):
+                attendance.log(
+                    f"ftp:{path.name}: exact-content replay blocked by "
+                    f"tombstone event={receipt_claim.event_id} "
+                    f"capture={receipt_claim.capture_id or '-'} "
+                    f"camera={camera_id} policy={log_type}"
+                )
+                if (
+                    bool(cfg.get("delete_camera_uploads_after_processing", True))
+                    and bool(cfg.get("delete_duplicate_camera_uploads", True))
+                ):
+                    remove_source(path, cfg)
+                return False
             claim = state.acquire_event_lease(
                 event_id,
                 owner=lease_owner,
@@ -912,6 +928,7 @@ def process_path(
                 "source_remote_ip": source_receipt.remote_ip,
                 "source_binding_id": camera_source.binding_id,
                 "event_id": event_id,
+                "capture_id": capture_id,
                 "source_name": path.name,
                 "source_sha256": source_sha256,
             },
