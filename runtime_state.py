@@ -1,5 +1,6 @@
 import hashlib
 import json
+import math
 import os
 import sqlite3
 import time
@@ -96,6 +97,12 @@ class RuntimeState:
                     window_started REAL NOT NULL,
                     failures INTEGER NOT NULL,
                     locked_until REAL NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS request_rate_limits (
+                    bucket_key TEXT PRIMARY KEY,
+                    window_started REAL NOT NULL,
+                    request_count INTEGER NOT NULL
                 );
 
                 CREATE TABLE IF NOT EXISTS admin_audit (
@@ -275,6 +282,77 @@ class RuntimeState:
         try:
             connection.execute(
                 "DELETE FROM login_limits WHERE limiter_key = ?", (limiter_key,)
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+    def consume_rate_limit(
+        self,
+        bucket_key,
+        *,
+        limit,
+        window_seconds,
+        now=None,
+    ):
+        bucket_key = str(bucket_key or "").strip()
+        if not bucket_key:
+            raise ValueError("rate-limit bucket key is required")
+        if len(bucket_key) > 240:
+            raise ValueError("rate-limit bucket key exceeds 240 characters")
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
+            raise ValueError("rate-limit limit must be a positive integer")
+        if (
+            isinstance(window_seconds, bool)
+            or not isinstance(window_seconds, int)
+            or window_seconds < 1
+        ):
+            raise ValueError("rate-limit window must be a positive integer")
+        now = time.time() if now is None else float(now)
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT window_started, request_count FROM request_rate_limits "
+                "WHERE bucket_key = ?",
+                (bucket_key,),
+            ).fetchone()
+            if not row or now - float(row["window_started"]) >= window_seconds:
+                window_started = now
+                count = 1
+            else:
+                window_started = float(row["window_started"])
+                count = int(row["request_count"])
+                if count >= limit:
+                    retry_after = max(
+                        1,
+                        int(math.ceil(window_seconds - (now - window_started))),
+                    )
+                    connection.rollback()
+                    return False, retry_after, 0
+                count += 1
+            connection.execute(
+                """
+                INSERT INTO request_rate_limits (
+                    bucket_key, window_started, request_count
+                ) VALUES (?, ?, ?)
+                ON CONFLICT(bucket_key) DO UPDATE SET
+                    window_started = excluded.window_started,
+                    request_count = excluded.request_count
+                """,
+                (bucket_key, window_started, count),
+            )
+            connection.commit()
+            return True, 0, max(0, limit - count)
+        finally:
+            connection.close()
+
+    def clear_rate_limit(self, bucket_key):
+        connection = self._connect()
+        try:
+            connection.execute(
+                "DELETE FROM request_rate_limits WHERE bucket_key = ?",
+                (str(bucket_key),),
             )
             connection.commit()
         finally:
