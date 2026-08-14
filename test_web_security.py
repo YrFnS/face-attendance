@@ -1,5 +1,15 @@
 import unittest
 
+from test_h0_credential_auth import (
+    ExternalAuthAdapterH11Tests,
+    GalleryCredentialH11Tests,
+    RuntimeRateLimitH11Tests,
+    SecretStoreH11Tests,
+    SystemdCredentialExampleH11Tests,
+    TrustedProxyH11Tests,
+    WebAdminH11Tests,
+)
+
 try:
     import flask  # noqa: F401
 except ModuleNotFoundError:

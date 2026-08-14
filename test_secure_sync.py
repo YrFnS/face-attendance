@@ -71,7 +71,7 @@ class SecureSyncTests(unittest.TestCase):
         self.status = root / "embedding_sync_status.json"
         self.cfg = {
             "central_url": "https://central.example.test",
-            "central_api_token": "secret",
+            "central_api_token": "s" * 32,
             "branch_name": "Baghdad",
             "model": "buffalo_l",
             "embedding_sync_retries": 0,
@@ -86,6 +86,17 @@ class SecureSyncTests(unittest.TestCase):
         self.release_cfg = {
             **self.cfg,
             "production_mode": True,
+            "central_api_credential_id": "node-2026",
+            "central_api_credentials": {
+                "node-2026": {
+                    "token": "t" * 48,
+                    "scopes": ["gallery:read"],
+                    "branches": ["Baghdad"],
+                    "models": ["buffalo_l"],
+                    "model_versions": ["approved-v1"],
+                    "enabled": True,
+                }
+            },
             "model_version": "approved-v1",
             "require_model_match": True,
             "require_model_version_match": True,
@@ -295,11 +306,13 @@ class SecureSyncTests(unittest.TestCase):
             session.calls[1][0], "https://central.example.test/v2/embeddings"
         )
         self.assertEqual(
-            session.calls[1][1]["headers"]["Authorization"], "Bearer secret"
+            session.calls[1][1]["headers"]["Authorization"],
+            "Bearer " + "s" * 32,
         )
         self.assertEqual(
             result["source_url"], "https://central.example.test/v2/embeddings"
         )
+        self.assertEqual(result["credential_id"], "legacy-central-token")
         self.assertTrue(first.closed)
 
     def test_cross_origin_redirect_is_rejected_before_following(self):
@@ -420,6 +433,47 @@ class SecureSyncTests(unittest.TestCase):
         )
         self.assertNotIn("If-None-Match", second.calls[0][1]["headers"])
 
+
+    def test_structured_credential_header_and_scope_are_enforced(self):
+        session = FakeSession(
+            [
+                FakeResponse(
+                    body=self.signed(1),
+                    headers={"Content-Type": "application/json"},
+                )
+            ]
+        )
+        result = sync_gallery(
+            self.release_cfg,
+            self.gallery,
+            self.status,
+            session=session,
+            sleep=lambda _: None,
+        )
+        headers = session.calls[0][1]["headers"]
+        self.assertEqual(headers["Authorization"], "Bearer " + "t" * 48)
+        self.assertEqual(
+            headers["X-Face-Attendance-Credential-ID"], "node-2026"
+        )
+        self.assertEqual(result["credential_id"], "node-2026")
+
+        wrong_scope = self.release_cfg.copy()
+        wrong_scope["central_api_credentials"] = {
+            "node-2026": {
+                **self.release_cfg["central_api_credentials"]["node-2026"],
+                "branches": ["Basra"],
+            }
+        }
+        blocked = FakeSession([])
+        with self.assertRaisesRegex(Exception, "not scoped"):
+            sync_gallery(
+                wrong_scope,
+                self.gallery,
+                self.status,
+                session=blocked,
+                sleep=lambda _: None,
+            )
+        self.assertEqual(blocked.calls, [])
 
     def test_strict_policy_is_checked_before_network(self):
         cfg = dict(

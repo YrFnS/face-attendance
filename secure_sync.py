@@ -14,6 +14,10 @@ from embedding_gallery import (
     write_gallery_atomic,
     write_sync_status,
 )
+from gallery_credentials import (
+    GalleryCredentialError,
+    outbound_gallery_credential,
+)
 from gallery_release import (
     record_acceptance,
     release_policy_issues,
@@ -75,24 +79,19 @@ def _validate_http_url(url, cfg, *, field):
     return parsed
 
 
-def _request_headers(cfg, release_state, *, conditional=True):
-    token = _text(cfg.get("central_api_token"))
-    if token.upper() in PLACEHOLDER_TOKENS:
-        token = ""
-    if not token and not bool(cfg.get("allow_unauthenticated_embedding_sync", False)):
-        raise GalleryError(
-            "central_api_token must be configured with a non-placeholder value"
-        )
+def _request_headers(credential, release_state, *, conditional=True):
     headers = {
         "Accept": "application/json",
-        "User-Agent": "face-attendance-embedding-sync/3",
+        "User-Agent": "face-attendance-embedding-sync/4",
+        "Authorization": f"Bearer {credential.token}",
+        "X-Face-Attendance-Credential-ID": credential.credential_id,
     }
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
     etag = _text(release_state.get("etag"))
     if conditional and etag:
         headers["If-None-Match"] = etag
     return headers
+
+
 
 
 def _validate_source(cfg):
@@ -301,6 +300,10 @@ def sync_gallery(cfg, gallery_path, status_path, session=requests, sleep=time.sl
             "embedding release policy is invalid: "
             + "; ".join(message for _, message in release_issues)
         )
+    try:
+        credential = outbound_gallery_credential(cfg)
+    except GalleryCredentialError as exc:
+        raise GalleryError(f"central gallery credential is invalid: {exc}") from exc
     requested_url = _validate_source(cfg)
     resolved_url = requested_url
     gallery_path = Path(gallery_path)
@@ -308,7 +311,17 @@ def sync_gallery(cfg, gallery_path, status_path, session=requests, sleep=time.sl
     scope_id, descriptor = release_scope(requested_url, cfg)
     previous_release = scope_state(status, scope_id)
     branch = _text(cfg.get("branch_name"))
-    params = {"branch": branch} if branch else None
+    model = _text(cfg.get("model"))
+    model_version = _text(cfg.get("model_version"))
+    params = {
+        key: value
+        for key, value in {
+            "branch": branch,
+            "model": model,
+            "model_version": model_version,
+        }.items()
+        if value
+    } or None
     retries = max(0, int(cfg.get("embedding_sync_retries", 2)))
     retry_base = max(0.1, float(cfg.get("embedding_retry_base_seconds", 1.0)))
     max_bytes = int(cfg.get("embedding_max_response_bytes", 50 * 1024 * 1024))
@@ -321,7 +334,7 @@ def sync_gallery(cfg, gallery_path, status_path, session=requests, sleep=time.sl
                     session,
                     requested_url,
                     headers=_request_headers(
-                        cfg,
+                        credential,
                         previous_release,
                         conditional=gallery_path.exists(),
                     ),
@@ -359,6 +372,8 @@ def sync_gallery(cfg, gallery_path, status_path, session=requests, sleep=time.sl
                         scope_id=scope_id,
                         not_modified=True,
                     )
+                    result["credential_id"] = credential.credential_id
+                    result["credential_fingerprint"] = credential.fingerprint
                     result["gallery_age_seconds"] = freshness["age_seconds"]
                     result["gallery_stale"] = freshness["stale"]
                     result["history_limit"] = int(
@@ -423,6 +438,8 @@ def sync_gallery(cfg, gallery_path, status_path, session=requests, sleep=time.sl
                     etag=etag,
                     scope_id=scope_id,
                 )
+                result["credential_id"] = credential.credential_id
+                result["credential_fingerprint"] = credential.fingerprint
                 result["gallery_age_seconds"] = freshness["age_seconds"]
                 result["gallery_stale"] = freshness["stale"]
                 result["history_limit"] = int(

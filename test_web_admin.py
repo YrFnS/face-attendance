@@ -51,7 +51,7 @@ class WebAdminTests(unittest.TestCase):
             "reject_stale_embedding_gallery": True,
             "embedding_max_age_seconds": 3600,
             "embedding_export_enabled": True,
-            "embedding_export_token": "secret",
+            "embedding_export_token": "secret-token-value",
             "local_enrollment_enabled": False,
             "web_admin_username": "admin",
             "web_admin_password_hash": hash_password("correct horse battery staple"),
@@ -109,9 +109,9 @@ class WebAdminTests(unittest.TestCase):
         self.assertEqual(self.client.get("/api/faces/embeddings?branch=Baghdad").status_code, 401)
 
     def test_export_returns_etag_and_304(self):
-        response = self.client.get("/api/faces/embeddings?branch=Baghdad", headers={"Authorization": "Bearer secret"})
+        response = self.client.get("/api/faces/embeddings?branch=Baghdad", headers={"Authorization": "Bearer secret-token-value"})
         self.assertEqual(response.status_code, 200)
-        cached = self.client.get("/api/faces/embeddings?branch=Baghdad", headers={"Authorization": "Bearer secret", "If-None-Match": response.headers["ETag"]})
+        cached = self.client.get("/api/faces/embeddings?branch=Baghdad", headers={"Authorization": "Bearer secret-token-value", "If-None-Match": response.headers["ETag"]})
         self.assertEqual(cached.status_code, 304)
 
     def test_upload_is_disabled_on_attendance_server(self):

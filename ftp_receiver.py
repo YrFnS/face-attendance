@@ -24,6 +24,7 @@ from camera_sources import (
     write_source_receipt,
 )
 from data_contract import safe_log_message
+from secret_store import ConfigLoadError, load_runtime_config
 
 
 ROOT = Path(__file__).resolve().parent
@@ -33,14 +34,11 @@ ALLOWED_EXTENSIONS = {".jpg", ".jpeg", ".png"}
 
 def load_config():
     try:
-        data = json.loads(CONFIG.read_text(encoding="utf-8"))
-    except FileNotFoundError as exc:
-        raise SystemExit(f"missing config: {CONFIG}") from exc
-    except json.JSONDecodeError as exc:
-        raise SystemExit(f"invalid JSON in {CONFIG}: {exc}") from exc
-    if not isinstance(data, dict):
-        raise SystemExit("config must contain a JSON object")
-    return data
+        return load_runtime_config(CONFIG)
+    except ConfigLoadError as exc:
+        raise SystemExit(str(exc)) from exc
+
+
 
 
 def resolve_folder(value):
