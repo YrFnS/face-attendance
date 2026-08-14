@@ -1,0 +1,230 @@
+    if status == "uncertain":
+        return "generic_failed"
+    return "generic_failed"
+
+
+def finish_claim(
+    state,
+    claim,
+    event_id,
+    status,
+    error="",
+    *,
+    reason_code="",
+    event_updates=None,
+    detail=None,
+):
+    if not claim or not claim.accepted:
+        return False
+    lifecycle = {
+        "checkin_created": "checkin_created",
+        "processed": "processed",
+        "processed_no_checkin": "processed",
+        "rejected": "rejected",
+        "failed": "failed",
+        "uncertain": "uncertain",
+    }.get(status, "failed")
+    try:
+        state.transition_event(
+            event_id,
+            to_state=lifecycle,
+            reason_code=_finish_reason(status, error, reason_code),
+            actor_type="watcher",
+            detail=detail or {},
+            event_updates=event_updates or {},
+            compatibility_status=status,
+            error=error,
+        )
+        return True
+    except Exception as exc:
+        attendance.log(
+            f"event-state finalization failed event={event_id or '-'} "
+            f"status={status}: {exc}"
+        )
+        return False
+
+
+def transition_claim(
+    state,
+    claim,
+    event_id,
+    *,
+    to_state,
+    reason_code,
+    event_updates=None,
+    detail=None,
+    compatibility_status="processing",
+):
+    if not claim or not claim.accepted:
+        return False
+    state.transition_event(
+        event_id,
+        to_state=to_state,
+        reason_code=reason_code,
+        actor_type="watcher",
+        detail=detail or {},
+        event_updates=event_updates or {},
+        compatibility_status=compatibility_status,
+    )
+    return True
+
+
+def event_versions(gallery, cfg):
+    metadata = dict(
+        getattr(getattr(gallery, "reloader", None), "metadata", {}) or {}
+    )
+    return {
+        "gallery_version": str(metadata.get("gallery_version") or ""),
+        "gallery_generated_at": str(metadata.get("generated_at") or ""),
+        "gallery_model": str(metadata.get("model") or cfg.get("model") or ""),
+        "gallery_model_version": str(
+            metadata.get("model_version") or cfg.get("model_version") or ""
+        ),
+        "recognition_model": str(cfg.get("model") or ""),
+        "recognition_model_version": str(cfg.get("model_version") or ""),
+        "preprocessing_version": str(
+            cfg.get("preprocessing_version")
+            or f"det-{cfg.get('det_size', 0)}-scale-{cfg.get('process_scale', 1.0)}"
+        ),
+        "policy_version": str(
+            cfg.get("attendance_policy_version") or "directional-v1"
+        ),
+    }
+
+
+def pad_reason_code(value):
+    value = str(value or "")
+    if value.startswith("pad_expected_one_face_found_"):
+        return "pad_single_face_required"
+    if value.startswith("pad_face_limit_exceeded_"):
+        return "pad_face_limit"
+    if value == "no_face_for_pad":
+        return "no_face"
+    return "pad_rejected"
+
+
+def pad_result_for_index(pad_results, index, pad_gate):
+    if 0 <= index - 1 < len(pad_results):
+        return pad_results[index - 1]
+    return PADResult(
+        False,
+        None,
+        getattr(pad_gate, "expected_provider", "")
+        or getattr(pad_gate, "provider", ""),
+        reason="not_evaluated",
+        face_index=index,
+        face_count=max(index, len(pad_results)),
+        skipped=True,
+    )
+
+
+def record_pad_only_decisions(
+    state,
+    claim,
+    event_id,
+    faces,
+    pad_results,
+    pad_gate,
+    cfg,
+    gallery,
+    log_type,
+    reason_code,
+):
+    if not claim or not claim.accepted:
+        return
+    versions = event_versions(gallery, cfg)
+    face_count = len(faces)
+    for index, face in enumerate(faces, start=1):
+        result = pad_result_for_index(pad_results, index, pad_gate)
+        width, height = attendance.face_size(face)
+        state.record_recognition_decision(
+            event_id=event_id,
+            face_index=index,
+            face_count=face_count,
+            bbox=face_bbox(face),
+            face_width=width,
+            face_height=height,
+            detection_score=float(face.det_score),
+            best_employee="",
+            best_score=0.0,
+            runner_up_score=0.0,
+            score_margin=0.0,
+            pad_passed=bool(result.passed),
+            pad_skipped=bool(result.skipped),
+            pad_score=result.score,
+            pad_provider=result.provider or "",
+            pad_model=result.model or "",
+            pad_evidence_id=result.evidence_id or "",
+            pad_binding_id=result.binding_id or "",
+            accepted=False,
+            reason_code=reason_code,
+            candidate_log_type=log_type,
+            retention_state="not_retained",
+            **versions,
+        )
+
+
+'''
+    replace_between(
+        "watch_service.py",
+        "def finish_claim(state, claim, event_id, status, error=\"\"):\n",
+        "def ordered_faces(faces):\n",
+        helper_block,
+    )
+    process_function = '''def process_path(
+    path,
+    app,
+    known,
+    gallery,
+    cfg,
+    state,
+    pad_gate,
+    *,
+    dry_run=False,
+    allow_stale=False,
+    sources=None,
+):
+    path = Path(path)
+    claim = None
+    event_id = ""
+    claim_finalized = False
+    try:
+        if not attendance.wait_until_stable(path):
+            attendance.log(f"ftp:{path.name}: skipped unstable file")
+            return False
+
+        stat = path.stat()
+        source_sha256, source_size = file_sha256(path)
+        sources = tuple(sources or load_camera_sources(cfg, ROOT))
+        camera_source = source_for_upload_path(sources, path)
+        camera_id = camera_source.camera_id
+        log_type = camera_source.policy
+        event_id = make_event_id(camera_id, log_type, source_sha256)
+        capture_id = make_capture_id(
+            camera_id,
+            source_sha256,
+            path.name,
+            source_size,
+            stat.st_mtime,
+        )
+        if not dry_run:
+            received_at = utc_now()
+            claim = state.record_event_receipt(
+                event_id=event_id,
+                capture_id=capture_id,
+                camera_id=camera_id,
+                log_type=log_type,
+                source_sha256=source_sha256,
+                source_name=path.name,
+                source_mtime=stat.st_mtime,
+                source_size=source_size,
+                received_at=received_at,
+                effective_at=received_at,
+                branch=camera_source.branch,
+                source_type=camera_source.source_type,
+                source_principal=camera_source.ftp_username,
+                source_binding_id=camera_source.binding_id,
+                policy=log_type,
+                source_at=timestamp_from_unix(stat.st_mtime),
+                source_time_provenance="filesystem_mtime_untrusted",
+                receipt_state="pending",
