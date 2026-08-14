@@ -73,9 +73,11 @@
         '  "model_version": "",\n  "preprocessing_version": "insightface-preprocess-v1",\n  "attendance_policy_version": "directional-v1",\n',
     )
     replace_once(
-        ".github/workflows/tests.yml",
-        '            test_runtime_state.py \\\n',
-        '            test_runtime_state.py \\\n            test_event_ledger.py \\\n',
+        "test_runtime_state.py",
+        "from unittest.mock import patch\n\nfrom runtime_state import (",
+        "from unittest.mock import patch\n\n"
+        "from test_event_ledger import EventLedgerTests\n"
+        "from runtime_state import (",
     )
     replace_once(
         "docs/attendance-platform-plan.md",
