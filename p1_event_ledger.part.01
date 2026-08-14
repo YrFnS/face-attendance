@@ -1,0 +1,230 @@
+    """
+    INSERT INTO event_transitions (
+        event_id, sequence, from_state, to_state, reason_code,
+        actor_type, actor_id, detail_json, created_at
+    )
+    SELECT event_id, 1, '', lifecycle_state, 'legacy_import',
+           'migration', 'schema-v2', '{}', received_at
+    FROM camera_events
+    """,
+    """
+    CREATE TRIGGER recognition_decisions_no_update
+    BEFORE UPDATE ON recognition_decisions
+    BEGIN
+        SELECT RAISE(ABORT, 'recognition decisions are immutable');
+    END
+    """,
+    """
+    CREATE TRIGGER recognition_decisions_no_direct_delete
+    BEFORE DELETE ON recognition_decisions
+    WHEN EXISTS (SELECT 1 FROM camera_events WHERE event_id = OLD.event_id)
+    BEGIN
+        SELECT RAISE(ABORT, 'recognition decisions are append-only');
+    END
+    """,
+    """
+    CREATE TRIGGER event_transitions_no_update
+    BEFORE UPDATE ON event_transitions
+    BEGIN
+        SELECT RAISE(ABORT, 'event transitions are immutable');
+    END
+    """,
+    """
+    CREATE TRIGGER event_transitions_no_direct_delete
+    BEFORE DELETE ON event_transitions
+    WHEN EXISTS (SELECT 1 FROM camera_events WHERE event_id = OLD.event_id)
+    BEGIN
+        SELECT RAISE(ABORT, 'event transitions are append-only');
+    END
+    """,
+    """
+    CREATE TRIGGER operator_actions_no_update
+    BEFORE UPDATE ON operator_actions
+    BEGIN
+        SELECT RAISE(ABORT, 'operator actions are immutable');
+    END
+    """,
+    """
+    CREATE TRIGGER operator_actions_no_direct_delete
+    BEFORE DELETE ON operator_actions
+    WHEN EXISTS (SELECT 1 FROM camera_events WHERE event_id = OLD.event_id)
+    BEGIN
+        SELECT RAISE(ABORT, 'operator actions are append-only');
+    END
+    """,
+)
+
+
+LEDGER_REQUIRED_TABLE_COLUMNS = {
+    "camera_events": {
+        "capture_id": ("TEXT", True, 0),
+        "received_at": ("TEXT", True, 0),
+        "received_unix": ("REAL", True, 0),
+        "transport_received_at": ("TEXT", True, 0),
+        "source_at": ("TEXT", False, 0),
+        "source_time_provenance": ("TEXT", True, 0),
+        "effective_at": ("TEXT", True, 0),
+        "branch": ("TEXT", True, 0),
+        "source_type": ("TEXT", True, 0),
+        "source_principal": ("TEXT", True, 0),
+        "source_remote_ip": ("TEXT", True, 0),
+        "source_binding_id": ("TEXT", True, 0),
+        "policy": ("TEXT", True, 0),
+        "receipt_state": ("TEXT", True, 0),
+        "receipt_verified": ("INTEGER", True, 0),
+        "receipt_json": ("TEXT", True, 0),
+        "lifecycle_state": ("TEXT", True, 0),
+        "state_version": ("INTEGER", True, 0),
+        "reason_code": ("TEXT", True, 0),
+        "gallery_version": ("TEXT", True, 0),
+        "gallery_generated_at": ("TEXT", True, 0),
+        "gallery_model": ("TEXT", True, 0),
+        "gallery_model_version": ("TEXT", True, 0),
+        "recognition_model": ("TEXT", True, 0),
+        "recognition_model_version": ("TEXT", True, 0),
+        "preprocessing_version": ("TEXT", True, 0),
+        "pad_provider": ("TEXT", True, 0),
+        "pad_model": ("TEXT", True, 0),
+        "policy_version": ("TEXT", True, 0),
+        "retention_state": ("TEXT", True, 0),
+        "final_disposition": ("TEXT", True, 0),
+    },
+    "recognition_decisions": {
+        "decision_id": ("TEXT", False, 1),
+        "event_id": ("TEXT", True, 0),
+        "decision_version": ("INTEGER", True, 0),
+        "face_index": ("INTEGER", True, 0),
+        "face_count": ("INTEGER", True, 0),
+        "bbox_x1": ("INTEGER", True, 0),
+        "bbox_y1": ("INTEGER", True, 0),
+        "bbox_x2": ("INTEGER", True, 0),
+        "bbox_y2": ("INTEGER", True, 0),
+        "face_width": ("REAL", True, 0),
+        "face_height": ("REAL", True, 0),
+        "detection_score": ("REAL", True, 0),
+        "best_employee": ("TEXT", True, 0),
+        "best_score": ("REAL", True, 0),
+        "runner_up_score": ("REAL", True, 0),
+        "score_margin": ("REAL", True, 0),
+        "pad_passed": ("INTEGER", True, 0),
+        "pad_skipped": ("INTEGER", True, 0),
+        "pad_score": ("REAL", False, 0),
+        "pad_provider": ("TEXT", True, 0),
+        "pad_model": ("TEXT", True, 0),
+        "pad_evidence_id": ("TEXT", True, 0),
+        "pad_binding_id": ("TEXT", True, 0),
+        "accepted": ("INTEGER", True, 0),
+        "reason_code": ("TEXT", True, 0),
+        "candidate_log_type": ("TEXT", True, 0),
+        "policy_version": ("TEXT", True, 0),
+        "gallery_version": ("TEXT", True, 0),
+        "gallery_generated_at": ("TEXT", True, 0),
+        "gallery_model": ("TEXT", True, 0),
+        "gallery_model_version": ("TEXT", True, 0),
+        "recognition_model": ("TEXT", True, 0),
+        "recognition_model_version": ("TEXT", True, 0),
+        "preprocessing_version": ("TEXT", True, 0),
+        "retention_state": ("TEXT", True, 0),
+        "created_at": ("TEXT", True, 0),
+    },
+    "event_transitions": {
+        "id": ("INTEGER", False, 1),
+        "event_id": ("TEXT", True, 0),
+        "sequence": ("INTEGER", True, 0),
+        "from_state": ("TEXT", True, 0),
+        "to_state": ("TEXT", True, 0),
+        "reason_code": ("TEXT", True, 0),
+        "actor_type": ("TEXT", True, 0),
+        "actor_id": ("TEXT", True, 0),
+        "detail_json": ("TEXT", True, 0),
+        "created_at": ("TEXT", True, 0),
+    },
+    "operator_actions": {
+        "action_id": ("TEXT", False, 1),
+        "event_id": ("TEXT", True, 0),
+        "actor": ("TEXT", True, 0),
+        "action": ("TEXT", True, 0),
+        "reason_code": ("TEXT", True, 0),
+        "detail_json": ("TEXT", True, 0),
+        "created_at": ("TEXT", True, 0),
+    },
+}
+
+LEDGER_REQUIRED_INDEXES = {
+    "recognition_decisions_event": (False, ("event_id", "face_index")),
+    "event_transitions_event": (False, ("event_id", "sequence")),
+    "operator_actions_event": (False, ("event_id", "created_at")),
+    "camera_events_capture_id": (False, ("capture_id",)),
+    "camera_events_lifecycle": (False, ("lifecycle_state", "received_unix")),
+}
+
+LEDGER_REQUIRED_TRIGGERS = frozenset(
+    {
+        "recognition_decisions_no_update",
+        "recognition_decisions_no_direct_delete",
+        "event_transitions_no_update",
+        "event_transitions_no_direct_delete",
+        "operator_actions_no_update",
+        "operator_actions_no_direct_delete",
+    }
+)
+
+
+class EventLedgerError(RuntimeError):
+    pass
+
+
+class EventLedgerValidationError(EventLedgerError, ValueError):
+    pass
+
+
+@dataclass(frozen=True)
+class LedgerClaim:
+    accepted: bool
+    event_id: str
+    reason: str = ""
+    existing_status: str = ""
+    capture_id: str = ""
+
+
+def utc_now():
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def timestamp_from_unix(value):
+    return datetime.fromtimestamp(float(value), timezone.utc).isoformat().replace(
+        "+00:00", "Z"
+    )
+
+
+def _text(value, field, *, required=False, max_chars=4096):
+    if value is None:
+        text = ""
+    elif not isinstance(value, str):
+        raise EventLedgerValidationError(f"{field} must be a string")
+    else:
+        text = unicodedata.normalize("NFC", value)
+    if text != text.strip():
+        raise EventLedgerValidationError(
+            f"{field} must not contain surrounding whitespace"
+        )
+    if required and not text:
+        raise EventLedgerValidationError(f"{field} is required")
+    if len(text) > int(max_chars):
+        raise EventLedgerValidationError(
+            f"{field} exceeds {int(max_chars)} characters"
+        )
+    for character in text:
+        if unicodedata.category(character) in {"Cc", "Cf", "Cs"}:
+            raise EventLedgerValidationError(
+                f"{field} contains a control or formatting character"
+            )
+    return text
+
+
+def _identifier(value, field):
+    text = _text(value, field, required=True, max_chars=64).lower()
+    if not HEX64_RE.fullmatch(text):
+        raise EventLedgerValidationError(
+            f"{field} must be a lowercase 64-character SHA-256 identifier"
+        )
