@@ -1,0 +1,308 @@
+        for transition in inspected.get("transitions", []):
+            timeline.append(
+                {
+                    "kind": "transition",
+                    "at": transition.get("created_at", ""),
+                    "sequence": transition.get("sequence", 0),
+                    "summary": (
+                        f"{transition.get('from_state') or '<start>'} -> "
+                        f"{transition.get('to_state')} "
+                        f"({transition.get('reason_code')})"
+                    ),
+                    "actor": transition.get("actor_id")
+                    or transition.get("actor_type", ""),
+                    "detail": transition.get("detail", {}),
+                }
+            )
+        for action in inspected.get("operator_actions", []):
+            timeline.append(
+                {
+                    "kind": "operator_action",
+                    "at": action.get("created_at", ""),
+                    "sequence": None,
+                    "summary": action.get("action", ""),
+                    "actor": action.get("actor", ""),
+                    "detail": action.get("detail", {}),
+                }
+            )
+        timeline.sort(
+            key=lambda item: (
+                str(item.get("at") or ""),
+                item.get("sequence") or 0,
+            )
+        )
+
+        return redact_event_value(
+            {
+                "event_id": event.get("event_id", event_id),
+                "headline": headline,
+                "current_state": state,
+                "current_reason": reason,
+                "delivery_safety": {
+                    "delivery_started": delivery_started,
+                    "confirmed_delivery": confirmed_delivery,
+                    "uncertain_policy_scope": uncertain_policy,
+                    "automatic_retry_allowed": False,
+                    "operator_reprocess_allowed": reprocess_eligible,
+                },
+                "operator_eligibility": {
+                    "reprocess": reprocess_eligible,
+                    "dismiss": dismiss_eligible,
+                    "delivery_retry": False,
+                    "delivery_cancel": False,
+                },
+                "source": {
+                    "camera_id": event.get("camera_id", ""),
+                    "branch": event.get("branch", ""),
+                    "direction": event.get("log_type", ""),
+                    "receipt_state": event.get("receipt_state", ""),
+                    "receipt_verified": bool(event.get("receipt_verified")),
+                    "retention_state": event.get("retention_state", ""),
+                },
+                "runtime_versions": {
+                    "gallery_version": event.get("gallery_version", ""),
+                    "gallery_model": event.get("gallery_model", ""),
+                    "gallery_model_version": event.get(
+                        "gallery_model_version",
+                        "",
+                    ),
+                    "recognition_model": event.get("recognition_model", ""),
+                    "recognition_model_version": event.get(
+                        "recognition_model_version",
+                        "",
+                    ),
+                    "preprocessing_version": event.get(
+                        "preprocessing_version",
+                        "",
+                    ),
+                    "pad_provider": event.get("pad_provider", ""),
+                    "pad_model": event.get("pad_model", ""),
+                    "policy_version": event.get("policy_version", ""),
+                },
+                "decision_summary": decision_summary,
+                "timeline": timeline,
+                "recommended_action": recommended,
+                "read_only": True,
+                "biometric_vectors_exposed": False,
+            }
+        )
+
+
+def _operator_actor_reason(actor, reason):
+    actor = _text(actor, "actor", required=True, max_chars=256)
+    reason = _text(
+        reason,
+        "operator reason",
+        required=True,
+        max_chars=OPERATOR_REASON_MAX_CHARS,
+    )
+    if len(reason) < OPERATOR_REASON_MIN_CHARS:
+        raise EventOperationError(
+            "operator reason must contain at least "
+            f"{OPERATOR_REASON_MIN_CHARS} characters"
+        )
+    return actor, reason
+
+
+class EventOperationsMixin:
+    """Atomic, audited Phase 1 operator actions. No delivery retry lives here."""
+
+    @staticmethod
+    def _insert_operator_action_tx(
+        connection,
+        *,
+        event_id,
+        actor,
+        action,
+        reason,
+        detail,
+        created_at,
+    ):
+        payload = dict(detail or {})
+        payload["operator_reason"] = reason
+        action_id = hashlib.sha256(
+            "\0".join(
+                (event_id, actor, action, created_at, reason)
+            ).encode("utf-8")
+        ).hexdigest()
+        connection.execute(
+            """
+            INSERT INTO operator_actions (
+                action_id, event_id, actor, action, reason_code,
+                detail_json, created_at
+            ) VALUES (?, ?, ?, ?, 'operator_action', ?, ?)
+            """,
+            (
+                action_id,
+                event_id,
+                actor,
+                action,
+                _json_text(payload, "operator action detail"),
+                created_at,
+            ),
+        )
+        return action_id
+
+    @staticmethod
+    def _active_lease(row, now):
+        return bool(row["lease_owner"]) and float(
+            row["lease_expires_unix"] or 0
+        ) > now
+
+    @staticmethod
+    def _delivery_started(row):
+        return bool(
+            row["delivery_started_at"]
+            or row["delivery_decision_id"]
+            or row["processing_phase"] == "delivery_in_progress"
+        )
+
+    @staticmethod
+    def _uncertain_policy_tx(connection, event_id):
+        return (
+            connection.execute(
+                """
+                SELECT 1 FROM attendance_policy_state
+                WHERE reservation_event_id = ?
+                  AND reservation_state = 'uncertain'
+                LIMIT 1
+                """,
+                (event_id,),
+            ).fetchone()
+            is not None
+        )
+
+    def operator_dismiss_event(self, event_id, *, actor, reason, now=None):
+        event_id = _identifier(event_id, "event_id")
+        actor, reason = _operator_actor_reason(actor, reason)
+        now = _finite(
+            now if now is not None else datetime.now(timezone.utc).timestamp(),
+            "now",
+            minimum=0,
+        )
+        created_at = timestamp_from_unix(now)
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT * FROM camera_events WHERE event_id = ?",
+                (event_id,),
+            ).fetchone()
+            if row is None:
+                raise EventOperationError(f"event does not exist: {event_id}")
+            if row["lifecycle_state"] not in DISMISSIBLE_STATES:
+                raise EventOperationError(
+                    "event state cannot be dismissed: "
+                    f"{row['lifecycle_state']}"
+                )
+            if self._active_lease(row, now):
+                raise EventOperationError("event has an active processing lease")
+            if self._delivery_started(row):
+                raise EventOperationError(
+                    "event crossed the delivery boundary; reconcile it instead "
+                    "of dismissing it"
+                )
+            if self._uncertain_policy_tx(connection, event_id):
+                raise EventOperationError(
+                    "event has an uncertain attendance-policy reservation"
+                )
+            self._release_policy_for_event_tx(
+                connection,
+                event_id,
+                uncertain=False,
+            )
+            action_id = self._insert_operator_action_tx(
+                connection,
+                event_id=event_id,
+                actor=actor,
+                action="dismissed",
+                reason=reason,
+                detail={
+                    "previous_state": row["lifecycle_state"],
+                    "previous_reason_code": row["reason_code"],
+                    "previous_final_disposition": row[
+                        "final_disposition"
+                    ],
+                },
+                created_at=created_at,
+            )
+            self._transition_tx(
+                connection,
+                row,
+                to_state="dismissed",
+                reason_code="operator_action",
+                detail={
+                    "action": "dismissed",
+                    "action_id": action_id,
+                    "operator_reason": reason,
+                },
+                compatibility_status="dismissed",
+                actor_type="operator",
+                actor_id=actor,
+                terminal=True,
+                now=now,
+            )
+            connection.execute(
+                "UPDATE camera_events SET final_disposition = 'dismissed' "
+                "WHERE event_id = ?",
+                (event_id,),
+            )
+            connection.commit()
+            return {
+                "event_id": event_id,
+                "action_id": action_id,
+                "action": "dismissed",
+                "actor": actor,
+                "state": "dismissed",
+                "delivery_retry_created": False,
+            }
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def operator_reprocess_event(
+        self,
+        event_id,
+        *,
+        actor,
+        reason,
+        source_path,
+        action="reprocess_requested",
+        now=None,
+    ):
+        event_id = _identifier(event_id, "event_id")
+        actor, reason = _operator_actor_reason(actor, reason)
+        action = _text(action, "action", required=True, max_chars=128)
+        source_path = _text(
+            str(source_path),
+            "source_path",
+            required=True,
+            max_chars=4096,
+        )
+        source_file = Path(source_path).expanduser()
+        try:
+            metadata = source_file.lstat()
+        except FileNotFoundError as exc:
+            raise EventOperationError(
+                f"source evidence does not exist: {source_file}"
+            ) from exc
+        if source_file.is_symlink() or not source_file.is_file():
+            raise EventOperationError(
+                "source evidence must be a regular non-symlink file: "
+                f"{source_file}"
+            )
+        now = _finite(
+            now if now is not None else datetime.now(timezone.utc).timestamp(),
+            "now",
+            minimum=0,
+        )
+        created_at = timestamp_from_unix(now)
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT * FROM camera_events WHERE event_id = ?",
+                (event_id,),
+            ).fetchone()
