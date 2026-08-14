@@ -274,8 +274,8 @@ Release A requires no Redis, Celery, PostgreSQL, or message broker. Introduce on
 
 **Purpose:** Make every camera event durable, explainable, and recoverable before adding features.
 
-- [ ] `P1-01` Add an explicit schema-version table and transactional forward migrations for `runtime_state.sqlite3`.
-- [ ] `P1-02` Add backup-before-migrate, migration verification, and documented rollback/restore commands.
+- [x] `P1-01` Add an explicit schema-version table and transactional forward migrations for `runtime_state.sqlite3`.
+- [x] `P1-02` Add backup-before-migrate, migration verification, and documented rollback/restore commands.
 - [ ] `P1-03` Expand `camera_events`; add `recognition_decisions`, append-only `event_transitions`, and append-only `operator_actions` using stable reason/status enums.
 - [ ] `P1-04` Persist a normalized receipt before time/size/decode rejection, then persist model, gallery, PAD, scores, margin, policy, immutable event times, and retention outcome for every decision.
 - [ ] `P1-05` Replace permanent `processing` claims with leases and explicit startup recovery: safely retry pre-delivery work; classify delivery ambiguity as `uncertain`.

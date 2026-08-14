@@ -16,6 +16,7 @@ model_manifest.json
 runtime_state.sqlite3
 runtime_state.sqlite3-wal
 runtime_state.sqlite3-shm
+runtime_state_backups/
 .embedding_gallery.json.*
 .embedding_sync_status.json.*
 .model_manifest.json.*
