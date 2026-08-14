@@ -1,0 +1,43 @@
+H0-09 fragment test_watch_service.py 4/4
+
+        class MixedPAD(PassingPAD):
+            def evaluate(self, crop, context):
+                result = super().evaluate(crop, context)
+                if context["face_index"] == 2:
+                    return PADResult(
+                        False,
+                        0.2,
+                        result.provider,
+                        reason="failed_liveness",
+                        evidence_id=result.evidence_id,
+                        model=result.model,
+                        binding_id=result.binding_id,
+                        crop_sha256=result.crop_sha256,
+                        face_index=result.face_index,
+                        face_count=result.face_count,
+                    )
+                return result
+
+        pad = MixedPAD()
+        called = []
+        attendance.process_image = lambda *args, **kwargs: called.append(True) or True
+        result = watch_service.process_path(
+            self.image_path,
+            FakeApp(faces),
+            [],
+            StaticGallery([]),
+            self.cfg,
+            self.state,
+            pad,
+            sources=self.sources,
+        )
+        self.assertFalse(result)
+        self.assertEqual(len(pad.calls), 2)
+        self.assertEqual(called, [])
+        event = self.state.get_event(self.event_id())
+        self.assertEqual(event["status"], "rejected")
+        self.assertIn("2:failed_liveness", event["error"])
+
+
+if __name__ == "__main__":
+    unittest.main()
