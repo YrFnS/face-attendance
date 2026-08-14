@@ -9,8 +9,17 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
+from event_ledger import (
+    EventLedgerMixin,
+    LEDGER_REQUIRED_INDEXES,
+    LEDGER_REQUIRED_TABLE_COLUMNS,
+    LEDGER_REQUIRED_TRIGGERS,
+    LEDGER_SCHEMA_STATEMENTS,
+    make_capture_id,
+)
 
-RUNTIME_SCHEMA_VERSION = 1
+
+RUNTIME_SCHEMA_VERSION = 2
 MIGRATION_TABLE = "schema_migrations"
 DEFAULT_BACKUP_DIRECTORY = "runtime_state_backups"
 
@@ -160,6 +169,7 @@ BASELINE_SCHEMA_STATEMENTS = (
 
 MIGRATIONS = (
     Migration(1, "baseline_runtime_state", BASELINE_SCHEMA_STATEMENTS),
+    Migration(2, "versioned_event_ledger", LEDGER_SCHEMA_STATEMENTS),
 )
 MIGRATION_BY_VERSION = {migration.version: migration for migration in MIGRATIONS}
 
@@ -325,9 +335,21 @@ def _schema_version(connection):
     return current, history
 
 
-def _required_schema_errors(connection):
+def _required_schema_errors(connection, version=None):
+    version = RUNTIME_SCHEMA_VERSION if version is None else int(version)
+    table_requirements = {
+        table: dict(columns) for table, columns in REQUIRED_TABLE_COLUMNS.items()
+    }
+    index_requirements = dict(REQUIRED_INDEXES)
+    trigger_requirements = set()
+    if version >= 2:
+        for table, columns in LEDGER_REQUIRED_TABLE_COLUMNS.items():
+            table_requirements.setdefault(table, {}).update(columns)
+        index_requirements.update(LEDGER_REQUIRED_INDEXES)
+        trigger_requirements.update(LEDGER_REQUIRED_TRIGGERS)
+
     errors = []
-    for table, required in REQUIRED_TABLE_COLUMNS.items():
+    for table, required in table_requirements.items():
         if not _table_exists(connection, table):
             errors.append(f"required table is missing: {table}")
             continue
@@ -359,7 +381,7 @@ def _required_schema_errors(connection):
         "SELECT name, tbl_name FROM sqlite_master WHERE type = 'index'"
     ).fetchall()
     indexes = {row["name"]: row for row in index_rows}
-    for index_name, (expected_unique, expected_columns) in REQUIRED_INDEXES.items():
+    for index_name, (expected_unique, expected_columns) in index_requirements.items():
         row = indexes.get(index_name)
         if row is None:
             errors.append(f"required indexes are missing: {index_name}")
@@ -383,6 +405,19 @@ def _required_schema_errors(connection):
             errors.append(
                 f"index {index_name} columns {actual_columns!r}; "
                 f"expected {expected_columns!r}"
+            )
+
+    if trigger_requirements:
+        triggers = {
+            row["name"]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'trigger'"
+            ).fetchall()
+        }
+        missing_triggers = sorted(trigger_requirements - triggers)
+        if missing_triggers:
+            errors.append(
+                "required triggers are missing: " + ", ".join(missing_triggers)
             )
     return errors
 
@@ -443,7 +478,7 @@ def inspect_runtime_database(path, *, require_latest=False):
             report["errors"].append(str(exc))
             return report
 
-        schema_errors = _required_schema_errors(connection) if current else []
+        schema_errors = _required_schema_errors(connection, version=current) if current else []
         report["schema_ok"] = not schema_errors
         report["errors"].extend(schema_errors)
         if require_latest and current != RUNTIME_SCHEMA_VERSION:
@@ -760,7 +795,7 @@ def restore_runtime_backup(
             pass
 
 
-class RuntimeState:
+class RuntimeState(EventLedgerMixin):
     def __init__(self, path, backup_dir=None):
         self.path = Path(path)
         self.backup_dir = _backup_directory(self.path, backup_dir)
@@ -845,7 +880,9 @@ class RuntimeState:
                 )
             for statement in migration.statements:
                 connection.execute(statement)
-            schema_errors = _required_schema_errors(connection)
+            schema_errors = _required_schema_errors(
+                connection, version=migration.version
+            )
             if schema_errors:
                 raise RuntimeStateMigrationError("; ".join(schema_errors))
             connection.execute(
@@ -884,76 +921,65 @@ class RuntimeState:
         source_mtime,
         source_size,
     ):
-        now = time.time()
-        connection = self._connect()
-        try:
-            connection.execute("BEGIN IMMEDIATE")
-            existing = connection.execute(
-                """
-                SELECT event_id, status
-                FROM camera_events
-                WHERE event_id = ? OR (camera_id = ? AND source_sha256 = ?)
-                LIMIT 1
-                """,
-                (event_id, camera_id, source_sha256),
-            ).fetchone()
-            if existing:
-                connection.rollback()
-                return EventClaim(
-                    False,
-                    existing["event_id"],
-                    reason="duplicate",
-                    existing_status=existing["status"],
-                )
-            connection.execute(
-                """
-                INSERT INTO camera_events (
-                    event_id, camera_id, log_type, source_sha256, source_name,
-                    source_mtime, source_size, status, created_unix, updated_unix
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, 'processing', ?, ?)
-                """,
-                (
-                    event_id,
-                    camera_id,
-                    log_type,
-                    source_sha256,
-                    source_name,
-                    source_mtime,
-                    int(source_size),
-                    now,
-                    now,
-                ),
+        received_at = utc_now()
+        claim = self.record_event_receipt(
+            event_id=event_id,
+            capture_id=make_capture_id(
+                camera_id,
+                source_sha256,
+                source_name,
+                source_size,
+                source_mtime,
+            ),
+            camera_id=camera_id,
+            log_type=log_type,
+            source_sha256=source_sha256,
+            source_name=source_name,
+            source_mtime=source_mtime,
+            source_size=int(source_size),
+            received_at=received_at,
+            effective_at=received_at,
+            policy=log_type,
+            source_time_provenance="legacy",
+            receipt_state="legacy",
+            receipt_verified=False,
+            receipt_detail={"compatibility_path": True},
+            policy_version="legacy",
+        )
+        if claim.accepted:
+            self.transition_event(
+                event_id,
+                to_state="processing",
+                reason_code="processing_started",
+                actor_type="system",
+                compatibility_status="processing",
             )
-            connection.commit()
-            return EventClaim(True, event_id)
-        finally:
-            connection.close()
+        return claim
 
     def finish_event(self, event_id, status="processed", error=""):
-        now = time.time()
-        connection = self._connect()
-        try:
-            connection.execute(
-                """
-                UPDATE camera_events
-                SET status = ?, error = ?, updated_unix = ?, completed_at = ?
-                WHERE event_id = ?
-                """,
-                (status, str(error or "")[:2000], now, utc_now(), event_id),
-            )
-            connection.commit()
-        finally:
-            connection.close()
+        mapping = {
+            "checkin_created": ("checkin_created", "checkin_created"),
+            "processed": ("processed", "processed_no_checkin"),
+            "processed_no_checkin": ("processed", "processed_no_checkin"),
+            "rejected": ("rejected", "generic_rejected"),
+            "failed": ("failed", "generic_failed"),
+            "uncertain": ("uncertain", "generic_failed"),
+        }
+        lifecycle, reason = mapping.get(
+            status,
+            ("failed", "generic_failed"),
+        )
+        return self.transition_event(
+            event_id,
+            to_state=lifecycle,
+            reason_code=reason,
+            actor_type="system",
+            compatibility_status=status,
+            error=error,
+        )
 
     def get_event(self, event_id):
-        connection = self._connect()
-        try:
-            row = connection.execute(
-                "SELECT * FROM camera_events WHERE event_id = ?", (event_id,)
-            ).fetchone()
-            return dict(row) if row else None
-        finally:
-            connection.close()
+        return self.event_details(event_id, include_history=True)
 
     def prune_events(self, retention_days):
         retention_days = int(retention_days or 0)

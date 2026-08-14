@@ -625,12 +625,19 @@ def process_image(
     cfg,
     dry_run=False,
     attach_source=None,
+    decision_callback=None,
 ):
     detect_frame = scaled_frame(image, cfg)
     faces = app.get(detect_frame)
     if not faces:
         log(f"{source_name}: no faces")
         return False
+
+    selected_log_type = log_type_for_path(cfg, attach_source)
+
+    def emit_decision(payload):
+        if decision_callback is not None:
+            decision_callback(dict(payload))
 
     created = False
     seen_this_image = set()
@@ -644,7 +651,21 @@ def process_image(
 
         width, height = face_size(face)
         score, employee, margin = match_employee(known, face.embedding)
+        runner_up_score = score - margin
         prefix = f"{source_name} face={index}/{len(faces)}"
+        decision = {
+            "face_index": index,
+            "face_count": len(faces),
+            "bbox": [x1, y1, x2, y2],
+            "face_width": float(width),
+            "face_height": float(height),
+            "detection_score": float(face.det_score),
+            "best_employee": employee or "",
+            "best_score": float(score),
+            "runner_up_score": float(runner_up_score),
+            "score_margin": float(margin),
+            "candidate_log_type": selected_log_type,
+        }
         if (
             width < int(cfg["min_face_width"])
             or height < int(cfg["min_face_height"])
@@ -656,17 +677,38 @@ def process_image(
                 f"det={float(face.det_score):.3f} "
                 f"best={employee} score={score:.3f} margin={margin:.3f}"
             )
-            save_rejected(crop, "quality", cfg, employee, score)
+            retained = save_rejected(crop, "quality", cfg, employee, score)
+            emit_decision(
+                {
+                    **decision,
+                    "accepted": False,
+                    "reason_code": "quality_rejected",
+                    "retention_state": "retained" if retained else "not_retained",
+                }
+            )
             continue
 
         log(f"{prefix} match={employee} score={score:.3f} margin={margin:.3f}")
-        if (
-            not employee
-            or score < float(cfg["threshold"])
-            or margin < float(cfg.get("min_score_margin", 0.0))
-            or employee in seen_this_image
-        ):
-            save_rejected(crop, "unknown", cfg, employee, score)
+        if not employee:
+            reason_code = "unknown_employee"
+        elif score < float(cfg["threshold"]):
+            reason_code = "score_below_threshold"
+        elif margin < float(cfg.get("min_score_margin", 0.0)):
+            reason_code = "margin_below_threshold"
+        elif employee in seen_this_image:
+            reason_code = "duplicate_face"
+        else:
+            reason_code = ""
+        if reason_code:
+            retained = save_rejected(crop, "unknown", cfg, employee, score)
+            emit_decision(
+                {
+                    **decision,
+                    "accepted": False,
+                    "reason_code": reason_code,
+                    "retention_state": "retained" if retained else "not_retained",
+                }
+            )
             continue
 
         employee = validate_employee_id(employee)
@@ -675,13 +717,29 @@ def process_image(
         attachment_path = (
             image_path if bool(cfg.get("attach_checkin_crop", True)) else None
         )
+        retention_state = (
+            "temporary"
+            if temporary and image_path
+            else "retained"
+            if image_path
+            else "not_retained"
+        )
         try:
+            emit_decision(
+                {
+                    **decision,
+                    "best_employee": employee,
+                    "accepted": True,
+                    "reason_code": "accepted_candidate",
+                    "retention_state": retention_state,
+                }
+            )
             created_now = create_checkin_with_cooldown(
                 employee,
                 cfg,
                 attachment_path,
                 dry_run,
-                log_type_for_path(cfg, attach_source),
+                selected_log_type,
             )
             created = created_now or created
         finally:

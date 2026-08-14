@@ -121,6 +121,8 @@
   "embedding_export_enabled": false,
   "model": "buffalo_l",
   "model_version": "",
+  "preprocessing_version": "insightface-preprocess-v1",
+  "attendance_policy_version": "directional-v1",
   "model_directory": "~/.insightface/models/buffalo_l",
   "model_license_acknowledged": false,
   "model_license_reference": "CHANGE_ME",
