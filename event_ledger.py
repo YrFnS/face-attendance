@@ -831,7 +831,17 @@ class EventLedgerMixin:
                 assignments.append(f"{key} = ?")
                 values.append(value)
             if to_state in TERMINAL_EVENT_STATES:
-                assignments.extend(["completed_at = ?", "final_disposition = ?"])
+                assignments.extend(
+                    [
+                        "completed_at = ?",
+                        "final_disposition = ?",
+                        "processing_phase = 'terminal'",
+                        "lease_owner = ''",
+                        "lease_acquired_at = ''",
+                        "lease_heartbeat_at = ''",
+                        "lease_expires_unix = 0",
+                    ]
+                )
                 values.extend([created_at, final_disposition or reason_code])
             values.append(event_id)
             connection.execute(

@@ -17,9 +17,15 @@ from event_ledger import (
     LEDGER_SCHEMA_STATEMENTS,
     make_capture_id,
 )
+from processing_recovery import (
+    ProcessingRecoveryMixin,
+    RECOVERY_REQUIRED_INDEXES,
+    RECOVERY_REQUIRED_TABLE_COLUMNS,
+    RECOVERY_SCHEMA_STATEMENTS,
+)
 
 
-RUNTIME_SCHEMA_VERSION = 2
+RUNTIME_SCHEMA_VERSION = 3
 MIGRATION_TABLE = "schema_migrations"
 DEFAULT_BACKUP_DIRECTORY = "runtime_state_backups"
 
@@ -170,6 +176,7 @@ BASELINE_SCHEMA_STATEMENTS = (
 MIGRATIONS = (
     Migration(1, "baseline_runtime_state", BASELINE_SCHEMA_STATEMENTS),
     Migration(2, "versioned_event_ledger", LEDGER_SCHEMA_STATEMENTS),
+    Migration(3, "processing_leases_and_policy_state", RECOVERY_SCHEMA_STATEMENTS),
 )
 MIGRATION_BY_VERSION = {migration.version: migration for migration in MIGRATIONS}
 
@@ -347,6 +354,10 @@ def _required_schema_errors(connection, version=None):
             table_requirements.setdefault(table, {}).update(columns)
         index_requirements.update(LEDGER_REQUIRED_INDEXES)
         trigger_requirements.update(LEDGER_REQUIRED_TRIGGERS)
+    if version >= 3:
+        for table, columns in RECOVERY_REQUIRED_TABLE_COLUMNS.items():
+            table_requirements.setdefault(table, {}).update(columns)
+        index_requirements.update(RECOVERY_REQUIRED_INDEXES)
 
     errors = []
     for table, required in table_requirements.items():
@@ -795,7 +806,7 @@ def restore_runtime_backup(
             pass
 
 
-class RuntimeState(EventLedgerMixin):
+class RuntimeState(ProcessingRecoveryMixin, EventLedgerMixin):
     def __init__(self, path, backup_dir=None):
         self.path = Path(path)
         self.backup_dir = _backup_directory(self.path, backup_dir)
@@ -946,15 +957,19 @@ class RuntimeState(EventLedgerMixin):
             receipt_detail={"compatibility_path": True},
             policy_version="legacy",
         )
-        if claim.accepted:
-            self.transition_event(
-                event_id,
-                to_state="processing",
-                reason_code="processing_started",
-                actor_type="system",
-                compatibility_status="processing",
-            )
-        return claim
+        if not claim.accepted:
+            return claim
+        lease = self.acquire_event_lease(
+            event_id,
+            owner="compatibility-claim",
+            lease_seconds=180,
+        )
+        return EventClaim(
+            lease.accepted,
+            event_id,
+            reason=lease.reason,
+            existing_status=lease.existing_status,
+        )
 
     def finish_event(self, event_id, status="processed", error=""):
         mapping = {
@@ -969,11 +984,12 @@ class RuntimeState(EventLedgerMixin):
             status,
             ("failed", "generic_failed"),
         )
-        return self.transition_event(
+        return self.finalize_event_with_lease(
             event_id,
+            owner="compatibility-claim",
             to_state=lifecycle,
             reason_code=reason,
-            actor_type="system",
+            detail={"compatibility_path": True},
             compatibility_status=status,
             error=error,
         )
