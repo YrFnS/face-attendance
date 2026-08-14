@@ -80,6 +80,24 @@ def patch_readiness_tests():
     replace_once("test_production_readiness.py", marker, addition + marker)
 
 
+def patch_ftps_compatibility():
+    replace_once(
+        "ftp_receiver.py",
+        "from pyftpdlib.handlers import FTPHandler, TLS_FTPHandler\n",
+        '''from pyftpdlib.handlers import FTPHandler\n\ntry:\n    from pyftpdlib.handlers import TLS_FTPHandler\nexcept ImportError:\n    from pyftpdlib.handlers.ftps.control import TLS_FTPHandler\n''',
+    )
+    replace_once(
+        "requirements.txt",
+        "pyftpdlib>=2.0.1,<3\n",
+        "pyftpdlib[ssl]>=2.0.1,<3\n",
+    )
+    replace_once(
+        ".github/workflows/tests.yml",
+        '            "pyftpdlib>=2.0.1,<3" \\\n',
+        '            "pyftpdlib[ssl]>=2.0.1,<3" \\\n',
+    )
+
+
 def main():
     fetch_fragments()
     assemble("camera_sources.py", "camera_sources.py", 7)
@@ -87,6 +105,7 @@ def main():
     assemble("test_ftp_receiver.py", "test_ftp_receiver.py", 2)
     assemble("test_watch_service.py", "test_watch_service.py", 3)
     patch_readiness_tests()
+    patch_ftps_compatibility()
     needle = '            test_gallery_contract.py \\\n'
     replace_once(
         ".github/workflows/tests.yml",
