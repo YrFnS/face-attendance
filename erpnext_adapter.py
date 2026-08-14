@@ -53,6 +53,13 @@ class EmployeeCheckinResult:
     transport: str
 
 
+@dataclass(frozen=True)
+class PrivateAttachmentResult:
+    file_docname: str
+    file_url: str
+    transport: str
+
+
 def erp_event_time(value=None):
     """Normalize an event time to ERPNext's UTC ``YYYY-mm-dd HH:MM:SS`` form."""
 
@@ -161,6 +168,14 @@ class ERPNextAdapter(ABC):
     ) -> EmployeeCheckinResult:
         raise NotImplementedError
 
+    @abstractmethod
+    def attach_private_file(
+        self,
+        docname: str,
+        image_path,
+    ) -> PrivateAttachmentResult:
+        raise NotImplementedError
+
 
 class RESTERPNextAdapter(ERPNextAdapter):
     transport = "rest"
@@ -229,28 +244,55 @@ class RESTERPNextAdapter(ERPNextAdapter):
                 "ERPNext REST response did not contain a valid document name"
             ) from exc
 
-        if image_path:
-            image_path = Path(image_path)
-            with image_path.open("rb") as handle:
-                upload = self.session.post(
-                    f"{self.base_url}/api/method/upload_file",
-                    headers=self._headers(json_request=False),
-                    data={
-                        "doctype": "Employee Checkin",
-                        "docname": docname,
-                        "is_private": "1",
-                    },
-                    files={
-                        "file": (
-                            image_path.name,
-                            handle,
-                            "image/jpeg",
-                        )
-                    },
-                    timeout=self.timeout_seconds,
-                )
-            upload.raise_for_status()
+        if image_path is not None:
+            raise ERPNextAdapterConfigurationError(
+                "private attachments must be delivered through attach_private_file"
+            )
         return EmployeeCheckinResult(docname, self.transport)
+
+    def attach_private_file(self, docname, image_path):
+        docname = validate_erp_docname(docname)
+        image_path = Path(image_path)
+        if image_path.is_symlink() or not image_path.is_file():
+            raise ERPNextAdapterConfigurationError(
+                "attachment source must be a regular non-symbolic-link file"
+            )
+        with image_path.open("rb") as handle:
+            upload = self.session.post(
+                f"{self.base_url}/api/method/upload_file",
+                headers=self._headers(json_request=False),
+                data={
+                    "doctype": "Employee Checkin",
+                    "docname": docname,
+                    "is_private": "1",
+                },
+                files={
+                    "file": (
+                        image_path.name,
+                        handle,
+                        "image/jpeg",
+                    )
+                },
+                timeout=self.timeout_seconds,
+            )
+        upload.raise_for_status()
+        try:
+            payload = upload.json()
+            message = payload.get("message") or {}
+            if not isinstance(message, dict):
+                raise TypeError("message must be an object")
+            file_docname = str(message.get("name") or "").strip()
+            file_url = str(message.get("file_url") or "").strip()
+            if not file_docname:
+                raise ValueError("missing File document name")
+            file_docname = validate_erp_docname(file_docname)
+            if len(file_url) > 2048:
+                raise ValueError("file_url is too long")
+        except (AttributeError, KeyError, TypeError, ValueError) as exc:
+            raise ERPNextAdapterError(
+                "ERPNext attachment response did not contain a valid File document"
+            ) from exc
+        return PrivateAttachmentResult(file_docname, file_url, self.transport)
 
 
 class BenchERPNextAdapter(ERPNextAdapter):
@@ -298,14 +340,40 @@ class BenchERPNextAdapter(ERPNextAdapter):
                 "ERPNext bench response did not contain a valid document name"
             ) from exc
 
-        if image_path and self.attach:
-            try:
-                self.attach(docname, Path(image_path))
-            except Exception as exc:
-                if self.attachment_error_handler is None:
-                    raise
-                self.attachment_error_handler(exc)
+        if image_path is not None:
+            raise ERPNextAdapterConfigurationError(
+                "private attachments must be delivered through attach_private_file"
+            )
         return EmployeeCheckinResult(docname, self.transport)
+
+    def attach_private_file(self, docname, image_path):
+        docname = validate_erp_docname(docname)
+        if self.attach is None:
+            raise ERPNextAdapterConfigurationError(
+                "bench attachment callback is required"
+            )
+        image_path = Path(image_path)
+        if image_path.is_symlink() or not image_path.is_file():
+            raise ERPNextAdapterConfigurationError(
+                "attachment source must be a regular non-symbolic-link file"
+            )
+        result = self.attach(docname, image_path)
+        file_docname = ""
+        file_url = ""
+        if isinstance(result, dict):
+            file_docname = str(result.get("name") or "").strip()
+            file_url = str(result.get("file_url") or "").strip()
+        elif isinstance(result, str):
+            file_docname = result.strip()
+        elif result is not None:
+            raise ERPNextAdapterError(
+                "bench attachment callback returned an invalid result"
+            )
+        if file_docname:
+            file_docname = validate_erp_docname(file_docname)
+        if len(file_url) > 2048:
+            raise ERPNextAdapterError("bench attachment file_url is too long")
+        return PrivateAttachmentResult(file_docname, file_url, self.transport)
 
 
 def build_erpnext_adapter(

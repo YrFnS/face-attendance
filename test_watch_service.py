@@ -873,5 +873,82 @@ class WatchServiceTests(unittest.TestCase):
             connection.close()
         self.assertEqual(policy[0], "pending")
 
+    def test_private_crop_is_spooled_into_separate_attachment_job(self):
+        self.cfg.update(
+            delivery_mode="worker",
+            delivery_worker_enabled=True,
+            attach_checkin_crop=True,
+            attachment_worker_enabled=True,
+            attachment_spool_dir=str(self.root / "attachment-spool"),
+            attachment_max_image_bytes=1024 * 1024,
+            attachment_queue_max_active_jobs=100,
+            attachment_queue_min_free_bytes=0,
+        )
+        crop = self.root / "accepted-crop.jpg"
+        cv2.imwrite(str(crop), np.zeros((20, 20, 3), dtype=np.uint8))
+
+        def process_image(
+            _image, _source, bound_app, _known, _cfg, _dry_run,
+            attendance_callback=None, **_kwargs
+        ):
+            bound_app.get(np.zeros((1, 1, 3), dtype=np.uint8))
+            return attendance_callback(
+                employee="HR-1",
+                log_type="IN",
+                image_path=crop,
+                dry_run=False,
+                decision={
+                    "face_index": 1,
+                    "face_count": 1,
+                    "bbox": [1, 2, 21, 30],
+                    "face_width": 20.0,
+                    "face_height": 28.0,
+                    "detection_score": 0.99,
+                    "best_employee": "HR-1",
+                    "best_score": 0.91,
+                    "runner_up_score": 0.50,
+                    "score_margin": 0.41,
+                    "candidate_log_type": "IN",
+                    "accepted": True,
+                    "reason_code": "accepted_candidate",
+                    "retention_state": "temporary",
+                },
+            )
+
+        attendance.process_image = process_image
+        attendance.create_checkin = lambda *_args, **_kwargs: self.fail(
+            "worker mode must not call ERPNext from the watcher"
+        )
+        result = watch_service.process_path(
+            self.image_path,
+            FakeApp([FakeFace()]),
+            [],
+            StaticGallery([{"employee": "HR-1"}]),
+            self.cfg,
+            self.state,
+            PassingPAD(),
+            sources=self.sources,
+            worker_id="attachment-queue-watcher",
+        )
+        self.assertFalse(result)
+        deliveries = self.state.list_delivery_jobs(state="pending", limit=10)
+        self.assertEqual(len(deliveries), 1)
+        attachment = self.state.attachment_job_for_delivery(
+            deliveries[0]["delivery_id"]
+        )
+        self.assertEqual(attachment["state"], "waiting_for_checkin")
+        self.assertEqual(attachment["source_state"], "available")
+        self.assertTrue(Path(attachment["source_path"]).is_file())
+        self.assertIsNone(
+            self.state.claim_next_attachment_job(
+                owner="attachment-a",
+                lease_seconds=60,
+                transport="rest",
+                max_attempts=3,
+                now=1000.0,
+            )
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

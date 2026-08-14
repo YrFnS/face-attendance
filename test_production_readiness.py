@@ -422,6 +422,23 @@ class ProductionReadinessTests(unittest.TestCase):
             {issue.code for issue in report.blockers},
         )
 
+    def test_private_crop_requires_attachment_worker(self):
+        cfg = self.valid_config()
+        cfg["delivery_mode"] = "worker"
+        cfg["delivery_worker_enabled"] = True
+        cfg["attach_checkin_crop"] = True
+        cfg["attachment_worker_enabled"] = False
+        report = self.report(cfg, verify_model_files=False)
+        blockers = [
+            issue.message
+            for issue in report.blockers
+            if issue.code == "delivery_worker_configuration_invalid"
+        ]
+        self.assertTrue(blockers)
+        self.assertTrue(
+            any("attachment_worker_enabled" in message for message in blockers)
+        )
+
     def test_disabled_ftp_staging_is_a_blocker(self):
         cfg = self.valid_config()
         cfg["ftp_staging_enabled"] = False

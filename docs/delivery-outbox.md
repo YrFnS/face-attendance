@@ -10,9 +10,7 @@ This slice implements:
 - `P2-02` — durable `delivery_jobs` created in the same SQLite transaction as an
   accepted recognition decision.
 
-It does **not** introduce the background delivery worker, retry scheduler,
-ERPNext-side uniqueness constraint, attachment job, reconciliation, or
-dead-letter workflow. Those remain P2-03 through P2-09.
+P2-03 adds the background delivery worker and P2-05 adds a separate private crop attachment outbox. ERPNext-side idempotency, reconciliation, and dead-letter operations remain separate plan items.
 
 ## Adapter boundary
 
@@ -36,13 +34,9 @@ without that key retain the previous compatibility choice: REST is used only
 when `frappe_url`, `frappe_api_key`, and `frappe_api_secret` are all present;
 otherwise the local bench adapter is used.
 
-The REST adapter validates the base URL, requires HTTPS unless the existing
-insecure-development acknowledgement is enabled, creates `Employee Checkin`,
-and preserves the current private attachment behavior.
+The REST adapter validates the base URL, requires HTTPS unless the existing insecure-development acknowledgement is enabled, and exposes independent Employee Checkin creation and private-file attachment operations.
 
-The bench adapter receives explicit execute and attachment callbacks. This
-keeps shell/WSL process handling outside the interface and makes the transport
-independently testable.
+The bench adapter receives explicit execute and attachment callbacks. Check-in creation never invokes the attachment callback; the P2-05 attachment worker calls it only after the parent delivery is confirmed.
 
 The canonical watcher still calls the synchronous compatibility wrapper in this
 slice. The adapter separation exists now so the P2-03 worker can use the same
@@ -166,3 +160,8 @@ single-node worker claims due jobs atomically, renews its lease during ERPNext
 calls, retries only provably safe failures, and marks ambiguous post-submission
 outcomes `uncertain`. Full configuration and operations are documented in
 `docs/delivery-worker.md`.
+
+
+## P2-05 private attachment outbox
+
+Schema version 8 adds `attachment_jobs`. An accepted decision can insert its delivery and attachment jobs in the same SQLite transaction. The crop is copied into a protected spool before the transaction, and the job remains unclaimable until the parent Employee Checkin job is delivered. Attachment failure has no state transition on the parent delivery job. See `docs/attachment-jobs.md`.

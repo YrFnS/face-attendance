@@ -9,6 +9,13 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
+from attachment_outbox import (
+    ATTACHMENT_OUTBOX_REQUIRED_INDEXES,
+    ATTACHMENT_OUTBOX_REQUIRED_TABLE_COLUMNS,
+    ATTACHMENT_OUTBOX_REQUIRED_TRIGGERS,
+    ATTACHMENT_OUTBOX_SCHEMA_STATEMENTS,
+    AttachmentOutboxMixin,
+)
 from delivery_outbox import (
     DELIVERY_OUTBOX_REQUIRED_INDEXES,
     DELIVERY_OUTBOX_REQUIRED_TABLE_COLUMNS,
@@ -50,7 +57,7 @@ from processing_recovery import (
 )
 
 
-RUNTIME_SCHEMA_VERSION = 7
+RUNTIME_SCHEMA_VERSION = 8
 MIGRATION_TABLE = "schema_migrations"
 DEFAULT_BACKUP_DIRECTORY = "runtime_state_backups"
 
@@ -212,6 +219,11 @@ MIGRATIONS = (
         7,
         "leased_delivery_worker",
         DELIVERY_WORKER_SCHEMA_STATEMENTS,
+    ),
+    Migration(
+        8,
+        "separate_private_attachment_outbox",
+        ATTACHMENT_OUTBOX_SCHEMA_STATEMENTS,
     ),
 )
 MIGRATION_BY_VERSION = {migration.version: migration for migration in MIGRATIONS}
@@ -414,6 +426,11 @@ def _required_schema_errors(connection, version=None):
             table_requirements.setdefault(table, {}).update(columns)
         index_requirements.update(DELIVERY_WORKER_REQUIRED_INDEXES)
         trigger_requirements.update(DELIVERY_WORKER_REQUIRED_TRIGGERS)
+    if version >= 8:
+        for table, columns in ATTACHMENT_OUTBOX_REQUIRED_TABLE_COLUMNS.items():
+            table_requirements.setdefault(table, {}).update(columns)
+        index_requirements.update(ATTACHMENT_OUTBOX_REQUIRED_INDEXES)
+        trigger_requirements.update(ATTACHMENT_OUTBOX_REQUIRED_TRIGGERS)
 
     errors = []
     for table, required in table_requirements.items():
@@ -863,6 +880,7 @@ def restore_runtime_backup(
 
 
 class RuntimeState(
+    AttachmentOutboxMixin,
     DeliveryOutboxMixin,
     EventOperationsMixin,
     ProcessingRecoveryMixin,
@@ -1095,6 +1113,12 @@ class RuntimeState(
                         AND j.state NOT IN (
                             'delivered', 'permanent_failure', 'cancelled'
                         )
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM attachment_jobs a
+                      WHERE a.event_id = camera_events.event_id
+                        AND a.state NOT IN ('attached', 'permanent_failure', 'cancelled')
                   )
                 ORDER BY created_unix, event_id
                 """,

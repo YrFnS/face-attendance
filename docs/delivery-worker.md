@@ -15,13 +15,14 @@ The default remains the compatibility path:
 }
 ```
 
-A staging node can enable the worker with:
+A staging node can enable the Employee Checkin worker and the independent private crop worker with:
 
 ```json
 {
   "delivery_mode": "worker",
   "delivery_worker_enabled": true,
-  "attach_checkin_crop": false
+  "attach_checkin_crop": true,
+  "attachment_worker_enabled": true
 }
 ```
 
@@ -29,9 +30,7 @@ Production worker mode is intentionally blocked until `P2-04` verifies an
 ERPNext-side atomic `face_attendance_delivery_id` contract. The worker does not
 claim exactly-once delivery before that dependency exists.
 
-`attach_checkin_crop` must remain false in worker mode until `P2-05` creates a
-separate durable attachment job. A crop upload failure must never downgrade a
-successfully created Employee Checkin.
+P2-05 now creates a separate durable attachment job. The Employee Checkin worker never uploads crops. The attachment worker starts only after the parent check-in is confirmed delivered; its retries and failures cannot downgrade that check-in. See `docs/attachment-jobs.md`.
 
 ## Job lifecycle
 
@@ -109,8 +108,7 @@ The Linux unit is:
 face-attendance-delivery.service
 ```
 
-The installer enables the unit but starts it only when both `delivery_mode` is
-`worker` and `delivery_worker_enabled` is true.
+The installer enables the unit and starts it when either worker delivery is active or private crop attachment is enabled. The single service process drains the two independent queues.
 
 Useful inspection remains available through SQLite-backed application methods
 and the existing event administration tooling. Do not edit delivery rows
@@ -129,3 +127,8 @@ On startup and before each batch, the worker recovers expired delivery leases:
 An operator must reconcile uncertain jobs against ERPNext after `P2-08` is
 implemented. Until then, no automatic retry or manual force-delivery command is
 provided for uncertain work.
+
+
+## P2-05 private attachment worker
+
+The same service also drains `attachment_jobs`. These jobs remain `waiting_for_checkin` until their parent delivery is confirmed, then use their own owner-bound leases, retry schedule, submission boundary, and terminal result. See `docs/attachment-jobs.md` for spool, retention, and recovery details.

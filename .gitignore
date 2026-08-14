@@ -17,6 +17,8 @@ runtime_state.sqlite3
 runtime_state.sqlite3-wal
 runtime_state.sqlite3-shm
 runtime_state_backups/
+delivery_attachments/
+attachment_spool/
 .embedding_gallery.json.*
 .embedding_sync_status.json.*
 .model_manifest.json.*
