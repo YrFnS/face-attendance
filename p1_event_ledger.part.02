@@ -105,18 +105,13 @@ def _parse_json_column(row, key):
 
 
 class EventLedgerMixin:
+    # These fields describe evidence learned after the immutable normalized
+    # receipt is inserted, or later processing outcomes. Camera/source identity,
+    # received/effective/source time, branch, and policy are intentionally absent.
     _EVENT_UPDATE_FIELDS = frozenset(
         {
             "transport_received_at",
-            "source_at",
-            "source_time_provenance",
-            "effective_at",
-            "branch",
-            "source_type",
-            "source_principal",
             "source_remote_ip",
-            "source_binding_id",
-            "policy",
             "receipt_state",
             "receipt_verified",
             "receipt_json",
@@ -148,8 +143,6 @@ class EventLedgerMixin:
         for key, value in values.items():
             if key in {
                 "transport_received_at",
-                "source_at",
-                "effective_at",
                 "gallery_generated_at",
             }:
                 output[key] = _timestamp(value, key, required=False)
