@@ -33,6 +33,13 @@ from data_contract import (
     validate_erp_docname,
     validate_log_type,
 )
+from erpnext_adapter import (
+    BenchERPNextAdapter,
+    EmployeeCheckinRequest,
+    RESTERPNextAdapter,
+    erp_event_time as adapter_erp_event_time,
+    select_erpnext_transport,
+)
 from model_runtime import ModelRuntimeError, create_face_analysis
 from secret_store import ConfigLoadError, load_runtime_config
 from runtime_policy import (
@@ -476,86 +483,55 @@ def api_headers(json_request=True):
 
 
 def erp_event_time(value=None):
-    if value in (None, ""):
-        return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    if not isinstance(value, str):
-        raise ValueError("event_time must be an RFC 3339 string")
-    candidate = value[:-1] + "+00:00" if value.endswith("Z") else value
-    try:
-        parsed = datetime.fromisoformat(candidate)
-    except ValueError as exc:
-        raise ValueError("event_time must be an RFC 3339 timestamp") from exc
-    if parsed.tzinfo is None or parsed.utcoffset() is None:
-        raise ValueError("event_time must include a timezone")
-    return parsed.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    return adapter_erp_event_time(value)
+
+
+def erpnext_transport_name(cfg=None):
+    return select_erpnext_transport(cfg or load_config())
 
 
 def create_checkin_api(employee, log_type, image_path=None, event_time=None):
-    employee = validate_employee_id(employee)
-    log_type = validate_log_type(log_type)
     cfg = load_config()
-    doc = {
-        "employee": employee,
-        "log_type": log_type,
-        "time": erp_event_time(event_time),
-    }
-    response = requests.post(
-        f"{cfg['frappe_url'].rstrip('/')}/api/resource/Employee%20Checkin",
-        headers=api_headers(),
-        json=doc,
-        timeout=30,
+    adapter = RESTERPNextAdapter(
+        base_url=cfg.get("frappe_url"),
+        api_key=cfg.get("frappe_api_key"),
+        api_secret=cfg.get("frappe_api_secret"),
+        allow_insecure=bool(cfg.get("allow_insecure_frappe_url", False)),
+        session=requests,
+        timeout_seconds=cfg.get("erpnext_request_timeout_seconds", 30),
     )
-    response.raise_for_status()
-    docname = response.json()["data"]["name"]
+    request = EmployeeCheckinRequest.build(employee, log_type, event_time)
+    result = adapter.create_employee_checkin(request, image_path)
     if image_path:
-        with open(image_path, "rb") as file:
-            upload = requests.post(
-                f"{cfg['frappe_url'].rstrip('/')}/api/method/upload_file",
-                headers=api_headers(json_request=False),
-                data={
-                    "doctype": "Employee Checkin",
-                    "docname": docname,
-                    "is_private": "1",
-                },
-                files={"file": (image_path.name, file, "image/jpeg")},
-                timeout=30,
-            )
-        upload.raise_for_status()
-        log(f"checkin attachment added: {docname} {image_path.name}")
-    log(f"checkin created: {employee} {log_type} {docname}")
-    return docname
+        log(f"checkin attachment added: {result.docname} {Path(image_path).name}")
+    log(f"checkin created: {request.employee} {request.log_type} {result.docname}")
+    return result.docname
 
 
 def create_checkin_bench(employee, log_type, image_path=None, event_time=None):
-    employee = validate_employee_id(employee)
-    log_type = validate_log_type(log_type)
-    doc = {
-        "doctype": "Employee Checkin",
-        "employee": employee,
-        "log_type": log_type,
-        "time": erp_event_time(event_time),
-    }
-    inserted = bench_execute("frappe.client.insert", {"doc": doc})
-    docname = inserted["name"]
-    if image_path:
-        try:
-            attach_image("Employee Checkin", docname, image_path)
-            log(f"checkin attachment added: {docname} {image_path.name}")
-        except subprocess.CalledProcessError as exc:
-            log(f"checkin attachment failed: {docname} {exc}")
-    log(f"checkin created: {employee} {log_type} {docname}")
-    return docname
+    request = EmployeeCheckinRequest.build(employee, log_type, event_time)
+
+    def attach(docname, path):
+        attach_image("Employee Checkin", docname, path)
+        log(f"checkin attachment added: {docname} {path.name}")
+
+    def attachment_failed(exc):
+        log(f"checkin attachment failed: {exc}")
+
+    adapter = BenchERPNextAdapter(
+        execute=bench_execute,
+        attach=attach,
+        attachment_error_handler=attachment_failed,
+    )
+    result = adapter.create_employee_checkin(request, image_path)
+    log(f"checkin created: {request.employee} {request.log_type} {result.docname}")
+    return result.docname
 
 
 def create_checkin(employee, log_type, image_path=None, event_time=None):
-    employee = validate_employee_id(employee)
-    log_type = validate_log_type(log_type)
     cfg = load_config()
-    if (
-        cfg.get("frappe_url")
-        and cfg.get("frappe_api_key")
-        and cfg.get("frappe_api_secret")
-    ):
+    transport = select_erpnext_transport(cfg)
+    if transport == "rest":
         return create_checkin_api(employee, log_type, image_path, event_time)
     return create_checkin_bench(employee, log_type, image_path, event_time)
 

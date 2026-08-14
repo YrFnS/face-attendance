@@ -528,6 +528,18 @@ class ProcessingRecoveryMixin:
                     terminal=True,
                     now=now,
                 )
+                if row["delivery_decision_id"]:
+                    self._mark_delivery_job_uncertain_tx(
+                        connection,
+                        decision_id=row["delivery_decision_id"],
+                        error_class="delivery_lease_expired",
+                        error=(
+                            "delivery outcome is ambiguous after an expired "
+                            "processing lease"
+                        ),
+                        now=now,
+                        missing_ok=True,
+                    )
                 self._release_policy_for_event_tx(
                     connection, event_id, uncertain=True
                 )
@@ -764,6 +776,7 @@ class ProcessingRecoveryMixin:
         owner,
         decision_id,
         lease_seconds,
+        transport="compatibility",
         now=None,
     ):
         event_id = _identifier(event_id, "event_id")
@@ -811,6 +824,14 @@ class ProcessingRecoveryMixin:
                     "with a stable delivery_id"
                 )
             delivery_id = str(decision["delivery_id"])
+            self._lease_delivery_job_tx(
+                connection,
+                decision_id=decision_id,
+                owner=owner,
+                lease_seconds=lease_seconds,
+                transport=transport,
+                now=now,
+            )
             self._transition_tx(
                 connection,
                 row,
@@ -898,6 +919,18 @@ class ProcessingRecoveryMixin:
                         terminal=True,
                         now=now,
                     )
+                    if row["delivery_decision_id"]:
+                        self._mark_delivery_job_uncertain_tx(
+                            connection,
+                            decision_id=row["delivery_decision_id"],
+                            error_class="delivery_lease_expired",
+                            error=(
+                                "watcher restarted after delivery submission "
+                                "began"
+                            ),
+                            now=now,
+                            missing_ok=True,
+                        )
                     self._release_policy_for_event_tx(
                         connection, row["event_id"], uncertain=True
                     )

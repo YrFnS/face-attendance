@@ -1101,11 +1101,17 @@ def process_path(
                 stored_decision_id = persist_decision(decision)
                 if stored_decision_id != decision_id:
                     raise RuntimeError("recognition decision identity mismatch")
+                delivery_transport = getattr(
+                    attendance,
+                    "erpnext_transport_name",
+                    lambda _cfg=None: "compatibility",
+                )(cfg)
                 state.begin_delivery_attempt(
                     event_id,
                     owner=lease_owner,
                     decision_id=decision_id,
                     lease_seconds=lease_seconds,
+                    transport=delivery_transport,
                 )
             except Exception:
                 state.release_attendance_policy_reservation(
@@ -1115,13 +1121,24 @@ def process_path(
                 )
                 raise
             try:
-                attendance.create_checkin(
+                remote_docname = attendance.create_checkin(
                     employee,
                     log_type,
                     image_path,
                     event_time=effective_at,
                 )
             except Exception as exc:
+                try:
+                    state.mark_delivery_job_uncertain(
+                        decision_id=decision_id,
+                        error_class="transport_exception",
+                        error=str(exc),
+                    )
+                except Exception as job_exc:
+                    attendance.log(
+                        f"delivery job uncertainty update failed "
+                        f"decision={decision_id}: {job_exc}"
+                    )
                 state.mark_attendance_policy_uncertain(
                     scope_key=reservation.scope_key,
                     event_id=event_id,
@@ -1129,6 +1146,36 @@ def process_path(
                 )
                 raise DeliveryAttemptUncertain(
                     f"ERPNext delivery outcome is ambiguous: {exc}"
+                ) from exc
+            try:
+                state.mark_delivery_job_delivered(
+                    decision_id=decision_id,
+                    remote_docname=remote_docname,
+                    transport=delivery_transport,
+                )
+            except Exception as exc:
+                try:
+                    state.mark_delivery_job_uncertain(
+                        decision_id=decision_id,
+                        error_class="local_delivery_commit_failed",
+                        error=str(exc),
+                    )
+                except Exception as job_exc:
+                    attendance.log(
+                        f"delivery job recovery update failed "
+                        f"decision={decision_id}: {job_exc}"
+                    )
+                try:
+                    state.mark_attendance_policy_uncertain(
+                        scope_key=reservation.scope_key,
+                        event_id=event_id,
+                        decision_id=decision_id,
+                    )
+                except Exception:
+                    pass
+                raise DeliveryAttemptUncertain(
+                    f"ERPNext committed but local delivery job commit failed: "
+                    f"{exc}"
                 ) from exc
             try:
                 state.commit_attendance_policy_reservation(

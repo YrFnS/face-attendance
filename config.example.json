@@ -3,10 +3,12 @@
   "camera_url": "rtsp://admin:CHANGE_ME@192.168.68.121:554/LiveMedia/ch1/Media1",
   "bench_dir": "/home/test/frappe-bench",
   "site": "test",
+  "erpnext_transport": "bench",
   "frappe_url": "",
   "frappe_api_key": "",
   "frappe_api_secret": "systemd://frappe_api_secret",
   "allow_insecure_frappe_url": false,
+  "erpnext_request_timeout_seconds": 30,
   "log_type": "IN",
   "camera_uploads_dir": "/opt/face-attendance/camera_uploads",
   "camera_sources": {

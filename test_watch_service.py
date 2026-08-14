@@ -572,6 +572,10 @@ class WatchServiceTests(unittest.TestCase):
         event = self.state.get_event(self.event_id())
         self.assertEqual(event["lifecycle_state"], "uncertain")
         self.assertEqual(event["processing_phase"], "terminal")
+        decision_id = event["decisions"][0]["decision_id"]
+        job = self.state.delivery_job_for_decision(decision_id)
+        self.assertEqual(job["state"], "uncertain")
+        self.assertEqual(job["last_error_class"], "transport_exception")
         self.assertEqual(captured["event_time"], event["effective_at"])
         connection = sqlite3.connect(self.state.path)
         try:

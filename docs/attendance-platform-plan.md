@@ -299,8 +299,8 @@ Phase 1 is not independently enabled for live delivery. Deploy Phases 1 and 2 to
 
 **Purpose:** Decouple recognition from network delivery and make check-ins recoverable.
 
-- [ ] `P2-01` Introduce an ERPNext adapter interface; keep API and local-bench transports explicit and independently tested.
-- [ ] `P2-02` Create `delivery_jobs` in the same transaction that accepts a recognition decision.
+- [x] `P2-01` Introduce an ERPNext adapter interface; keep API and local-bench transports explicit and independently tested.
+- [x] `P2-02` Create `delivery_jobs` in the same transaction that accepts a recognition decision.
 - [ ] `P2-03` Implement a single-node delivery worker with leases, bounded exponential backoff, jitter, and retry budgets.
 - [ ] `P2-04` Enforce an atomic ERPNext idempotency contract for both REST and local-bench adapters: a unique `face_attendance_delivery_id` per Employee Checkin with duplicate-conflict lookup or a whitelisted get-or-create endpoint keyed by that delivery ID. Keep `face_attendance_event_id` as non-unique capture trace metadata so multiple accepted faces in one capture can create independent check-ins. Client lookup-before-create alone is race-prone. Treat connection loss after submission as `uncertain` until reconciliation proves the result.
 - [ ] `P2-05` Separate Employee Checkin creation from private crop attachment. A failed attachment becomes its own retryable job, and any required private crop is protected from retention cleanup until that job reaches a terminal state.
