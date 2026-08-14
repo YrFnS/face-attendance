@@ -34,6 +34,8 @@ The camera still sends an image because it cannot send an InsightFace embedding.
 
 - `face_attendance.py` — recognition/check-in helpers and legacy diagnostic commands that refuse live processing.
 - `watch_service.py` — production FTP watcher with readiness, PAD, replay protection, and event state.
+- `event_operations.py` — read-only event inspection plus atomic, audited pre-delivery operator actions.
+- `event_admin.py` — CLI for event list/inspect/explain, safe reprocess, quarantine review, and dismissal.
 - `embedding_gallery.py` — validates, normalizes, stores, and reloads galleries.
 - `secure_sync.py` — authoritative bounded gallery-sync client with authenticated, same-origin redirect validation.
 - `sync_embeddings.py` — manual or continuous gallery synchronization.
@@ -248,6 +250,15 @@ Folder mapping is controlled by:
 python sync_embeddings.py
 python sync_embeddings.py --status
 python face_attendance.py status
+
+# Inspect and explain durable event history without modifying SQLite
+python event_admin.py list --state rejected --limit 50
+python event_admin.py inspect <event-id>
+python event_admin.py explain <event-id>
+
+# Mutating event commands require actor, reason, and explicit confirmation.
+# Reprocess/requeue additionally require the canonical watcher to be stopped.
+# See docs/event-operations-cli.md before using these commands.
 
 # Explicit offline migration of a trusted legacy pickle only
 python legacy_gallery_converter.py \
