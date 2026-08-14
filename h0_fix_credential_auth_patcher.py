@@ -1,8 +1,19 @@
 from pathlib import Path
 
 
-path = Path("h0_apply_credential_auth.py")
-source = path.read_text(encoding="utf-8")
+def replace_exact(path, old, new, *, count=1):
+    target = Path(path)
+    source = target.read_text(encoding="utf-8")
+    actual = source.count(old)
+    if actual != count:
+        raise SystemExit(
+            f"expected {count} match(es) in {path}, found {actual}: {old[:120]!r}"
+        )
+    target.write_text(source.replace(old, new), encoding="utf-8")
+
+
+patcher = Path("h0_apply_credential_auth.py")
+source = patcher.read_text(encoding="utf-8")
 old = """    replace_once(
         \"secure_sync.py\",
         '''                    result[\"gallery_age_seconds\"] = freshness[\"age_seconds\"]
@@ -45,4 +56,53 @@ new = """    sync_source = read(\"secure_sync.py\")
 """
 if source.count(old) != 1:
     raise SystemExit("secure sync patch block was not found exactly once")
-path.write_text(source.replace(old, new, 1), encoding="utf-8")
+patcher.write_text(source.replace(old, new, 1), encoding="utf-8")
+
+replace_exact(
+    "gallery_credentials.py",
+    '        raise GalleryCredentialError(f"{field} must be configured")\n',
+    '        raise GalleryCredentialError(\n'
+    '            f"{field} must be a non-placeholder value"\n'
+    '        )\n',
+)
+
+replace_exact(
+    "runtime_policy.py",
+    '''        if is_placeholder(cfg.get("central_api_token")):
+            issues.append(
+                (
+                    "central_api_token_missing",
+                    "central_api_token must be a non-placeholder value in production",
+                )
+            )
+''',
+    '''        structured_credentials = cfg.get("central_api_credentials")
+        selected_credential = _text(cfg.get("central_api_credential_id"))
+        has_structured_credential = (
+            isinstance(structured_credentials, dict)
+            and bool(selected_credential)
+            and selected_credential in structured_credentials
+        )
+        if not has_structured_credential and is_placeholder(
+            cfg.get("central_api_token")
+        ):
+            issues.append(
+                (
+                    "central_api_token_missing",
+                    "a scoped central gallery credential is required in production",
+                )
+            )
+''',
+)
+
+replace_exact(
+    "test_web_admin.py",
+    '            "embedding_export_token": "secret",\n',
+    '            "embedding_export_token": "secret-token-value",\n',
+)
+replace_exact(
+    "test_web_admin.py",
+    '"Authorization": "Bearer secret"',
+    '"Authorization": "Bearer secret-token-value"',
+    count=2,
+)
