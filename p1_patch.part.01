@@ -1,0 +1,230 @@
+            reason_code=reason,
+            actor_type="system",
+            compatibility_status=status,
+            error=error,
+        )
+
+    def get_event(self, event_id):
+        return self.event_details(event_id, include_history=True)
+
+    def prune_events(self, retention_days):
+        retention_days = int(retention_days or 0)
+        if retention_days <= 0:
+            return 0
+        cutoff = time.time() - retention_days * 86400
+        connection = self._connect()
+        try:
+            cursor = connection.execute(
+                "DELETE FROM camera_events WHERE created_unix < ?", (cutoff,)
+            )
+            connection.commit()
+            return cursor.rowcount
+        finally:
+            connection.close()
+
+'''
+    replace_between(
+        "runtime_state.py",
+        "    def claim_event(\n",
+        "    def login_allowed(\n",
+        compatibility_block,
+    )
+
+
+def patch_face_attendance():
+    replacement = '''def process_image(
+    image,
+    source_name,
+    app,
+    known,
+    cfg,
+    dry_run=False,
+    attach_source=None,
+    decision_callback=None,
+):
+    detect_frame = scaled_frame(image, cfg)
+    faces = app.get(detect_frame)
+    if not faces:
+        log(f"{source_name}: no faces")
+        return False
+
+    selected_log_type = log_type_for_path(cfg, attach_source)
+
+    def emit_decision(payload):
+        if decision_callback is not None:
+            decision_callback(dict(payload))
+
+    created = False
+    seen_this_image = set()
+    for index, face in enumerate(faces, start=1):
+        x1, y1, x2, y2 = [max(0, int(value)) for value in face.bbox]
+        crop = detect_frame[y1:y2, x1:x2]
+        if crop.size and bool(cfg.get("save_latest_face", False)):
+            LOGS.mkdir(exist_ok=True)
+            cv2.imwrite(str(LOGS / f"latest_face_{index}.jpg"), crop)
+            cv2.imwrite(str(LOGS / "latest_face.jpg"), crop)
+
+        width, height = face_size(face)
+        score, employee, margin = match_employee(known, face.embedding)
+        runner_up_score = score - margin
+        prefix = f"{source_name} face={index}/{len(faces)}"
+        decision = {
+            "face_index": index,
+            "face_count": len(faces),
+            "bbox": [x1, y1, x2, y2],
+            "face_width": float(width),
+            "face_height": float(height),
+            "detection_score": float(face.det_score),
+            "best_employee": employee or "",
+            "best_score": float(score),
+            "runner_up_score": float(runner_up_score),
+            "score_margin": float(margin),
+            "candidate_log_type": selected_log_type,
+        }
+        if (
+            width < int(cfg["min_face_width"])
+            or height < int(cfg["min_face_height"])
+            or float(face.det_score) < float(cfg["min_detection_score"])
+        ):
+            log(
+                f"{prefix} rejected=size_or_detection "
+                f"size={width:.0f}x{height:.0f} "
+                f"det={float(face.det_score):.3f} "
+                f"best={employee} score={score:.3f} margin={margin:.3f}"
+            )
+            retained = save_rejected(crop, "quality", cfg, employee, score)
+            emit_decision(
+                {
+                    **decision,
+                    "accepted": False,
+                    "reason_code": "quality_rejected",
+                    "retention_state": "retained" if retained else "not_retained",
+                }
+            )
+            continue
+
+        log(f"{prefix} match={employee} score={score:.3f} margin={margin:.3f}")
+        if not employee:
+            reason_code = "unknown_employee"
+        elif score < float(cfg["threshold"]):
+            reason_code = "score_below_threshold"
+        elif margin < float(cfg.get("min_score_margin", 0.0)):
+            reason_code = "margin_below_threshold"
+        elif employee in seen_this_image:
+            reason_code = "duplicate_face"
+        else:
+            reason_code = ""
+        if reason_code:
+            retained = save_rejected(crop, "unknown", cfg, employee, score)
+            emit_decision(
+                {
+                    **decision,
+                    "accepted": False,
+                    "reason_code": reason_code,
+                    "retention_state": "retained" if retained else "not_retained",
+                }
+            )
+            continue
+
+        employee = validate_employee_id(employee)
+        seen_this_image.add(employee)
+        image_path, temporary = save_checkin_image(crop, employee, score, cfg)
+        attachment_path = (
+            image_path if bool(cfg.get("attach_checkin_crop", True)) else None
+        )
+        retention_state = (
+            "temporary"
+            if temporary and image_path
+            else "retained"
+            if image_path
+            else "not_retained"
+        )
+        try:
+            emit_decision(
+                {
+                    **decision,
+                    "best_employee": employee,
+                    "accepted": True,
+                    "reason_code": "accepted_candidate",
+                    "retention_state": retention_state,
+                }
+            )
+            created_now = create_checkin_with_cooldown(
+                employee,
+                cfg,
+                attachment_path,
+                dry_run,
+                selected_log_type,
+            )
+            created = created_now or created
+        finally:
+            if temporary and image_path:
+                try:
+                    image_path.unlink()
+                except FileNotFoundError:
+                    pass
+    return created
+
+
+'''
+    replace_between(
+        "face_attendance.py",
+        "def process_image(\n",
+        "def cleanup_old_audit_files(cfg):\n",
+        replacement,
+    )
+
+
+def patch_watch_service():
+    replace_once(
+        "watch_service.py",
+        "import time\nfrom pathlib import Path\n",
+        "import time\nfrom datetime import datetime, timezone\nfrom pathlib import Path\n",
+    )
+    replace_once(
+        "watch_service.py",
+        "from pad import PADConfigError, PADGate, PADResult\n",
+        '''from event_ledger import make_capture_id, timestamp_from_unix, utc_now
+from pad import PADConfigError, PADGate, PADResult
+''',
+    )
+    replace_once(
+        "watch_service.py",
+        '''def reject_file(path, reason, cfg, *, dry_run=False):
+    if dry_run:
+        attendance.log(f"dry run: would reject ftp:{Path(path).name} reason={reason}")
+        return
+    moved = quarantine(path, reason, cfg, dry_run=dry_run)
+    if moved:
+        attendance.log(f"ftp:{Path(path).name}: quarantined reason={reason} path={moved}")
+    else:
+        attendance.log(f"ftp:{Path(path).name}: rejected reason={reason}")
+        if bool(cfg.get("delete_rejected_camera_uploads", False)):
+            remove_source(path, cfg)
+''',
+        '''def reject_file(path, reason, cfg, *, dry_run=False):
+    if dry_run:
+        attendance.log(f"dry run: would reject ftp:{Path(path).name} reason={reason}")
+        return "not_retained"
+    moved = quarantine(path, reason, cfg, dry_run=dry_run)
+    if moved:
+        attendance.log(f"ftp:{Path(path).name}: quarantined reason={reason} path={moved}")
+        return "quarantined"
+    attendance.log(f"ftp:{Path(path).name}: rejected reason={reason}")
+    if bool(cfg.get("delete_rejected_camera_uploads", False)):
+        remove_source(path, cfg)
+        return "deleted"
+    return "retained"
+''',
+    )
+    helper_block = '''def _finish_reason(status, error, reason_code):
+    if reason_code:
+        return reason_code
+    if status == "checkin_created":
+        return "checkin_created"
+    if status in {"processed", "processed_no_checkin"}:
+        return "processed_no_checkin"
+    if status == "rejected":
+        return "generic_rejected"
+    if status == "failed":
+        return "generic_failed"
