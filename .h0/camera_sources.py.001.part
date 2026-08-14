@@ -1,0 +1,129 @@
+H0-09 fragment camera_sources.py 2/7
+        raise CameraSourceError("camera upload_dir must not include .incoming")
+    return relative.as_posix()
+
+
+def normalize_ip(value):
+    text = _text(value, "source IP", max_chars=64)
+    try:
+        address = ipaddress.ip_address(text)
+    except ValueError as exc:
+        raise CameraSourceError(f"invalid source IP address: {text}") from exc
+    if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped:
+        address = address.ipv4_mapped
+    return address
+
+
+def _allowed_networks(value, field):
+    if not isinstance(value, list) or not value:
+        raise CameraSourceError(f"{field} must contain at least one CIDR network")
+    networks = []
+    seen = set()
+    for index, item in enumerate(value):
+        text = _text(item, f"{field}[{index}]", max_chars=64)
+        try:
+            network = ipaddress.ip_network(text, strict=False)
+        except ValueError as exc:
+            raise CameraSourceError(f"{field}[{index}] is not a valid CIDR network") from exc
+        if network.prefixlen == 0:
+            raise CameraSourceError(f"{field}[{index}] must not allow the entire internet")
+        key = (network.version, network.network_address.compressed, network.prefixlen)
+        if key in seen:
+            raise CameraSourceError(f"{field} contains a duplicate network: {network}")
+        seen.add(key)
+        networks.append(network)
+    return tuple(networks)
+
+
+def _source_binding_descriptor(
+    *,
+    camera_id,
+    source_type,
+    branch,
+    policy,
+    ftp_username,
+    upload_route,
+    allowed_networks,
+):
+    return {
+        "schema_version": 1,
+        "camera_id": camera_id,
+        "source_type": source_type,
+        "branch": branch,
+        "policy": policy,
+        "ftp_username": ftp_username,
+        "upload_route": upload_route,
+        "allowed_networks": [str(item) for item in allowed_networks],
+    }
+
+
+def _canonical_json(value):
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+
+
+def _binding_id(descriptor):
+    return hashlib.sha256(_canonical_json(descriptor)).hexdigest()
+
+
+def _password(value, username):
+    password = _text(value, f"FTP password for {username}", max_chars=1024)
+    if _is_placeholder(password):
+        raise CameraSourceError(
+            f"FTP password for {username} is missing or still a placeholder"
+        )
+    if len(password.encode("utf-8")) < 16:
+        raise CameraSourceError(
+            f"FTP password for {username} must contain at least 16 UTF-8 bytes"
+        )
+    return password
+
+
+def _permissions(value, username, default="elw"):
+    permissions = _text(
+        value if value not in (None, "") else default,
+        f"FTP permissions for {username}",
+        max_chars=16,
+    )
+    if "w" not in permissions:
+        raise CameraSourceError(
+            f"FTP permissions for {username} must include upload permission 'w'"
+        )
+    unsupported = sorted(set(permissions) - FTP_UPLOAD_ONLY_PERMISSIONS)
+    if unsupported:
+        raise CameraSourceError(
+            f"FTP permissions for {username} grant unsupported permissions: "
+            f"{''.join(unsupported)}"
+        )
+    return permissions
+
+
+def load_camera_sources(cfg, root):
+    if not isinstance(cfg, dict):
+        raise CameraSourceError("config must be a JSON object")
+    root = Path(root).resolve(strict=False)
+    upload_root = uploads_root(cfg, root)
+    raw_sources = cfg.get("camera_sources")
+    if not isinstance(raw_sources, dict) or not raw_sources:
+        raise CameraSourceError(
+            "camera_sources must define at least one explicitly bound camera"
+        )
+    raw_users = cfg.get("ftp_users")
+    if not isinstance(raw_users, dict) or not raw_users:
+        raise CameraSourceError(
+            "ftp_users must define one unique credential for each camera source"
+        )
+
+    configured_branch = _text(
+        cfg.get("branch_name"), "branch_name", required=False, max_chars=128
+    )
+    default_permissions = _text(
+        cfg.get("ftp_permissions") or "elw", "ftp_permissions", max_chars=16
+    )
+    sources = []
+    usernames = set()

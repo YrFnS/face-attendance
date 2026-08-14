@@ -1,0 +1,125 @@
+H0-09 fragment camera_sources.py 5/7
+            raise CameraSourceError("camera_source_receipt_secret is required")
+        return b""
+    if _is_placeholder(value):
+        raise CameraSourceError(
+            "camera_source_receipt_secret must not be a placeholder"
+        )
+    encoded = value.encode("utf-8")
+    if len(encoded) < 32:
+        raise CameraSourceError(
+            "camera_source_receipt_secret must contain at least 32 UTF-8 bytes"
+        )
+    if len(encoded) > 1024:
+        raise CameraSourceError(
+            "camera_source_receipt_secret exceeds 1024 UTF-8 bytes"
+        )
+    return encoded
+
+
+def receipt_path(image_path):
+    image = Path(image_path)
+    return image.with_name(image.name + RECEIPT_SUFFIX)
+
+
+def _timestamp(value, field="received_at"):
+    text = _text(value, field, max_chars=64)
+    candidate = text[:-1] + "+00:00" if text.endswith("Z") else text
+    try:
+        parsed = datetime.fromisoformat(candidate)
+    except ValueError as exc:
+        raise CameraSourceError(f"{field} must be a valid RFC 3339 timestamp") from exc
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise CameraSourceError(f"{field} must include a timezone")
+    return parsed.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _receipt_payload(source, *, remote_ip, received_at, source_sha256, source_size):
+    digest = _text(source_sha256, "source_sha256", max_chars=64, pattern=HEX64_RE)
+    size = _strict_positive_int(source_size, "source_size")
+    address = normalize_ip(remote_ip)
+    if not source.allows_ip(address.compressed):
+        raise CameraSourceError(
+            f"source IP {address.compressed} is not allowed for camera {source.camera_id}"
+        )
+    return {
+        "schema_version": RECEIPT_SCHEMA_VERSION,
+        "camera_id": source.camera_id,
+        "source_type": source.source_type,
+        "branch": source.branch,
+        "policy": source.policy,
+        "ftp_username": source.ftp_username,
+        "remote_ip": address.compressed,
+        "received_at": _timestamp(received_at),
+        "source_sha256": digest,
+        "source_size": size,
+        "source_binding_id": source.binding_id,
+    }
+
+
+def _receipt_signature(payload, secret):
+    return hmac.new(secret, _canonical_json(payload), hashlib.sha256).hexdigest()
+
+
+def write_source_receipt(
+    image_path,
+    source,
+    cfg,
+    *,
+    remote_ip,
+    source_sha256,
+    source_size,
+    received_at=None,
+):
+    image = Path(image_path)
+    if source_for_upload_path((source,), image) != source:
+        raise CameraSourceError("image path does not match its camera source")
+    secret = receipt_secret(cfg, required=True)
+    payload = _receipt_payload(
+        source,
+        remote_ip=remote_ip,
+        received_at=received_at
+        or datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        source_sha256=source_sha256,
+        source_size=source_size,
+    )
+    payload["signature"] = _receipt_signature(payload, secret)
+    destination = receipt_path(image)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(
+        prefix=f".{destination.name}.", suffix=".tmp", dir=destination.parent
+    )
+    temporary_path = Path(temporary)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
+            json.dump(payload, handle, ensure_ascii=False, sort_keys=True, indent=2)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        try:
+            os.chmod(temporary_path, 0o600)
+        except OSError:
+            pass
+        os.replace(temporary_path, destination)
+    finally:
+        try:
+            temporary_path.unlink()
+        except FileNotFoundError:
+            pass
+    return destination
+
+
+def _reject_duplicate_keys(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise CameraSourceError(f"source receipt contains duplicate key: {key}")
+        result[key] = value
+    return result
+
+
+def _load_receipt_file(path):
+    path = Path(path)
+    try:
+        size = path.stat().st_size
+    except FileNotFoundError as exc:

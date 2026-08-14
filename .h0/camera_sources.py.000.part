@@ -1,0 +1,141 @@
+H0-09 fragment camera_sources.py 1/7
+import hashlib
+import hmac
+import ipaddress
+import json
+import os
+import re
+import tempfile
+import unicodedata
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+
+
+PLACEHOLDERS = {"", "CHANGE_ME", "REPLACE_ME", "CHANGEME", "TODO"}
+CAMERA_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+FTP_USERNAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._@-]{0,63}$")
+HEX64_RE = re.compile(r"^[0-9a-f]{64}$")
+RECEIPT_SUFFIX = ".source.json"
+RECEIPT_SCHEMA_VERSION = 1
+MAX_RECEIPT_BYTES = 32 * 1024
+FTP_UPLOAD_ONLY_PERMISSIONS = frozenset("elw")
+
+
+class CameraSourceError(ValueError):
+    pass
+
+
+@dataclass(frozen=True)
+class CameraSource:
+    camera_id: str
+    source_type: str
+    branch: str
+    policy: str
+    ftp_username: str
+    upload_dir: Path
+    upload_route: str
+    allowed_networks: tuple
+    binding_id: str
+
+    def allows_ip(self, value):
+        try:
+            address = normalize_ip(value)
+        except CameraSourceError:
+            return False
+        return any(address in network for network in self.allowed_networks)
+
+
+@dataclass(frozen=True)
+class SourceReceipt:
+    camera_id: str
+    source_type: str
+    branch: str
+    policy: str
+    ftp_username: str
+    remote_ip: str
+    received_at: str
+    source_sha256: str
+    source_size: int
+    source_binding_id: str
+    signature: str
+    verified: bool
+
+
+def _text(value, field, *, required=True, max_chars=256, pattern=None):
+    if value is None:
+        text = ""
+    elif not isinstance(value, str):
+        raise CameraSourceError(f"{field} must be a string")
+    else:
+        text = unicodedata.normalize("NFC", value)
+    if text != text.strip():
+        raise CameraSourceError(f"{field} must not contain surrounding whitespace")
+    if required and not text:
+        raise CameraSourceError(f"{field} is required")
+    if len(text) > int(max_chars):
+        raise CameraSourceError(f"{field} exceeds {int(max_chars)} characters")
+    for character in text:
+        if unicodedata.category(character) in {"Cc", "Cf", "Cs"}:
+            raise CameraSourceError(f"{field} contains a control or formatting character")
+    if text and pattern is not None and not pattern.fullmatch(text):
+        raise CameraSourceError(f"{field} has an invalid format")
+    return text
+
+
+def _is_placeholder(value):
+    return str(value or "").strip().upper() in PLACEHOLDERS
+
+
+def _strict_json_object(raw, label):
+    if not isinstance(raw, dict):
+        raise CameraSourceError(f"{label} must be a JSON object")
+    return raw
+
+
+def _strict_positive_int(value, field, *, maximum=(1 << 31) - 1):
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise CameraSourceError(f"{field} must be an integer")
+    if value < 0 or value > int(maximum):
+        raise CameraSourceError(f"{field} must be between 0 and {int(maximum)}")
+    return value
+
+
+def _resolve(root, value, field):
+    text = _text(value, field, max_chars=4096)
+    path = Path(text).expanduser()
+    if not path.is_absolute():
+        path = Path(root) / path
+    lexical = Path(os.path.abspath(path))
+    cursor = lexical
+    while True:
+        if cursor.exists() and cursor.is_symlink():
+            raise CameraSourceError(f"{field} must not use a symbolic-link path")
+        if cursor == cursor.parent:
+            break
+        cursor = cursor.parent
+    return lexical.resolve(strict=False)
+
+
+def uploads_root(cfg, root):
+    value = cfg.get("camera_uploads_dir")
+    if value in (None, ""):
+        value = Path(root) / "camera_uploads"
+    path = Path(value).expanduser()
+    if not path.is_absolute():
+        path = Path(root) / path
+    return path.resolve(strict=False)
+
+
+def _relative_route(target, root):
+    try:
+        relative = target.relative_to(root)
+    except ValueError as exc:
+        raise CameraSourceError(
+            f"camera upload_dir must remain under camera_uploads_dir: {target}"
+        ) from exc
+    if not relative.parts:
+        raise CameraSourceError(
+            "each camera upload_dir must be a dedicated subdirectory of camera_uploads_dir"
+        )
+    if ".incoming" in relative.parts:

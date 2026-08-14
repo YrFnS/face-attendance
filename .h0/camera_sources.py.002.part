@@ -1,0 +1,109 @@
+H0-09 fragment camera_sources.py 3/7
+    routes = []
+    password_owners = {}
+
+    for raw_camera_id, raw_item in raw_sources.items():
+        camera_id = _text(
+            raw_camera_id, "camera source ID", max_chars=128, pattern=CAMERA_ID_RE
+        )
+        item = _strict_json_object(raw_item, f"camera_sources.{camera_id}")
+        allowed_fields = {
+            "source_type",
+            "branch",
+            "policy",
+            "ftp_username",
+            "upload_dir",
+            "allowed_networks",
+        }
+        unknown = sorted(set(item) - allowed_fields)
+        if unknown:
+            raise CameraSourceError(
+                f"camera_sources.{camera_id} contains unknown fields: {', '.join(unknown)}"
+            )
+        source_type = _text(
+            item.get("source_type"),
+            f"camera_sources.{camera_id}.source_type",
+            max_chars=64,
+        ).lower()
+        if source_type != "holowits_ftp":
+            raise CameraSourceError(
+                f"camera_sources.{camera_id}.source_type must be holowits_ftp"
+            )
+        branch = _text(
+            item.get("branch"),
+            f"camera_sources.{camera_id}.branch",
+            max_chars=128,
+        )
+        if _is_placeholder(branch):
+            raise CameraSourceError(
+                f"camera_sources.{camera_id}.branch must not be a placeholder"
+            )
+        if configured_branch and branch != configured_branch:
+            raise CameraSourceError(
+                f"camera_sources.{camera_id}.branch {branch!r} does not match branch_name {configured_branch!r}"
+            )
+        policy = _text(
+            item.get("policy"),
+            f"camera_sources.{camera_id}.policy",
+            max_chars=16,
+        )
+        if policy not in {"IN", "OUT"}:
+            raise CameraSourceError(
+                f"camera_sources.{camera_id}.policy must be IN or OUT"
+            )
+        username = _text(
+            item.get("ftp_username"),
+            f"camera_sources.{camera_id}.ftp_username",
+            max_chars=64,
+            pattern=FTP_USERNAME_RE,
+        )
+        if username in usernames:
+            raise CameraSourceError(
+                f"FTP username {username!r} is bound to more than one camera"
+            )
+        usernames.add(username)
+
+        target = _resolve(
+            root,
+            item.get("upload_dir"),
+            f"camera_sources.{camera_id}.upload_dir",
+        )
+        route = _relative_route(target, upload_root)
+        if target.exists() and target.is_symlink():
+            raise CameraSourceError(
+                f"camera_sources.{camera_id}.upload_dir must not be a symbolic link"
+            )
+        for other_id, other_target in routes:
+            if target == other_target:
+                raise CameraSourceError(
+                    f"camera sources {other_id!r} and {camera_id!r} share an upload route"
+                )
+            if target in other_target.parents or other_target in target.parents:
+                raise CameraSourceError(
+                    f"camera upload routes must not overlap: {other_id!r} and {camera_id!r}"
+                )
+        routes.append((camera_id, target))
+
+        networks = _allowed_networks(
+            item.get("allowed_networks"),
+            f"camera_sources.{camera_id}.allowed_networks",
+        )
+
+        user_item = raw_users.get(username)
+        if not isinstance(user_item, dict):
+            raise CameraSourceError(
+                f"ftp_users.{username} must exist and be a JSON object"
+            )
+        user_unknown = sorted(set(user_item) - {"password", "dir", "permissions"})
+        if user_unknown:
+            raise CameraSourceError(
+                f"ftp_users.{username} contains unknown fields: {', '.join(user_unknown)}"
+            )
+        password = _password(user_item.get("password"), username)
+        owner = password_owners.get(password)
+        if owner:
+            raise CameraSourceError(
+                f"FTP credentials for {owner!r} and {username!r} reuse the same password"
+            )
+        password_owners[password] = username
+        _permissions(user_item.get("permissions"), username, default_permissions)

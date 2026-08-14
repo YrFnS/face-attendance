@@ -1,0 +1,117 @@
+H0-09 fragment camera_sources.py 6/7
+        raise CameraSourceError(f"source receipt is missing: {path.name}") from exc
+    if size > MAX_RECEIPT_BYTES:
+        raise CameraSourceError(
+            f"source receipt exceeds {MAX_RECEIPT_BYTES} bytes"
+        )
+    try:
+        return json.loads(
+            path.read_text(encoding="utf-8"),
+            object_pairs_hook=_reject_duplicate_keys,
+            parse_constant=lambda value: (_ for _ in ()).throw(
+                CameraSourceError(f"source receipt contains invalid number: {value}")
+            ),
+        )
+    except UnicodeDecodeError as exc:
+        raise CameraSourceError("source receipt must be UTF-8") from exc
+    except json.JSONDecodeError as exc:
+        raise CameraSourceError(f"source receipt is invalid JSON: {exc}") from exc
+
+
+def verify_source_receipt(
+    image_path,
+    cfg,
+    root,
+    *,
+    source_sha256,
+    source_size,
+    sources=None,
+):
+    image = Path(image_path)
+    sources = tuple(sources or load_camera_sources(cfg, root))
+    source = source_for_upload_path(sources, image)
+    required = bool(cfg.get("production_mode", False)) or bool(
+        cfg.get("camera_source_receipt_required", True)
+    )
+    path = receipt_path(image)
+    if not path.exists() and not required:
+        return source, SourceReceipt(
+            camera_id=source.camera_id,
+            source_type=source.source_type,
+            branch=source.branch,
+            policy=source.policy,
+            ftp_username=source.ftp_username,
+            remote_ip="",
+            received_at="",
+            source_sha256=source_sha256,
+            source_size=int(source_size),
+            source_binding_id=source.binding_id,
+            signature="",
+            verified=False,
+        )
+
+    payload = _load_receipt_file(path)
+    if not isinstance(payload, dict):
+        raise CameraSourceError("source receipt must be a JSON object")
+    expected_fields = {
+        "schema_version",
+        "camera_id",
+        "source_type",
+        "branch",
+        "policy",
+        "ftp_username",
+        "remote_ip",
+        "received_at",
+        "source_sha256",
+        "source_size",
+        "source_binding_id",
+        "signature",
+    }
+    unknown = sorted(set(payload) - expected_fields)
+    missing = sorted(expected_fields - set(payload))
+    if unknown:
+        raise CameraSourceError(
+            f"source receipt contains unknown fields: {', '.join(unknown)}"
+        )
+    if missing:
+        raise CameraSourceError(
+            f"source receipt is missing fields: {', '.join(missing)}"
+        )
+    if payload.get("schema_version") != RECEIPT_SCHEMA_VERSION:
+        raise CameraSourceError(
+            f"unsupported source receipt schema_version: {payload.get('schema_version')!r}"
+        )
+
+    normalized = _receipt_payload(
+        source,
+        remote_ip=payload.get("remote_ip"),
+        received_at=payload.get("received_at"),
+        source_sha256=payload.get("source_sha256"),
+        source_size=payload.get("source_size"),
+    )
+    for key in (
+        "camera_id",
+        "source_type",
+        "branch",
+        "policy",
+        "ftp_username",
+        "source_binding_id",
+    ):
+        if payload.get(key) != normalized.get(key):
+            raise CameraSourceError(
+                f"source receipt {key} does not match the configured camera binding"
+            )
+    if normalized["source_sha256"] != source_sha256:
+        raise CameraSourceError("source receipt SHA-256 does not match the upload")
+    if normalized["source_size"] != int(source_size):
+        raise CameraSourceError("source receipt size does not match the upload")
+
+    signature = _text(payload.get("signature"), "source receipt signature", max_chars=64, pattern=HEX64_RE)
+    secret = receipt_secret(cfg, required=True)
+    expected_signature = _receipt_signature(normalized, secret)
+    if not hmac.compare_digest(signature, expected_signature):
+        raise CameraSourceError("source receipt signature is invalid")
+
+    future_tolerance = cfg.get("camera_source_receipt_future_tolerance_seconds", 300)
+    if isinstance(future_tolerance, bool) or not isinstance(future_tolerance, int):
+        raise CameraSourceError(

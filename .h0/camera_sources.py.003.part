@@ -1,0 +1,120 @@
+H0-09 fragment camera_sources.py 4/7
+        if user_item.get("dir") not in (None, ""):
+            legacy_target = _resolve(root, user_item.get("dir"), f"ftp_users.{username}.dir")
+            if legacy_target != target:
+                raise CameraSourceError(
+                    f"ftp_users.{username}.dir does not match the bound camera upload_dir"
+                )
+
+        descriptor = _source_binding_descriptor(
+            camera_id=camera_id,
+            source_type=source_type,
+            branch=branch,
+            policy=policy,
+            ftp_username=username,
+            upload_route=route,
+            allowed_networks=networks,
+        )
+        sources.append(
+            CameraSource(
+                camera_id=camera_id,
+                source_type=source_type,
+                branch=branch,
+                policy=policy,
+                ftp_username=username,
+                upload_dir=target,
+                upload_route=route,
+                allowed_networks=networks,
+                binding_id=_binding_id(descriptor),
+            )
+        )
+
+    unbound_users = sorted(set(raw_users) - usernames)
+    if unbound_users:
+        raise CameraSourceError(
+            "every FTP credential must be bound to exactly one camera source; "
+            f"unbound users: {', '.join(unbound_users)}"
+        )
+    return tuple(sorted(sources, key=lambda item: item.camera_id))
+
+
+def camera_source_configuration_issues(cfg, root):
+    issues = []
+    try:
+        load_camera_sources(cfg, root)
+    except CameraSourceError as exc:
+        issues.append(str(exc))
+    required = bool(cfg.get("production_mode", False)) or bool(
+        cfg.get("camera_source_receipt_required", True)
+    )
+    try:
+        receipt_secret(cfg, required=required)
+    except CameraSourceError as exc:
+        issues.append(str(exc))
+    if bool(cfg.get("production_mode", False)) and not bool(
+        cfg.get("camera_source_receipt_required", True)
+    ):
+        issues.append("camera_source_receipt_required must be true in production")
+    return issues
+
+
+def source_by_username(sources, username):
+    text = _text(username, "FTP username", max_chars=64, pattern=FTP_USERNAME_RE)
+    matches = [item for item in sources if item.ftp_username == text]
+    if len(matches) != 1:
+        raise CameraSourceError(
+            f"FTP username {text!r} is not bound to exactly one camera source"
+        )
+    return matches[0]
+
+
+def source_for_upload_path(sources, path):
+    target = Path(path).resolve(strict=False)
+    matches = []
+    for source in sources:
+        try:
+            target.relative_to(source.upload_dir)
+            matches.append(source)
+        except ValueError:
+            continue
+    if len(matches) != 1:
+        raise CameraSourceError(
+            f"upload path is not bound to exactly one camera source: {target}"
+        )
+    relative = target.relative_to(matches[0].upload_dir)
+    if ".incoming" in relative.parts:
+        raise CameraSourceError("watcher must not process a staging .incoming path")
+    return matches[0]
+
+
+def ftp_user_config(cfg, source):
+    raw_users = cfg.get("ftp_users")
+    if not isinstance(raw_users, dict):
+        raise CameraSourceError("ftp_users must be a JSON object")
+    item = raw_users.get(source.ftp_username)
+    if not isinstance(item, dict):
+        raise CameraSourceError(
+            f"ftp_users.{source.ftp_username} must be a JSON object"
+        )
+    return {
+        "password": _password(item.get("password"), source.ftp_username),
+        "permissions": _permissions(
+            item.get("permissions"),
+            source.ftp_username,
+            _text(cfg.get("ftp_permissions") or "elw", "ftp_permissions", max_chars=16),
+        ),
+    }
+
+
+def receipt_secret(cfg, *, required=True):
+    value = cfg.get("camera_source_receipt_secret")
+    if value is None:
+        value = ""
+    if not isinstance(value, str):
+        raise CameraSourceError("camera_source_receipt_secret must be a string")
+    if value != value.strip():
+        raise CameraSourceError(
+            "camera_source_receipt_secret must not contain surrounding whitespace"
+        )
+    if not value:
+        if required:
