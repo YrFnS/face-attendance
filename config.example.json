@@ -9,23 +9,40 @@
   "allow_insecure_frappe_url": false,
   "log_type": "IN",
   "camera_uploads_dir": "/opt/face-attendance/camera_uploads",
-  "camera_ids": {
-    "in": "entrance-in",
-    "out": "entrance-out"
+  "camera_sources": {
+    "entrance-in": {
+      "source_type": "holowits_ftp",
+      "branch": "CHANGE_ME",
+      "policy": "IN",
+      "ftp_username": "camera_in",
+      "upload_dir": "camera_uploads/in",
+      "allowed_networks": [
+        "192.168.68.121/32"
+      ]
+    },
+    "entrance-out": {
+      "source_type": "holowits_ftp",
+      "branch": "CHANGE_ME",
+      "policy": "OUT",
+      "ftp_username": "camera_out",
+      "upload_dir": "camera_uploads/out",
+      "allowed_networks": [
+        "192.168.68.122/32"
+      ]
+    }
   },
+  "camera_source_receipt_required": true,
+  "camera_source_receipt_secret": "CHANGE_ME",
+  "camera_source_receipt_future_tolerance_seconds": 300,
   "camera_network_isolated_acknowledged": false,
   "ftp_bind_host": "0.0.0.0",
-  "ftp_username": "camera",
-  "ftp_password": "CHANGE_ME",
   "ftp_users": {
     "camera_in": {
       "password": "CHANGE_ME",
-      "dir": "camera_uploads/in",
       "permissions": "elw"
     },
     "camera_out": {
       "password": "CHANGE_ME",
-      "dir": "camera_uploads/out",
       "permissions": "elw"
     }
   },

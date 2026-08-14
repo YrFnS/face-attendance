@@ -1,4 +1,5 @@
 import importlib
+import json
 import sys
 import tempfile
 import types
@@ -8,6 +9,12 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+from camera_sources import (
+    load_camera_sources,
+    receipt_path,
+    source_by_username,
+    write_source_receipt,
+)
 from pad import PADGate, PADResult
 from runtime_state import RuntimeState, file_sha256, make_event_id
 
@@ -95,8 +102,28 @@ class WatchServiceTests(unittest.TestCase):
         )
         self.state = RuntimeState(self.root / "runtime.sqlite3")
         self.cfg = {
-            "folder_log_types": {"in": "IN", "out": "OUT"},
-            "camera_ids": {"in": "camera-in", "out": "camera-out"},
+            "production_mode": False,
+            "branch_name": "Baghdad",
+            "camera_uploads_dir": str(self.root / "camera_uploads"),
+            "camera_source_receipt_required": True,
+            "camera_source_receipt_secret": "receipt-secret-" + "x" * 32,
+            "ftp_permissions": "elw",
+            "ftp_users": {
+                "camera_in": {
+                    "password": "camera-in-password-unique",
+                    "permissions": "elw",
+                }
+            },
+            "camera_sources": {
+                "camera-in": {
+                    "source_type": "holowits_ftp",
+                    "branch": "Baghdad",
+                    "policy": "IN",
+                    "ftp_username": "camera_in",
+                    "upload_dir": str(self.image_path.parent),
+                    "allowed_networks": ["192.0.2.10/32"],
+                }
+            },
             "max_camera_event_age_seconds": 0,
             "camera_event_future_tolerance_seconds": 60,
             "max_camera_upload_bytes": 1024 * 1024,
@@ -107,6 +134,8 @@ class WatchServiceTests(unittest.TestCase):
             "delete_duplicate_camera_uploads": False,
             "pad_require_single_face": True,
         }
+        self.sources = load_camera_sources(self.cfg, self.root)
+        self.write_receipt()
         self.pad_gate = PADGate(
             {
                 "pad_provider": "disabled",
@@ -120,9 +149,64 @@ class WatchServiceTests(unittest.TestCase):
         attendance.process_image = self.original_process_image
         self.temp.cleanup()
 
+    def write_receipt(self):
+        digest, size = file_sha256(self.image_path)
+        source = source_by_username(self.sources, "camera_in")
+        write_source_receipt(
+            self.image_path,
+            source,
+            self.cfg,
+            remote_ip="192.0.2.10",
+            source_sha256=digest,
+            source_size=size,
+        )
+
     def event_id(self):
         digest, _ = file_sha256(self.image_path)
         return make_event_id("camera-in", "IN", digest)
+
+    def test_missing_receipt_is_claimed_and_rejected_before_recognition(self):
+        receipt_path(self.image_path).unlink()
+        app = FakeApp([FakeFace()])
+        result = watch_service.process_path(
+            self.image_path,
+            app,
+            [],
+            StaticGallery([]),
+            self.cfg,
+            self.state,
+            self.pad_gate,
+            sources=self.sources,
+        )
+        self.assertFalse(result)
+        self.assertEqual(app.calls, 0)
+        event = self.state.get_event(self.event_id())
+        self.assertEqual(event["status"], "rejected")
+        self.assertIn("source_binding", event["error"])
+        self.assertIn("receipt is missing", event["error"])
+
+    def test_tampered_receipt_is_rejected_before_pad_or_recognition(self):
+        data = json.loads(receipt_path(self.image_path).read_text(encoding="utf-8"))
+        data["ftp_username"] = "other-camera"
+        receipt_path(self.image_path).write_text(json.dumps(data), encoding="utf-8")
+        app = FakeApp([FakeFace()])
+        pad = PassingPAD()
+        result = watch_service.process_path(
+            self.image_path,
+            app,
+            [],
+            StaticGallery([]),
+            self.cfg,
+            self.state,
+            pad,
+            sources=self.sources,
+        )
+        self.assertFalse(result)
+        self.assertEqual(app.calls, 0)
+        self.assertEqual(pad.calls, [])
+        event = self.state.get_event(self.event_id())
+        self.assertEqual(event["status"], "rejected")
+        self.assertIn("ftp_username", event["error"])
 
     def test_handled_error_after_claim_is_finalized(self):
         result = watch_service.process_path(
@@ -133,6 +217,7 @@ class WatchServiceTests(unittest.TestCase):
             self.cfg,
             self.state,
             self.pad_gate,
+            sources=self.sources,
         )
         self.assertFalse(result)
         event = self.state.get_event(self.event_id())
@@ -150,6 +235,7 @@ class WatchServiceTests(unittest.TestCase):
                 self.cfg,
                 self.state,
                 self.pad_gate,
+                sources=self.sources,
             )
         event = self.state.get_event(self.event_id())
         self.assertEqual(event["status"], "failed")
@@ -169,6 +255,7 @@ class WatchServiceTests(unittest.TestCase):
             self.cfg,
             self.state,
             pad,
+            sources=self.sources,
         )
         self.assertFalse(result)
         self.assertEqual(app.calls, 1)
@@ -178,15 +265,17 @@ class WatchServiceTests(unittest.TestCase):
         self.assertEqual(event["status"], "rejected")
         self.assertIn("pad_expected_one_face_found_2", event["error"])
 
-    def test_recognition_consumes_the_exact_pad_evaluated_face_set(self):
+    def test_recognition_consumes_exact_pad_faces_and_bound_source_context(self):
         face = FakeFace(5)
         app = FakeApp([face])
         pad = PassingPAD()
         captured = {}
 
-        def process_image(_image, _source, bound_app, _known, _cfg, _dry_run, **kwargs):
+        def process_image(_image, source_text, bound_app, _known, event_cfg, _dry_run, **kwargs):
             captured["faces"] = bound_app.get(np.zeros((1, 1, 3), dtype=np.uint8))
             captured["attach_source"] = kwargs.get("attach_source")
+            captured["source_text"] = source_text
+            captured["log_type"] = event_cfg["log_type"]
             return True
 
         attendance.process_image = process_image
@@ -198,6 +287,7 @@ class WatchServiceTests(unittest.TestCase):
             self.cfg,
             self.state,
             pad,
+            sources=self.sources,
         )
         self.assertTrue(result)
         self.assertEqual(app.calls, 1)
@@ -206,6 +296,13 @@ class WatchServiceTests(unittest.TestCase):
         self.assertEqual(pad.calls[0]["face_index"], 1)
         self.assertEqual(pad.calls[0]["face_count"], 1)
         self.assertEqual(pad.calls[0]["bbox"], [5, 2, 25, 30])
+        self.assertEqual(pad.calls[0]["branch"], "Baghdad")
+        self.assertEqual(pad.calls[0]["source_principal"], "camera_in")
+        self.assertEqual(pad.calls[0]["source_remote_ip"], "192.0.2.10")
+        self.assertIn("principal=camera_in", captured["source_text"])
+        self.assertIn("ip=192.0.2.10", captured["source_text"])
+        self.assertEqual(captured["log_type"], "IN")
+        self.assertIsNone(captured["attach_source"])
         event = self.state.get_event(self.event_id())
         self.assertEqual(event["status"], "checkin_created")
 
@@ -242,6 +339,7 @@ class WatchServiceTests(unittest.TestCase):
             self.cfg,
             self.state,
             pad,
+            sources=self.sources,
         )
         self.assertFalse(result)
         self.assertEqual(len(pad.calls), 2)
