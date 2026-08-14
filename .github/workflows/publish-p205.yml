@@ -15,12 +15,19 @@ jobs:
     steps:
       - uses: actions/checkout@v7.0.1
         with:
-          ref: agent/p2-delivery-worker
           fetch-depth: 0
       - uses: actions/setup-python@v7.0.0
         with:
           python-version: "3.11"
           cache: pip
+      - name: Reset to verified P2-03 base while preserving payload
+        run: |
+          cp -a .p205 /tmp/p205-payload
+          git fetch origin agent/p2-delivery-worker:refs/remotes/origin/agent/p2-delivery-worker
+          git reset --hard origin/agent/p2-delivery-worker
+          rm -rf .p205
+          cp -a /tmp/p205-payload .p205
+          test "$(git rev-parse HEAD)" = "a3011e16ea8816901b16b8a630588c83e50d8a23"
       - name: Apply reviewed P2-05 patch
         run: |
           cat .p205/patch-chunk-* | base64 --decode > /tmp/p205.patch.xz
