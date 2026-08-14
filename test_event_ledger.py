@@ -58,8 +58,8 @@ class EventLedgerTests(unittest.TestCase):
     def test_schema_v2_tables_indexes_and_append_only_triggers_exist(self):
         report = self.state.migration_status()
         self.assertTrue(report["ok"], report)
-        self.assertEqual(RUNTIME_SCHEMA_VERSION, 2)
-        self.assertEqual(report["schema_version"], 2)
+        self.assertEqual(RUNTIME_SCHEMA_VERSION, 3)
+        self.assertEqual(report["schema_version"], 3)
         connection = sqlite3.connect(self.database)
         try:
             objects = {

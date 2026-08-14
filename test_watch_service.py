@@ -1,5 +1,7 @@
 import importlib
 import json
+import sqlite3
+import time
 import sys
 import tempfile
 import types
@@ -32,6 +34,7 @@ attendance.image_files = lambda folder: []
 attendance.load_config = lambda: {}
 attendance.cleanup_old_audit_files = lambda cfg: None
 attendance.process_image = lambda *args, **kwargs: False
+attendance.create_checkin = lambda *args, **kwargs: "CHK-TEST"
 sys.modules["face_attendance"] = attendance
 watch_service = importlib.import_module("watch_service")
 
@@ -144,9 +147,11 @@ class WatchServiceTests(unittest.TestCase):
             }
         )
         self.original_process_image = attendance.process_image
+        self.original_create_checkin = attendance.create_checkin
 
     def tearDown(self):
         attendance.process_image = self.original_process_image
+        attendance.create_checkin = self.original_create_checkin
         self.temp.cleanup()
 
     def write_receipt(self):
@@ -442,6 +447,178 @@ class WatchServiceTests(unittest.TestCase):
         self.assertEqual(decision["recognition_model_version"], "approved-v1")
         self.assertEqual(decision["reason_code"], "accepted_candidate")
 
+
+    def test_expired_pre_delivery_event_retries_same_upload(self):
+        digest, size = file_sha256(self.image_path)
+        event_id = self.event_id()
+        received_at = "2026-08-14T00:00:00Z"
+        receipt = self.state.record_event_receipt(
+            event_id=event_id,
+            capture_id=watch_service.make_capture_id(
+                "camera-in", digest, self.image_path.name, size,
+                self.image_path.stat().st_mtime,
+            ),
+            camera_id="camera-in",
+            log_type="IN",
+            source_sha256=digest,
+            source_name=self.image_path.name,
+            source_mtime=self.image_path.stat().st_mtime,
+            source_size=size,
+            received_at=received_at,
+            effective_at=received_at,
+            branch="Baghdad",
+            source_type="holowits_ftp",
+            source_principal="camera_in",
+            source_binding_id=self.sources[0].binding_id,
+            policy="IN",
+            source_at=received_at,
+            source_time_provenance="test",
+            receipt_state="pending",
+            receipt_verified=False,
+            receipt_detail={"test": True},
+            policy_version="directional-v1",
+        )
+        self.assertTrue(receipt.accepted)
+        old_now = time.time() - 300
+        first = self.state.acquire_event_lease(
+            event_id,
+            owner="dead-worker",
+            lease_seconds=30,
+            now=old_now,
+        )
+        self.assertTrue(first.accepted)
+        def recovered_process_image(
+            _image, _source, bound_app, _known, _cfg, _dry_run, **_kwargs
+        ):
+            bound_app.get(np.zeros((1, 1, 3), dtype=np.uint8))
+            return False
+
+        attendance.process_image = recovered_process_image
+        result = watch_service.process_path(
+            self.image_path,
+            FakeApp([FakeFace()]),
+            [],
+            StaticGallery([]),
+            self.cfg,
+            self.state,
+            self.pad_gate,
+            sources=self.sources,
+            worker_id="replacement-worker",
+        )
+        self.assertFalse(result)
+        event = self.state.get_event(event_id)
+        self.assertEqual(event["processing_attempt"], 2)
+        self.assertEqual(event["lifecycle_state"], "processed")
+        self.assertGreaterEqual(event["recovery_count"], 1)
+
+    def test_delivery_exception_is_uncertain_and_uses_effective_time(self):
+        captured = {}
+
+        def create_checkin(employee, log_type, image_path=None, event_time=None):
+            captured["employee"] = employee
+            captured["log_type"] = log_type
+            captured["event_time"] = event_time
+            raise TimeoutError("connection closed after submission")
+
+        def process_image(
+            _image, _source, bound_app, _known, _cfg, _dry_run,
+            attendance_callback=None, **_kwargs
+        ):
+            bound_app.get(np.zeros((1, 1, 3), dtype=np.uint8))
+            return attendance_callback(
+                employee="HR-1",
+                log_type="IN",
+                image_path=None,
+                dry_run=False,
+                decision={
+                    "face_index": 1,
+                    "face_count": 1,
+                    "bbox": [1, 2, 21, 30],
+                    "face_width": 20.0,
+                    "face_height": 28.0,
+                    "detection_score": 0.99,
+                    "best_employee": "HR-1",
+                    "best_score": 0.91,
+                    "runner_up_score": 0.50,
+                    "score_margin": 0.41,
+                    "candidate_log_type": "IN",
+                    "accepted": True,
+                    "reason_code": "accepted_candidate",
+                    "retention_state": "not_retained",
+                },
+            )
+
+        attendance.create_checkin = create_checkin
+        attendance.process_image = process_image
+        result = watch_service.process_path(
+            self.image_path,
+            FakeApp([FakeFace()]),
+            [],
+            StaticGallery([{"employee": "HR-1"}]),
+            self.cfg,
+            self.state,
+            PassingPAD(),
+            sources=self.sources,
+            worker_id="delivery-worker",
+        )
+        self.assertFalse(result)
+        event = self.state.get_event(self.event_id())
+        self.assertEqual(event["lifecycle_state"], "uncertain")
+        self.assertEqual(event["processing_phase"], "terminal")
+        self.assertEqual(captured["event_time"], event["effective_at"])
+        connection = sqlite3.connect(self.state.path)
+        try:
+            reservation = connection.execute(
+                "SELECT reservation_state FROM attendance_policy_state"
+            ).fetchone()
+        finally:
+            connection.close()
+        self.assertEqual(reservation[0], "uncertain")
+
+    def test_startup_recovery_marks_missing_source_failed(self):
+        digest, size = file_sha256(self.image_path)
+        event_id = self.event_id()
+        received_at = "2026-08-14T00:00:00Z"
+        self.state.record_event_receipt(
+            event_id=event_id,
+            capture_id=watch_service.make_capture_id(
+                "camera-in", digest, self.image_path.name, size,
+                self.image_path.stat().st_mtime,
+            ),
+            camera_id="camera-in",
+            log_type="IN",
+            source_sha256=digest,
+            source_name=self.image_path.name,
+            source_mtime=self.image_path.stat().st_mtime,
+            source_size=size,
+            received_at=received_at,
+            effective_at=received_at,
+            branch="Baghdad",
+            source_type="holowits_ftp",
+            source_principal="camera_in",
+            source_binding_id=self.sources[0].binding_id,
+            policy="IN",
+            source_at=received_at,
+            source_time_provenance="test",
+            receipt_state="pending",
+            receipt_verified=False,
+            receipt_detail={"test": True},
+            policy_version="directional-v1",
+        )
+        self.state.acquire_event_lease(
+            event_id,
+            owner="dead-worker",
+            lease_seconds=30,
+            now=time.time() - 300,
+        )
+        self.image_path.unlink()
+        receipt_path(self.image_path).unlink(missing_ok=True)
+        watch_service.recover_startup_events(
+            self.state, self.sources, self.cfg
+        )
+        event = self.state.get_event(event_id)
+        self.assertEqual(event["lifecycle_state"], "failed")
+        self.assertIn("source upload is unavailable", event["error"])
 
 if __name__ == "__main__":
     unittest.main()

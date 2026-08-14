@@ -1,7 +1,9 @@
 import argparse
 import os
 import shutil
+import socket
 import time
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -15,13 +17,67 @@ from camera_sources import (
     source_for_upload_path,
     verify_source_receipt,
 )
-from event_ledger import make_capture_id, timestamp_from_unix, utc_now
+from event_ledger import (
+    make_capture_id,
+    make_recognition_decision_id,
+    timestamp_from_unix,
+    utc_now,
+)
+from processing_recovery import ProcessingLeaseError
 from pad import PADConfigError, PADGate, PADResult
 from production_readiness import check_production_readiness, format_report
 from runtime_state import RuntimeState, file_sha256, make_event_id, resolve_runtime_path
 
 
 ROOT = Path(__file__).resolve().parent
+
+
+class DeliveryAttemptUncertain(RuntimeError):
+    pass
+
+
+def watcher_worker_id():
+    host = socket.gethostname().strip() or "unknown-host"
+    return f"{host}:{os.getpid()}:{uuid.uuid4().hex}"
+
+
+def processing_lease_seconds(cfg):
+    return int(cfg.get("event_processing_lease_seconds", 180))
+
+
+def policy_reservation_seconds(cfg):
+    return int(cfg.get("attendance_policy_reservation_seconds", 300))
+
+
+def recover_startup_events(state, sources, cfg):
+    if not bool(cfg.get("event_startup_recovery_enabled", True)):
+        return []
+    outcomes = state.recover_expired_event_leases()
+    by_camera = {source.camera_id: source for source in sources}
+    for outcome in outcomes:
+        source = by_camera.get(outcome.camera_id)
+        candidate = (
+            source.upload_dir / Path(outcome.source_name).name if source else None
+        )
+        if outcome.outcome == "uncertain":
+            if candidate is not None and candidate.is_file():
+                reject_file(candidate, "delivery_uncertain", cfg)
+            attendance.log(
+                f"startup recovery marked event uncertain event={outcome.event_id} "
+                f"decision={outcome.delivery_decision_id or '-'}"
+            )
+            continue
+        if candidate is not None and candidate.is_file():
+            attendance.log(
+                f"startup recovery queued safe retry event={outcome.event_id} "
+                f"attempt={outcome.processing_attempt} path={candidate}"
+            )
+            continue
+        state.mark_recovery_source_missing(outcome.event_id)
+        attendance.log(
+            f"startup recovery failed event={outcome.event_id}: source upload missing"
+        )
+    return outcomes
 
 
 class BoundFaceApp:
@@ -163,6 +219,7 @@ def finish_claim(
     reason_code="",
     event_updates=None,
     detail=None,
+    lease_owner="",
 ):
     if not claim or not claim.accepted:
         return False
@@ -175,16 +232,29 @@ def finish_claim(
         "uncertain": "uncertain",
     }.get(status, "failed")
     try:
-        state.transition_event(
-            event_id,
-            to_state=lifecycle,
-            reason_code=_finish_reason(status, error, reason_code),
-            actor_type="watcher",
-            detail=detail or {},
-            event_updates=event_updates or {},
-            compatibility_status=status,
-            error=error,
-        )
+        final_reason = _finish_reason(status, error, reason_code)
+        if lease_owner:
+            state.finalize_event_with_lease(
+                event_id,
+                owner=lease_owner,
+                to_state=lifecycle,
+                reason_code=final_reason,
+                detail=detail or {},
+                event_updates=event_updates or {},
+                compatibility_status=status,
+                error=error,
+            )
+        else:
+            state.transition_event(
+                event_id,
+                to_state=lifecycle,
+                reason_code=final_reason,
+                actor_type="watcher",
+                detail=detail or {},
+                event_updates=event_updates or {},
+                compatibility_status=status,
+                error=error,
+            )
         return True
     except Exception as exc:
         attendance.log(
@@ -204,9 +274,17 @@ def transition_claim(
     event_updates=None,
     detail=None,
     compatibility_status="processing",
+    lease_owner="",
+    lease_seconds=180,
 ):
     if not claim or not claim.accepted:
         return False
+    if lease_owner:
+        state.renew_event_lease(
+            event_id,
+            owner=lease_owner,
+            lease_seconds=lease_seconds,
+        )
     state.transition_event(
         event_id,
         to_state=to_state,
@@ -279,6 +357,7 @@ def record_pad_only_decisions(
     gallery,
     log_type,
     reason_code,
+    decision_version=1,
 ):
     if not claim or not claim.accepted:
         return
@@ -310,6 +389,7 @@ def record_pad_only_decisions(
             reason_code=reason_code,
             candidate_log_type=log_type,
             retention_state="not_retained",
+            decision_version=decision_version,
             **versions,
         )
 
@@ -391,11 +471,16 @@ def process_path(
     dry_run=False,
     allow_stale=False,
     sources=None,
+    worker_id=None,
 ):
+    del known
     path = Path(path)
+    receipt_claim = None
     claim = None
     event_id = ""
     claim_finalized = False
+    lease_owner = worker_id or f"pid-{os.getpid()}"
+    lease_seconds = processing_lease_seconds(cfg)
     try:
         if not attendance.wait_until_stable(path):
             attendance.log(f"ftp:{path.name}: skipped unstable file")
@@ -417,7 +502,7 @@ def process_path(
         )
         if not dry_run:
             received_at = utc_now()
-            claim = state.record_event_receipt(
+            receipt_claim = state.record_event_receipt(
                 event_id=event_id,
                 capture_id=capture_id,
                 camera_id=camera_id,
@@ -446,18 +531,44 @@ def process_path(
                     cfg.get("attendance_policy_version") or "directional-v1"
                 ),
             )
+            claim = state.acquire_event_lease(
+                event_id,
+                owner=lease_owner,
+                lease_seconds=lease_seconds,
+            )
             if not claim.accepted:
                 attendance.log(
-                    f"ftp:{path.name}: replay skipped event={claim.event_id} "
-                    f"camera={camera_id} policy={log_type} "
-                    f"status={claim.existing_status}"
+                    f"ftp:{path.name}: event not leased event={event_id} "
+                    f"camera={camera_id} policy={log_type} reason={claim.reason} "
+                    f"status={claim.existing_status or '-'}"
                 )
-                if (
-                    bool(cfg.get("delete_camera_uploads_after_processing", True))
+                if claim.reason == "delivery_ambiguous" or (
+                    claim.reason == "terminal"
+                    and claim.existing_status == "uncertain"
+                ):
+                    reject_file(
+                        path, "delivery_uncertain", cfg, dry_run=dry_run
+                    )
+                elif (
+                    claim.reason == "terminal"
+                    and bool(cfg.get("delete_camera_uploads_after_processing", True))
                     and bool(cfg.get("delete_duplicate_camera_uploads", True))
                 ):
                     remove_source(path, cfg)
                 return False
+            if claim.recovered:
+                attendance.log(
+                    f"ftp:{path.name}: recovered event={event_id} "
+                    f"attempt={claim.attempt}"
+                )
+        else:
+            claim = receipt_claim
+
+        event = state.get_event(event_id) if not dry_run else None
+        effective_at = (
+            event.get("effective_at") if event else utc_now()
+        )
+        processing_attempt = int(getattr(claim, "attempt", 1) or 1)
 
         max_bytes = int(cfg.get("max_camera_upload_bytes", 20 * 1024 * 1024))
         if max_bytes and source_size > max_bytes:
@@ -470,6 +581,7 @@ def process_path(
                 error="upload_too_large",
                 reason_code="upload_too_large",
                 event_updates={"retention_state": retention},
+                lease_owner=lease_owner,
             )
             return False
 
@@ -497,6 +609,7 @@ def process_path(
                     "receipt_state": "invalid",
                     "retention_state": retention,
                 },
+                lease_owner=lease_owner,
             )
             attendance.log(
                 f"ftp:{path.name}: source binding rejected camera={camera_id} "
@@ -536,6 +649,8 @@ def process_path(
                     "receipt_verified": bool(source_receipt.verified),
                     "receipt_json": receipt_detail,
                 },
+                lease_owner=lease_owner,
+                lease_seconds=lease_seconds,
             )
 
         receipt_ip = source_receipt.remote_ip or "-"
@@ -558,6 +673,7 @@ def process_path(
                 error=time_error,
                 reason_code=time_error,
                 event_updates={"retention_state": retention},
+                lease_owner=lease_owner,
             )
             return False
 
@@ -572,6 +688,7 @@ def process_path(
                 error="unreadable_image",
                 reason_code="unreadable_image",
                 event_updates={"retention_state": retention},
+                lease_owner=lease_owner,
             )
             return False
         height, width = image.shape[:2]
@@ -586,6 +703,7 @@ def process_path(
                 error="image_too_large",
                 reason_code="image_too_large",
                 event_updates={"retention_state": retention},
+                lease_owner=lease_owner,
             )
             return False
 
@@ -597,6 +715,8 @@ def process_path(
                 to_state="validating",
                 reason_code="image_validated",
                 detail={"width": width, "height": height},
+                lease_owner=lease_owner,
+                lease_seconds=lease_seconds,
             )
 
         detect_frame = attendance.scaled_frame(image, cfg)
@@ -611,6 +731,7 @@ def process_path(
                 error="no_face",
                 reason_code="no_face",
                 event_updates={"retention_state": retention},
+                lease_owner=lease_owner,
             )
             return False
 
@@ -644,6 +765,7 @@ def process_path(
                 gallery,
                 log_type,
                 reason_code,
+                decision_version=processing_attempt,
             )
             retention = reject_file(path, "pad_rejected", cfg, dry_run=dry_run)
             claim_finalized = finish_claim(
@@ -654,6 +776,7 @@ def process_path(
                 error=f"pad:{pad_event_error}"[:2000],
                 reason_code=reason_code,
                 event_updates={"retention_state": retention},
+                lease_owner=lease_owner,
             )
             return False
 
@@ -691,6 +814,7 @@ def process_path(
                 gallery,
                 log_type,
                 "pad_rejected",
+                decision_version=processing_attempt,
             )
             retention = reject_file(path, "pad_rejected", cfg, dry_run=dry_run)
             claim_finalized = finish_claim(
@@ -701,6 +825,7 @@ def process_path(
                 error=f"pad:{reasons}"[:2000],
                 reason_code="pad_rejected",
                 event_updates={"retention_state": retention},
+                lease_owner=lease_owner,
             )
             return False
 
@@ -726,6 +851,8 @@ def process_path(
                     "pad_provider": pad_provider or "",
                     "pad_model": pad_model or "",
                 },
+                lease_owner=lease_owner,
+                lease_seconds=lease_seconds,
             )
 
         def persist_decision(decision):
@@ -750,8 +877,95 @@ def process_path(
                 recognition_model=versions["recognition_model"],
                 recognition_model_version=versions["recognition_model_version"],
                 preprocessing_version=versions["preprocessing_version"],
+                decision_version=processing_attempt,
                 **decision,
             )
+
+        def deliver_candidate(*, employee, log_type, image_path, dry_run, decision):
+            if dry_run:
+                attendance.log(f"dry run: would create {employee} {log_type}")
+                return True
+            decision_id = make_recognition_decision_id(
+                event_id,
+                int(decision["face_index"]),
+                processing_attempt,
+            )
+            reservation = state.reserve_attendance_policy(
+                employee=employee,
+                direction=log_type,
+                branch=camera_source.branch,
+                policy_version=versions["policy_version"],
+                event_id=event_id,
+                decision_id=decision_id,
+                effective_at=effective_at,
+                cooldown_seconds=int(cfg.get("cooldown_seconds", 600)),
+                reservation_seconds=policy_reservation_seconds(cfg),
+            )
+            if not reservation.accepted:
+                persist_decision(
+                    {
+                        **decision,
+                        "accepted": False,
+                        "reason_code": "cooldown_suppressed",
+                    }
+                )
+                attendance.log(
+                    f"policy suppress: employee={employee} direction={log_type} "
+                    f"reason={reservation.reason} remaining={reservation.remaining_seconds}s"
+                )
+                return False
+            try:
+                stored_decision_id = persist_decision(decision)
+                if stored_decision_id != decision_id:
+                    raise RuntimeError("recognition decision identity mismatch")
+                state.begin_delivery_attempt(
+                    event_id,
+                    owner=lease_owner,
+                    decision_id=decision_id,
+                    lease_seconds=lease_seconds,
+                )
+            except Exception:
+                state.release_attendance_policy_reservation(
+                    scope_key=reservation.scope_key,
+                    event_id=event_id,
+                    decision_id=decision_id,
+                )
+                raise
+            try:
+                attendance.create_checkin(
+                    employee,
+                    log_type,
+                    image_path,
+                    event_time=effective_at,
+                )
+            except Exception as exc:
+                state.mark_attendance_policy_uncertain(
+                    scope_key=reservation.scope_key,
+                    event_id=event_id,
+                    decision_id=decision_id,
+                )
+                raise DeliveryAttemptUncertain(
+                    f"ERPNext delivery outcome is ambiguous: {exc}"
+                ) from exc
+            try:
+                state.commit_attendance_policy_reservation(
+                    scope_key=reservation.scope_key,
+                    event_id=event_id,
+                    decision_id=decision_id,
+                )
+            except Exception as exc:
+                try:
+                    state.mark_attendance_policy_uncertain(
+                        scope_key=reservation.scope_key,
+                        event_id=event_id,
+                        decision_id=decision_id,
+                    )
+                except Exception:
+                    pass
+                raise DeliveryAttemptUncertain(
+                    f"ERPNext committed but local policy commit failed: {exc}"
+                ) from exc
+            return True
 
         bound_app = BoundFaceApp(faces)
         recognition_cfg = dict(cfg)
@@ -766,10 +980,14 @@ def process_path(
                 dry_run,
                 attach_source=None,
                 decision_callback=persist_decision,
+                attendance_callback=deliver_candidate,
             )
             if bound_app.calls != 1:
                 raise RuntimeError("recognition did not consume the bound face set exactly once")
+        except DeliveryAttemptUncertain:
+            raise
         except Exception as exc:
+            state.release_event_policy_reservations(event_id)
             retention = reject_file(
                 path, "processing_failed", cfg, dry_run=dry_run
             )
@@ -781,6 +999,7 @@ def process_path(
                 error=str(exc),
                 reason_code="processing_failed",
                 event_updates={"retention_state": retention},
+                lease_owner=lease_owner,
             )
             attendance.log(
                 f"ftp:{path.name}: processing failed event={event_id} "
@@ -803,11 +1022,37 @@ def process_path(
             status="checkin_created" if created else "processed_no_checkin",
             reason_code="checkin_created" if created else "processed_no_checkin",
             event_updates={"retention_state": retention},
+            lease_owner=lease_owner,
         )
         return bool(created)
+    except DeliveryAttemptUncertain as exc:
+        retention = reject_file(
+            path, "delivery_uncertain", cfg, dry_run=dry_run
+        )
+        claim_finalized = finish_claim(
+            state,
+            claim,
+            event_id,
+            status="uncertain",
+            error=str(exc),
+            reason_code="generic_failed",
+            event_updates={"retention_state": retention},
+            detail={"kind": "delivery_ambiguous"},
+            lease_owner=lease_owner,
+        )
+        attendance.log(
+            f"ftp:{path.name}: delivery uncertain event={event_id}: {exc}"
+        )
+        return False
+    except ProcessingLeaseError as exc:
+        attendance.log(
+            f"ftp:{path.name}: processing lease lost event={event_id}: {exc}"
+        )
+        return False
     except (FileNotFoundError, ValueError) as exc:
         retention = reject_file(path, "invalid_upload", cfg, dry_run=dry_run)
         if claim and claim.accepted and not claim_finalized:
+            state.release_event_policy_reservations(event_id)
             claim_finalized = finish_claim(
                 state,
                 claim,
@@ -816,11 +1061,13 @@ def process_path(
                 error=f"invalid_upload:{exc}",
                 reason_code="invalid_upload",
                 event_updates={"retention_state": retention},
+                lease_owner=lease_owner,
             )
         attendance.log(f"ftp:{path.name}: rejected before processing: {exc}")
         return False
     except Exception as exc:
         if claim and claim.accepted and not claim_finalized:
+            state.release_event_policy_reservations(event_id)
             finish_claim(
                 state,
                 claim,
@@ -828,6 +1075,7 @@ def process_path(
                 status="failed",
                 error=f"unexpected:{exc}",
                 reason_code="unexpected_error",
+                lease_owner=lease_owner,
             )
         attendance.log(f"ftp:{path.name}: unexpected processing error: {exc}")
         raise
@@ -866,6 +1114,8 @@ def run(*, once=False, dry_run=False, allow_stale=False):
     folder = Path(cfg.get("camera_uploads_dir", ROOT / "camera_uploads"))
     folder.mkdir(parents=True, exist_ok=True)
     state = state_for_config(cfg)
+    worker_id = watcher_worker_id()
+    recover_startup_events(state, sources, cfg)
     verified_model_directory = (
         report.model_integrity.get("model_directory")
         if report.model_integrity.get("ok")
@@ -887,7 +1137,7 @@ def run(*, once=False, dry_run=False, allow_stale=False):
     attendance.log(
         f"secure folder watcher started: {folder}; pad={pad_gate.provider}; "
         f"production_mode={int(bool(cfg.get('production_mode', False)))}; "
-        f"sources={source_summary}"
+        f"worker={worker_id}; sources={source_summary}"
     )
 
     while True:
@@ -906,6 +1156,7 @@ def run(*, once=False, dry_run=False, allow_stale=False):
                     dry_run=dry_run,
                     allow_stale=allow_stale,
                     sources=sources,
+                    worker_id=worker_id,
                 )
                 or created
             )

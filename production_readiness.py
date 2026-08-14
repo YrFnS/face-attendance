@@ -14,6 +14,9 @@ from model_manifest import (
     verify_manifest,
 )
 from pad import configuration_issues as pad_configuration_issues
+from processing_recovery import (
+    configuration_issues as processing_recovery_configuration_issues,
+)
 from runtime_policy import inspect_gallery, strict_profile_issues
 from secret_store import (
     ConfigLoadError,
@@ -153,6 +156,10 @@ def check_production_readiness(
 
     for code, message in strict_profile_issues(cfg):
         issues.append(ReadinessIssue(code, message))
+    for message in processing_recovery_configuration_issues(cfg):
+        issues.append(
+            ReadinessIssue("processing_recovery_configuration_invalid", message)
+        )
 
     for message in gallery_credential_configuration_issues(cfg):
         issues.append(ReadinessIssue("gallery_credentials_invalid", message))

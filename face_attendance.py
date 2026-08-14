@@ -4,7 +4,7 @@ import os
 import shlex
 import subprocess
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 import cv2
@@ -51,8 +51,6 @@ EMBEDDINGS = ROOT / "embedding_gallery.json"
 LEGACY_EMBEDDINGS = ROOT / "embeddings.pkl"
 SYNC_STATUS = ROOT / "embedding_sync_status.json"
 LOGS = ROOT / "logs"
-COOLDOWN_STATE = ROOT / "cooldown_state.json"
-COOLDOWN_LOCK = ROOT / "cooldown_state.lock"
 
 
 def log(message):
@@ -378,42 +376,6 @@ class GalleryRuntime:
             raise
 
 
-def load_cooldown_state():
-    if not COOLDOWN_STATE.exists():
-        return {}
-    try:
-        return json.loads(COOLDOWN_STATE.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return {}
-
-
-def save_cooldown_state(last_seen):
-    COOLDOWN_STATE.write_text(
-        json.dumps(last_seen, indent=2, sort_keys=True), encoding="utf-8"
-    )
-
-
-def acquire_cooldown_lock(timeout=10):
-    start = time.time()
-    while True:
-        try:
-            return os.open(
-                str(COOLDOWN_LOCK), os.O_CREAT | os.O_EXCL | os.O_WRONLY
-            )
-        except FileExistsError:
-            if time.time() - start > timeout:
-                raise TimeoutError("cooldown lock timed out")
-            time.sleep(0.1)
-
-
-def release_cooldown_lock(lock_fd):
-    os.close(lock_fd)
-    try:
-        COOLDOWN_LOCK.unlink()
-    except FileNotFoundError:
-        pass
-
-
 def bench_execute(method, kwargs):
     cfg = load_config()
     command = " ".join(
@@ -513,14 +475,29 @@ def api_headers(json_request=True):
     return headers
 
 
-def create_checkin_api(employee, log_type, image_path=None):
+def erp_event_time(value=None):
+    if value in (None, ""):
+        return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    if not isinstance(value, str):
+        raise ValueError("event_time must be an RFC 3339 string")
+    candidate = value[:-1] + "+00:00" if value.endswith("Z") else value
+    try:
+        parsed = datetime.fromisoformat(candidate)
+    except ValueError as exc:
+        raise ValueError("event_time must be an RFC 3339 timestamp") from exc
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise ValueError("event_time must include a timezone")
+    return parsed.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def create_checkin_api(employee, log_type, image_path=None, event_time=None):
     employee = validate_employee_id(employee)
     log_type = validate_log_type(log_type)
     cfg = load_config()
     doc = {
         "employee": employee,
         "log_type": log_type,
-        "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "time": erp_event_time(event_time),
     }
     response = requests.post(
         f"{cfg['frappe_url'].rstrip('/')}/api/resource/Employee%20Checkin",
@@ -546,16 +523,17 @@ def create_checkin_api(employee, log_type, image_path=None):
         upload.raise_for_status()
         log(f"checkin attachment added: {docname} {image_path.name}")
     log(f"checkin created: {employee} {log_type} {docname}")
+    return docname
 
 
-def create_checkin_bench(employee, log_type, image_path=None):
+def create_checkin_bench(employee, log_type, image_path=None, event_time=None):
     employee = validate_employee_id(employee)
     log_type = validate_log_type(log_type)
     doc = {
         "doctype": "Employee Checkin",
         "employee": employee,
         "log_type": log_type,
-        "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "time": erp_event_time(event_time),
     }
     inserted = bench_execute("frappe.client.insert", {"doc": doc})
     docname = inserted["name"]
@@ -566,9 +544,10 @@ def create_checkin_bench(employee, log_type, image_path=None):
         except subprocess.CalledProcessError as exc:
             log(f"checkin attachment failed: {docname} {exc}")
     log(f"checkin created: {employee} {log_type} {docname}")
+    return docname
 
 
-def create_checkin(employee, log_type, image_path=None):
+def create_checkin(employee, log_type, image_path=None, event_time=None):
     employee = validate_employee_id(employee)
     log_type = validate_log_type(log_type)
     cfg = load_config()
@@ -577,8 +556,8 @@ def create_checkin(employee, log_type, image_path=None):
         and cfg.get("frappe_api_key")
         and cfg.get("frappe_api_secret")
     ):
-        return create_checkin_api(employee, log_type, image_path)
-    return create_checkin_bench(employee, log_type, image_path)
+        return create_checkin_api(employee, log_type, image_path, event_time)
+    return create_checkin_bench(employee, log_type, image_path, event_time)
 
 
 def create_checkin_with_cooldown(
@@ -586,25 +565,13 @@ def create_checkin_with_cooldown(
 ):
     employee = validate_employee_id(employee)
     log_type = validate_log_type(log_type or cfg["log_type"])
-    lock_fd = acquire_cooldown_lock()
-    try:
-        last_seen = load_cooldown_state()
-        now = time.time()
-        remaining = int(cfg["cooldown_seconds"]) - int(
-            now - last_seen.get(employee, 0)
-        )
-        if remaining > 0:
-            log(f"cooldown skip: {employee} {remaining}s remaining")
-            return False
-        if dry_run:
-            log(f"dry run: would create {employee} {log_type}")
-            return True
-        create_checkin(employee, log_type, image_path)
-        last_seen[employee] = now
-        save_cooldown_state(last_seen)
+    if dry_run:
+        log(f"dry run: would create {employee} {log_type}")
         return True
-    finally:
-        release_cooldown_lock(lock_fd)
+    raise RuntimeError(
+        "filesystem cooldown state has been removed; live attendance must use "
+        "the canonical watcher transactional policy callback"
+    )
 
 
 def log_type_for_path(cfg, path):
@@ -626,6 +593,7 @@ def process_image(
     dry_run=False,
     attach_source=None,
     decision_callback=None,
+    attendance_callback=None,
 ):
     detect_frame = scaled_frame(image, cfg)
     faces = app.get(detect_frame)
@@ -637,7 +605,8 @@ def process_image(
 
     def emit_decision(payload):
         if decision_callback is not None:
-            decision_callback(dict(payload))
+            return decision_callback(dict(payload))
+        return None
 
     created = False
     seen_this_image = set()
@@ -724,23 +693,31 @@ def process_image(
             if image_path
             else "not_retained"
         )
+        candidate = {
+            **decision,
+            "best_employee": employee,
+            "accepted": True,
+            "reason_code": "accepted_candidate",
+            "retention_state": retention_state,
+        }
         try:
-            emit_decision(
-                {
-                    **decision,
-                    "best_employee": employee,
-                    "accepted": True,
-                    "reason_code": "accepted_candidate",
-                    "retention_state": retention_state,
-                }
-            )
-            created_now = create_checkin_with_cooldown(
-                employee,
-                cfg,
-                attachment_path,
-                dry_run,
-                selected_log_type,
-            )
+            if attendance_callback is not None:
+                created_now = attendance_callback(
+                    employee=employee,
+                    log_type=selected_log_type,
+                    image_path=attachment_path,
+                    dry_run=dry_run,
+                    decision=dict(candidate),
+                )
+            else:
+                emit_decision(candidate)
+                created_now = create_checkin_with_cooldown(
+                    employee,
+                    cfg,
+                    attachment_path,
+                    dry_run,
+                    selected_log_type,
+                )
             created = created_now or created
         finally:
             if temporary and image_path:
