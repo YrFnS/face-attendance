@@ -1,0 +1,306 @@
+                params.append(str(employee))
+            start_unix = _timestamp_unix(from_time, "from_time")
+            end_unix = _timestamp_unix(to_time, "to_time")
+            if start_unix is not None:
+                where.append(f"e.{time_column} >= ?")
+                params.append(start_unix)
+            if end_unix is not None:
+                where.append(f"e.{time_column} <= ?")
+                params.append(end_unix)
+            if (
+                start_unix is not None
+                and end_unix is not None
+                and start_unix > end_unix
+            ):
+                raise EventInspectionError("from_time must not be later than to_time")
+
+            predicate = " WHERE " + " AND ".join(where) if where else ""
+            total = int(
+                connection.execute(
+                    f"SELECT COUNT(*) FROM camera_events e{predicate}",
+                    params,
+                ).fetchone()[0]
+            )
+            processing_phase = (
+                "e.processing_phase" if "processing_phase" in columns else "''"
+            )
+            received_at = (
+                "e.received_at" if "received_at" in columns else "''"
+            )
+            effective_at = (
+                "e.effective_at" if "effective_at" in columns else "''"
+            )
+            branch_expr = "e.branch" if "branch" in columns else "''"
+            reason_expr = (
+                "e.reason_code" if "reason_code" in columns else "''"
+            )
+            final_expr = (
+                "e.final_disposition"
+                if "final_disposition" in columns
+                else "''"
+            )
+            capture_expr = (
+                "e.capture_id" if "capture_id" in columns else "''"
+            )
+            rows = connection.execute(
+                f"""
+                SELECT
+                    e.event_id,
+                    {capture_expr} AS capture_id,
+                    e.camera_id,
+                    e.log_type AS direction,
+                    {branch_expr} AS branch,
+                    {state_column} AS lifecycle_state,
+                    e.status,
+                    {reason_expr} AS reason_code,
+                    {processing_phase} AS processing_phase,
+                    {received_at} AS received_at,
+                    {effective_at} AS effective_at,
+                    {final_expr} AS final_disposition,
+                    e.source_name,
+                    e.source_size,
+                    (SELECT COUNT(*) FROM recognition_decisions d
+                     WHERE d.event_id = e.event_id) AS decision_count,
+                    (SELECT COUNT(*) FROM recognition_decisions d
+                     WHERE d.event_id = e.event_id AND d.accepted = 1)
+                        AS accepted_decision_count,
+                    COALESCE((SELECT d.best_employee
+                     FROM recognition_decisions d
+                     WHERE d.event_id = e.event_id AND d.accepted = 1
+                     ORDER BY d.created_at, d.decision_id LIMIT 1), '')
+                        AS employee
+                FROM camera_events e
+                {predicate}
+                ORDER BY e.{time_column}
+                    {'DESC' if order == 'newest' else 'ASC'}, e.event_id
+                LIMIT ? OFFSET ?
+                """,
+                [*params, limit, offset],
+            ).fetchall()
+            items = [redact_event_value(dict(row)) for row in rows]
+            return {
+                "database_schema_version": version,
+                "total": total,
+                "limit": limit,
+                "offset": offset,
+                "order": order,
+                "items": items,
+                "read_only": True,
+            }
+        finally:
+            connection.close()
+
+    def inspect_event(self, event_id):
+        event_id = _identifier(event_id, "event_id")
+        connection, version = self._connect()
+        try:
+            row = connection.execute(
+                "SELECT * FROM camera_events WHERE event_id = ?",
+                (event_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            event = dict(row)
+            if "receipt_json" in event:
+                event["receipt"] = _parse_json(event.pop("receipt_json"))
+            if "receipt_verified" in event:
+                event["receipt_verified"] = bool(event["receipt_verified"])
+
+            transitions = []
+            if _table_exists(connection, "event_transitions"):
+                transitions = [
+                    dict(item)
+                    for item in connection.execute(
+                        """
+                        SELECT sequence, from_state, to_state, reason_code,
+                               actor_type, actor_id, detail_json, created_at
+                        FROM event_transitions
+                        WHERE event_id = ? ORDER BY sequence
+                        """,
+                        (event_id,),
+                    ).fetchall()
+                ]
+                for item in transitions:
+                    item["detail"] = _parse_json(item.pop("detail_json"))
+
+            decisions = []
+            if _table_exists(connection, "recognition_decisions"):
+                decisions = [
+                    dict(item)
+                    for item in connection.execute(
+                        """
+                        SELECT * FROM recognition_decisions
+                        WHERE event_id = ?
+                        ORDER BY decision_version, face_index
+                        """,
+                        (event_id,),
+                    ).fetchall()
+                ]
+                for item in decisions:
+                    for boolean_key in (
+                        "pad_passed",
+                        "pad_skipped",
+                        "accepted",
+                    ):
+                        if boolean_key in item:
+                            item[boolean_key] = bool(item[boolean_key])
+
+            actions = []
+            if _table_exists(connection, "operator_actions"):
+                actions = [
+                    dict(item)
+                    for item in connection.execute(
+                        """
+                        SELECT action_id, actor, action, reason_code,
+                               detail_json, created_at
+                        FROM operator_actions
+                        WHERE event_id = ? ORDER BY created_at, action_id
+                        """,
+                        (event_id,),
+                    ).fetchall()
+                ]
+                for item in actions:
+                    item["detail"] = _parse_json(item.pop("detail_json"))
+
+            policy = []
+            if _table_exists(connection, "attendance_policy_state"):
+                policy = [
+                    dict(item)
+                    for item in connection.execute(
+                        """
+                        SELECT * FROM attendance_policy_state
+                        WHERE committed_event_id = ? OR reservation_event_id = ?
+                        ORDER BY scope_key
+                        """,
+                        (event_id, event_id),
+                    ).fetchall()
+                ]
+
+            return redact_event_value(
+                {
+                    "database_schema_version": version,
+                    "event": event,
+                    "transitions": transitions,
+                    "decisions": decisions,
+                    "operator_actions": actions,
+                    "attendance_policy": policy,
+                    "read_only": True,
+                    "biometric_vectors_exposed": False,
+                }
+            )
+        finally:
+            connection.close()
+
+    def explain_event(self, event_id, *, now=None):
+        inspected = self.inspect_event(event_id)
+        if inspected is None:
+            return None
+        now = time.time() if now is None else float(now)
+        event = inspected["event"]
+        state = str(
+            event.get("lifecycle_state") or event.get("status") or "unknown"
+        )
+        reason = str(event.get("reason_code") or "")
+        delivery_started = bool(
+            event.get("delivery_started_at")
+            or event.get("delivery_decision_id")
+            or event.get("processing_phase") == "delivery_in_progress"
+        )
+        lease_active = bool(
+            event.get("lease_owner")
+            and float(event.get("lease_expires_unix") or 0) > now
+        )
+        uncertain_policy = any(
+            item.get("reservation_state") == "uncertain"
+            for item in inspected.get("attendance_policy", [])
+        )
+        confirmed_delivery = state == "checkin_created"
+        reprocess_eligible = bool(
+            state in REPROCESSABLE_STATES
+            and not delivery_started
+            and not lease_active
+            and not uncertain_policy
+        )
+        dismiss_eligible = bool(
+            state in DISMISSIBLE_STATES
+            and not delivery_started
+            and not lease_active
+            and not uncertain_policy
+        )
+
+        if state == "checkin_created":
+            headline = "ERPNext check-in creation was reported successful."
+            recommended = (
+                "Use the ERPNext record for any delivered check-in correction or "
+                "deletion; the local event CLI does not cancel delivered records."
+            )
+        elif state == "uncertain" or delivery_started:
+            headline = (
+                "ERPNext delivery may have started and its outcome is not proven."
+            )
+            recommended = (
+                "Reconcile this event against ERPNext. Automatic or operator "
+                "delivery retry is intentionally unavailable until Phase 2 "
+                "idempotency is active."
+            )
+        elif event.get("retention_state") == "quarantined":
+            headline = (
+                "The event is terminal and its source evidence is quarantined."
+            )
+            recommended = (
+                "Review the source and receipt, then use resolve-quarantine retain "
+                "or requeue. Requeue requires the watcher to be stopped."
+            )
+        elif reprocess_eligible:
+            headline = (
+                "The event failed or was rejected before remote delivery began."
+            )
+            recommended = (
+                "After correcting the cause, verifying retained source evidence, "
+                "and stopping the watcher, use the audited reprocess command."
+            )
+        elif state == "dismissed":
+            headline = "An operator dismissed this event without remote delivery."
+            recommended = (
+                "Review the operator action history if the dismissal must be "
+                "revisited."
+            )
+        elif state == "processed":
+            headline = "Recognition processing completed without creating a check-in."
+            recommended = (
+                "Review face decisions and policy evidence; no delivery retry "
+                "exists in Phase 1."
+            )
+        else:
+            headline = (
+                f"The event is currently {state} with reason "
+                f"{reason or 'unspecified'}."
+            )
+            recommended = (
+                "Review the transition and decision timeline before taking action."
+            )
+
+        decision_summary = []
+        for decision in inspected.get("decisions", []):
+            decision_summary.append(
+                {
+                    "decision_id": decision.get("decision_id", ""),
+                    "decision_version": decision.get("decision_version", 0),
+                    "face_index": decision.get("face_index", 0),
+                    "accepted": bool(decision.get("accepted")),
+                    "employee": decision.get("best_employee", ""),
+                    "reason_code": decision.get("reason_code", ""),
+                    "best_score": decision.get("best_score"),
+                    "runner_up_score": decision.get("runner_up_score"),
+                    "score_margin": decision.get("score_margin"),
+                    "pad_passed": bool(decision.get("pad_passed")),
+                    "pad_score": decision.get("pad_score"),
+                    "gallery_version": decision.get("gallery_version", ""),
+                    "recognition_model_version": decision.get(
+                        "recognition_model_version",
+                        "",
+                    ),
+                }
+            )
+
+        timeline = []
