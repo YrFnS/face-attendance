@@ -1,0 +1,49 @@
+H0-09 fragment test_watch_service.py 3/4
+        app = FakeApp([FakeFace(1), FakeFace(40)])
+        pad = PassingPAD()
+        called = []
+        attendance.process_image = lambda *args, **kwargs: called.append(True) or True
+        result = watch_service.process_path(self.image_path, app, [], StaticGallery([]), self.cfg, self.state, pad, sources=self.sources)
+        self.assertFalse(result)
+        self.assertEqual(app.calls, 1)
+        self.assertEqual(pad.calls, [])
+        self.assertEqual(called, [])
+        event = self.state.get_event(self.event_id())
+        self.assertEqual(event["status"], "rejected")
+        self.assertIn("pad_expected_one_face_found_2", event["error"])
+
+    def test_recognition_consumes_exact_pad_faces_and_bound_source_context(self):
+        face = FakeFace(5)
+        app = FakeApp([face])
+        pad = PassingPAD()
+        captured = {}
+
+        def process_image(_image, source_text, bound_app, _known, event_cfg, _dry_run, **kwargs):
+            captured["faces"] = bound_app.get(np.zeros((1, 1, 3), dtype=np.uint8))
+            captured["attach_source"] = kwargs.get("attach_source")
+            captured["source_text"] = source_text
+            captured["log_type"] = event_cfg["log_type"]
+            return True
+
+        attendance.process_image = process_image
+        result = watch_service.process_path(self.image_path, app, [], StaticGallery([{"employee": "HR-1"}]), self.cfg, self.state, pad, sources=self.sources)
+        self.assertTrue(result)
+        self.assertEqual(app.calls, 1)
+        self.assertEqual(len(pad.calls), 1)
+        self.assertIs(captured["faces"][0], face)
+        self.assertEqual(pad.calls[0]["face_index"], 1)
+        self.assertEqual(pad.calls[0]["face_count"], 1)
+        self.assertEqual(pad.calls[0]["bbox"], [5, 2, 25, 30])
+        self.assertEqual(pad.calls[0]["branch"], "Baghdad")
+        self.assertEqual(pad.calls[0]["source_principal"], "camera_in")
+        self.assertEqual(pad.calls[0]["source_remote_ip"], "192.0.2.10")
+        self.assertIn("principal=camera_in", captured["source_text"])
+        self.assertIn("ip=192.0.2.10", captured["source_text"])
+        self.assertEqual(captured["log_type"], "IN")
+        self.assertIsNone(captured["attach_source"])
+        event = self.state.get_event(self.event_id())
+        self.assertEqual(event["status"], "checkin_created")
+
+    def test_per_face_mode_requires_every_face_to_pass(self):
+        self.cfg["pad_require_single_face"] = False
+        faces = [FakeFace(1), FakeFace(40)]
