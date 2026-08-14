@@ -9,6 +9,13 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
+from event_identity import (
+    IDENTITY_REQUIRED_INDEXES,
+    IDENTITY_REQUIRED_TABLE_COLUMNS,
+    IDENTITY_REQUIRED_TRIGGERS,
+    IDENTITY_SCHEMA_STATEMENTS,
+    make_event_id,
+)
 from event_ledger import (
     EventLedgerMixin,
     LEDGER_REQUIRED_INDEXES,
@@ -32,7 +39,7 @@ from processing_recovery import (
 )
 
 
-RUNTIME_SCHEMA_VERSION = 4
+RUNTIME_SCHEMA_VERSION = 5
 MIGRATION_TABLE = "schema_migrations"
 DEFAULT_BACKUP_DIRECTORY = "runtime_state_backups"
 
@@ -79,11 +86,6 @@ def file_sha256(path, max_bytes=0, chunk_size=1024 * 1024):
                 raise ValueError(f"file exceeds maximum size of {int(max_bytes)} bytes")
             digest.update(chunk)
     return digest.hexdigest(), size
-
-
-def make_event_id(camera_id, log_type, source_sha256):
-    value = "\0".join((str(camera_id), str(log_type), str(source_sha256)))
-    return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -185,6 +187,11 @@ MIGRATIONS = (
     Migration(2, "versioned_event_ledger", LEDGER_SCHEMA_STATEMENTS),
     Migration(3, "processing_leases_and_policy_state", RECOVERY_SCHEMA_STATEMENTS),
     Migration(4, "audited_event_operations", OPERATION_SCHEMA_STATEMENTS),
+    Migration(
+        5,
+        "idempotency_tombstones_and_identifier_schemes",
+        IDENTITY_SCHEMA_STATEMENTS,
+    ),
 )
 MIGRATION_BY_VERSION = {migration.version: migration for migration in MIGRATIONS}
 
@@ -371,6 +378,11 @@ def _required_schema_errors(connection, version=None):
             table_requirements.setdefault(table, {}).update(columns)
         index_requirements.update(OPERATION_REQUIRED_INDEXES)
         trigger_requirements.update(OPERATION_REQUIRED_TRIGGERS)
+    if version >= 5:
+        for table, columns in IDENTITY_REQUIRED_TABLE_COLUMNS.items():
+            table_requirements.setdefault(table, {}).update(columns)
+        index_requirements.update(IDENTITY_REQUIRED_INDEXES)
+        trigger_requirements.update(IDENTITY_REQUIRED_TRIGGERS)
 
     errors = []
     for table, required in table_requirements.items():
@@ -1010,18 +1022,69 @@ class RuntimeState(EventOperationsMixin, ProcessingRecoveryMixin, EventLedgerMix
     def get_event(self, event_id):
         return self.event_details(event_id, include_history=True)
 
+    def get_event_tombstone(self, event_id):
+        connection = self._connect()
+        try:
+            row = connection.execute(
+                "SELECT * FROM event_tombstones WHERE event_id = ?",
+                (str(event_id).lower(),),
+            ).fetchone()
+            return dict(row) if row else None
+        finally:
+            connection.close()
+
     def prune_events(self, retention_days):
+        """Prune safe terminal detail while preserving permanent replay records."""
+
         retention_days = int(retention_days or 0)
         if retention_days <= 0:
             return 0
         cutoff = time.time() - retention_days * 86400
         connection = self._connect()
         try:
-            cursor = connection.execute(
-                "DELETE FROM camera_events WHERE created_unix < ?", (cutoff,)
-            )
+            connection.execute("BEGIN IMMEDIATE")
+            rows = connection.execute(
+                """
+                SELECT event_id, capture_id, camera_id, source_sha256
+                FROM camera_events
+                WHERE created_unix < ?
+                  AND lifecycle_state IN (
+                      'processed', 'checkin_created', 'rejected', 'failed', 'dismissed'
+                  )
+                  AND retention_state <> 'quarantined'
+                ORDER BY created_unix, event_id
+                """,
+                (cutoff,),
+            ).fetchall()
+            for row in rows:
+                stored = connection.execute(
+                    """
+                    SELECT event_id, capture_id, camera_id, source_sha256
+                    FROM event_tombstones
+                    WHERE event_id = ?
+                    """,
+                    (row["event_id"],),
+                ).fetchone()
+                if (
+                    stored is None
+                    or stored["capture_id"] != row["capture_id"]
+                    or stored["camera_id"] != row["camera_id"]
+                    or stored["source_sha256"] != row["source_sha256"]
+                ):
+                    raise RuntimeStateError(
+                        "event tombstone is missing or conflicts with detailed "
+                        "history; pruning was refused"
+                    )
+            if rows:
+                connection.executemany(
+                    "DELETE FROM camera_events WHERE event_id = ?",
+                    [(row["event_id"],) for row in rows],
+                )
             connection.commit()
-            return cursor.rowcount
+            return len(rows)
+        except Exception:
+            connection.rollback()
+            raise
         finally:
             connection.close()
 

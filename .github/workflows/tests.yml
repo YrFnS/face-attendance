@@ -47,6 +47,13 @@ jobs:
             test_runtime_policy.py \
             test_model_runtime.py \
             test_runtime_state.py \
+            test_event_ledger.py \
+            test_event_operations.py \
+            test_processing_recovery.py \
+            test_event_identity.py \
+            test_event_tombstones.py \
+            test_runtime_schema_fixtures.py \
+            test_h0_credential_auth.py \
             test_web_security.py \
             test_web_admin.py \
             test_model_manifest.py \
@@ -58,5 +65,6 @@ jobs:
       - name: Validate configuration and shell templates
         run: |
           python -m json.tool config.example.json >/dev/null
+          python -m json.tool tests/fixtures/manifest.json >/dev/null
           bash -n install_linux.sh
           bash -n deploy/firewall/ufw-rules.example.sh

@@ -7,6 +7,20 @@ import unicodedata
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
+from event_identity import (
+    CAPTURE_ID_SCHEME,
+    CONTENT_HASH_ALGORITHM,
+    DECISION_ID_SCHEME,
+    DEFAULT_DELIVERY_CONTRACT_VERSION,
+    DELIVERY_ID_SCHEME,
+    EVENT_ID_SCHEME,
+    LEGACY_CONTENT_HASH_ALGORITHM,
+    make_capture_id as _make_capture_id,
+    make_delivery_id as _make_delivery_id,
+    make_event_id as _make_event_id,
+    make_recognition_decision_id as _make_recognition_decision_id,
+)
+
 
 HEX64_RE = re.compile(r"^[0-9a-f]{64}$")
 
@@ -532,27 +546,24 @@ def _json_text(value, field, *, max_bytes=32768):
 
 
 def make_capture_id(camera_id, source_sha256, source_name, source_size, source_mtime):
-    value = "\0".join(
-        (
-            str(camera_id),
-            str(source_sha256),
-            str(source_name),
-            str(int(source_size)),
-            f"{float(source_mtime):.6f}",
-        )
+    return _make_capture_id(
+        camera_id, source_sha256, source_name, source_size, source_mtime
     )
-    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def make_event_id(camera_id, log_type, source_sha256):
+    return _make_event_id(camera_id, log_type, source_sha256)
 
 
 def make_recognition_decision_id(event_id, face_index, decision_version=1):
-    event_id = _identifier(event_id, "event_id")
-    face_index = _integer(face_index, "face_index", minimum=1)
-    decision_version = _integer(
-        decision_version, "decision_version", minimum=1, maximum=1_000_000
-    )
-    value = "\0".join((event_id, str(face_index), str(decision_version)))
-    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+    return _make_recognition_decision_id(event_id, face_index, decision_version)
 
+
+def make_delivery_id(
+    decision_id,
+    delivery_contract_version=DEFAULT_DELIVERY_CONTRACT_VERSION,
+):
+    return _make_delivery_id(decision_id, delivery_contract_version)
 
 def _parse_json_column(row, key):
     value = row.get(key)
@@ -676,6 +687,27 @@ class EventLedgerMixin:
             raise EventLedgerValidationError(
                 "source_sha256 must be a lowercase 64-character SHA-256 digest"
             )
+        content_hash_algorithm = (
+            CONTENT_HASH_ALGORITHM
+            if receipt_state != "legacy" and HEX64_RE.fullmatch(source_sha256)
+            else LEGACY_CONTENT_HASH_ALGORITHM
+        )
+        expected_event_id = make_event_id(camera_id, log_type, source_sha256)
+        if event_id != expected_event_id:
+            raise EventLedgerValidationError(
+                "event_id does not match the current camera/direction/content scheme"
+            )
+        expected_capture_id = make_capture_id(
+            camera_id,
+            source_sha256,
+            source_name,
+            source_size,
+            source_mtime,
+        )
+        if capture_id != expected_capture_id:
+            raise EventLedgerValidationError(
+                "capture_id does not match the current capture-envelope scheme"
+            )
         received_at = _timestamp(received_at, "received_at")
         effective_at = _timestamp(effective_at, "effective_at")
         source_at = _timestamp(source_at, "source_at", required=False)
@@ -694,24 +726,65 @@ class EventLedgerMixin:
         connection = self._connect()
         try:
             connection.execute("BEGIN IMMEDIATE")
-            existing = connection.execute(
+            tombstone = connection.execute(
                 """
-                SELECT event_id, status, capture_id
-                FROM camera_events
-                WHERE event_id = ? OR (camera_id = ? AND source_sha256 = ?)
+                SELECT t.event_id, t.capture_id, e.status
+                FROM event_tombstones t
+                LEFT JOIN camera_events e ON e.event_id = t.event_id
+                WHERE t.camera_id = ? AND t.source_sha256 = ?
                 LIMIT 1
                 """,
-                (event_id, camera_id, source_sha256),
+                (camera_id, source_sha256),
             ).fetchone()
-            if existing:
+            if tombstone:
                 connection.rollback()
+                detail_present = tombstone["status"] is not None
                 return LedgerClaim(
                     False,
-                    existing["event_id"],
-                    reason="duplicate",
-                    existing_status=existing["status"],
-                    capture_id=existing["capture_id"] or "",
+                    tombstone["event_id"],
+                    reason="duplicate" if detail_present else "tombstoned",
+                    existing_status=(
+                        tombstone["status"] if detail_present else "tombstoned"
+                    ),
+                    capture_id=tombstone["capture_id"],
                 )
+
+            collision = connection.execute(
+                """
+                SELECT event_id, capture_id, camera_id, source_sha256
+                FROM event_tombstones
+                WHERE event_id = ? OR capture_id = ?
+                LIMIT 1
+                """,
+                (event_id, capture_id),
+            ).fetchone()
+            if collision:
+                raise EventLedgerValidationError(
+                    "identifier collision: event_id or capture_id is already bound "
+                    "to different camera content"
+                )
+
+            connection.execute(
+                """
+                INSERT INTO event_tombstones (
+                    event_id, event_id_scheme, capture_id, capture_id_scheme,
+                    camera_id, log_type, source_sha256, content_hash_algorithm,
+                    first_received_at, first_received_unix
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    event_id,
+                    EVENT_ID_SCHEME,
+                    capture_id,
+                    CAPTURE_ID_SCHEME,
+                    camera_id,
+                    log_type,
+                    source_sha256,
+                    content_hash_algorithm,
+                    received_at,
+                    received_unix,
+                ),
+            )
             connection.execute(
                 """
                 INSERT INTO camera_events (
@@ -723,10 +796,12 @@ class EventLedgerMixin:
                     effective_at, branch, source_type, source_principal,
                     source_remote_ip, source_binding_id, policy, receipt_state,
                     receipt_verified, receipt_json, lifecycle_state, state_version,
-                    reason_code, policy_version, retention_state
+                    reason_code, policy_version, retention_state,
+                    event_id_scheme, capture_id_scheme, content_hash_algorithm
                 ) VALUES (
                     ?, ?, ?, ?, ?, ?, ?, ?, ?, 'received', ?, ?, NULL, '', ?, ?, ?,
-                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'received', 1, ?, ?, 'pending'
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'received', 1, ?, ?, 'pending',
+                    ?, ?, ?
                 )
                 """,
                 (
@@ -763,6 +838,9 @@ class EventLedgerMixin:
                     receipt_json,
                     reason_code,
                     _text(policy_version, "policy_version", max_chars=128),
+                    EVENT_ID_SCHEME,
+                    CAPTURE_ID_SCHEME,
+                    content_hash_algorithm,
                 ),
             )
             connection.execute(
@@ -921,6 +999,7 @@ class EventLedgerMixin:
         preprocessing_version="",
         retention_state="pending",
         decision_version=1,
+        delivery_contract_version=DEFAULT_DELIVERY_CONTRACT_VERSION,
     ):
         event_id = _identifier(event_id, "event_id")
         face_index = _integer(face_index, "face_index", minimum=1)
@@ -955,6 +1034,21 @@ class EventLedgerMixin:
             )
         decision_id = make_recognition_decision_id(
             event_id, face_index, decision_version
+        )
+        delivery_contract_version = _text(
+            delivery_contract_version,
+            "delivery_contract_version",
+            required=True,
+            max_chars=128,
+        )
+        delivery_id = (
+            make_delivery_id(decision_id, delivery_contract_version)
+            if accepted
+            else ""
+        )
+        delivery_id_scheme = DELIVERY_ID_SCHEME if accepted else ""
+        stored_delivery_contract_version = (
+            delivery_contract_version if accepted else ""
         )
         created_at = utc_now()
         values = (
@@ -999,6 +1093,10 @@ class EventLedgerMixin:
             _text(preprocessing_version, "preprocessing_version", max_chars=128),
             retention_state,
             created_at,
+            DECISION_ID_SCHEME,
+            delivery_id,
+            delivery_id_scheme,
+            stored_delivery_contract_version,
         )
         connection = self._connect()
         try:
@@ -1018,10 +1116,12 @@ class EventLedgerMixin:
                     candidate_log_type, policy_version, gallery_version,
                     gallery_generated_at, gallery_model, gallery_model_version,
                     recognition_model, recognition_model_version,
-                    preprocessing_version, retention_state, created_at
+                    preprocessing_version, retention_state, created_at,
+                    decision_id_scheme, delivery_id, delivery_id_scheme,
+                    delivery_contract_version
                 ) VALUES (
                     ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
                 )
                 """,
                 values,

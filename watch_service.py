@@ -695,6 +695,25 @@ def process_path(
                     cfg.get("attendance_policy_version") or "directional-v1"
                 ),
             )
+            if (
+                not receipt_claim.accepted
+                and (
+                    receipt_claim.reason == "tombstoned"
+                    or receipt_claim.event_id != event_id
+                )
+            ):
+                attendance.log(
+                    f"ftp:{path.name}: replay blocked by persistent receipt "
+                    f"reason={receipt_claim.reason} "
+                    f"event={receipt_claim.event_id} camera={camera_id} "
+                    f"policy={log_type}"
+                )
+                if (
+                    bool(cfg.get("delete_camera_uploads_after_processing", True))
+                    and bool(cfg.get("delete_duplicate_camera_uploads", True))
+                ):
+                    remove_source(path, cfg)
+                return False
             claim = state.acquire_event_lease(
                 event_id,
                 owner=lease_owner,

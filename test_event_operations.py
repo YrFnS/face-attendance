@@ -133,9 +133,9 @@ class EventOperationsTests(unittest.TestCase):
         return event_id, media
 
     def test_schema_v4_columns_indexes_and_source_path_trigger(self):
-        self.assertEqual(RUNTIME_SCHEMA_VERSION, 4)
+        self.assertGreaterEqual(RUNTIME_SCHEMA_VERSION, 4)
         report = self.state.migration_status()
-        self.assertEqual(report["schema_version"], 4)
+        self.assertEqual(report["schema_version"], RUNTIME_SCHEMA_VERSION)
         self.assertTrue(report["ok"], report)
         connection = sqlite3.connect(self.database)
         try:
@@ -216,7 +216,10 @@ class EventOperationsTests(unittest.TestCase):
             connection.close()
 
         migrated = RuntimeState(previous, backup_dir=self.root / "v3-backups")
-        self.assertEqual(migrated.migration_status()["schema_version"], 4)
+        self.assertEqual(
+            migrated.migration_status()["schema_version"],
+            RUNTIME_SCHEMA_VERSION,
+        )
         self.assertIsNotNone(migrated.last_migration_backup)
         event = migrated.get_event(event_id)
         self.assertEqual(event["source_name"], "old.jpg")

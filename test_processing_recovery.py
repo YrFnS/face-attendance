@@ -6,6 +6,7 @@ from pathlib import Path
 from event_ledger import (
     TERMINAL_EVENT_STATES,
     make_capture_id,
+    make_delivery_id,
     make_recognition_decision_id,
 )
 from processing_recovery import (
@@ -60,6 +61,28 @@ class ProcessingRecoveryTests(unittest.TestCase):
             receipt_verified=True,
             receipt_detail={"verified": True},
             policy_version="directional-v1",
+        )
+
+    def record_accepted_decision(self, event_id, decision_version):
+        return self.state.record_recognition_decision(
+            event_id=event_id,
+            face_index=1,
+            face_count=1,
+            bbox=[1, 2, 30, 40],
+            face_width=29,
+            face_height=38,
+            detection_score=0.99,
+            best_employee="HR-1",
+            best_score=0.9,
+            runner_up_score=0.2,
+            score_margin=0.7,
+            pad_passed=True,
+            pad_skipped=False,
+            accepted=True,
+            reason_code="accepted_candidate",
+            candidate_log_type="IN",
+            retention_state="not_retained",
+            decision_version=decision_version,
         )
 
     def test_schema_v3_has_processing_and_policy_state(self):
@@ -159,12 +182,22 @@ class ProcessingRecoveryTests(unittest.TestCase):
             now=1001.0,
         )
         self.assertTrue(reservation.accepted)
+        self.assertEqual(
+            self.record_accepted_decision(self.event_id, lease.attempt),
+            decision_id,
+        )
         self.state.begin_delivery_attempt(
             self.event_id,
             owner="worker-a",
             decision_id=decision_id,
             lease_seconds=60,
             now=1002.0,
+        )
+        event = self.state.get_event(self.event_id)
+        delivery_transition = event["transitions"][-1]
+        self.assertEqual(
+            delivery_transition["detail"]["delivery_id"],
+            make_delivery_id(decision_id),
         )
 
         outcomes = self.state.recover_expired_event_leases(now=1200.0)
@@ -191,6 +224,29 @@ class ProcessingRecoveryTests(unittest.TestCase):
         )
         self.assertFalse(blocked.accepted)
         self.assertEqual(blocked.reason, "uncertain_reservation")
+
+    def test_delivery_requires_persisted_accepted_decision(self):
+        self.record_event()
+        lease = self.state.acquire_event_lease(
+            self.event_id,
+            owner="worker-a",
+            lease_seconds=60,
+            now=1000.0,
+        )
+        decision_id = make_recognition_decision_id(
+            self.event_id, 1, lease.attempt
+        )
+        with self.assertRaisesRegex(
+            ProcessingLeaseError,
+            "persisted accepted recognition decision",
+        ):
+            self.state.begin_delivery_attempt(
+                self.event_id,
+                owner="worker-a",
+                decision_id=decision_id,
+                lease_seconds=60,
+                now=1001.0,
+            )
 
     def test_cooldown_is_scoped_by_direction_branch_and_policy(self):
         self.record_event()
@@ -399,6 +455,10 @@ class ProcessingRecoveryTests(unittest.TestCase):
             now=1001.0,
         )
         self.assertTrue(reservation.accepted)
+        self.assertEqual(
+            self.record_accepted_decision(self.event_id, lease.attempt),
+            decision_id,
+        )
         self.state.begin_delivery_attempt(
             self.event_id,
             owner="worker-a",

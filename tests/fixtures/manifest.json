@@ -1,0 +1,50 @@
+{
+  "fixture_format": 1,
+  "event_id": "8765271424280363493967b4c808316379309ca32274f9192d3e9f322c2f5c20",
+  "fixtures": [
+    {
+      "name": "runtime_state_v1.sqlite3.gz.b64",
+      "schema_version": 1,
+      "source_release": "P1-01 baseline runtime state",
+      "source_commit": "bcbecd49c948a2b5464963ec604991432bc5b1ee",
+      "migration_name": "baseline_runtime_state",
+      "migration_checksum": "f20957f7f2b6eaa80d2e70c7b1ca649b4f4f5ef5fa972424eabaaf3f92b29879",
+      "gzip_sha256": "2e3fc39e7a0ce4a335452aa4d96cabb3e4635c02f587e3126204579599269306",
+      "raw_sha256": "aede9c1d1ae8737d5574a348b5a420dec5759ba88a002a538f715da35e0a4642",
+      "raw_size": 53248
+    },
+    {
+      "name": "runtime_state_v2.sqlite3.gz.b64",
+      "schema_version": 2,
+      "source_release": "P1-03 versioned event ledger",
+      "source_commit": "a21d228e18781390855978ecd9c3dfcf0c4a04f9",
+      "migration_name": "versioned_event_ledger",
+      "migration_checksum": "f2f241d8b3e6e1ed6a35c11e6751352c7d2ad5012d82caa732e91bd5703b0742",
+      "gzip_sha256": "303637e3a442b8d62cb93da2083a8f6c4d59b682064d54dea98524566b064978",
+      "raw_sha256": "6c99bdb3a9897c9f2d49f225c078f1f4488d8a6b86afcb0c5beb82407906b716",
+      "raw_size": 118784
+    },
+    {
+      "name": "runtime_state_v3.sqlite3.gz.b64",
+      "schema_version": 3,
+      "source_release": "P1-05/P1-06 processing leases and policy state",
+      "source_commit": "87aea213f5f612a343d3213cdc7433806eb235d9",
+      "migration_name": "processing_leases_and_policy_state",
+      "migration_checksum": "bf1bab1e084e9ce0cc8f45b70082744a80a4c14d756c6bdc75fab1b7516ff7d4",
+      "gzip_sha256": "0df928a2f05058d233626d9af338726eeee487ee37c7bf6e5d24e367845236b2",
+      "raw_sha256": "aa68209fea7615a21294b639f88213cc87b3e217b047095e62c65c1015788c7c",
+      "raw_size": 139264
+    },
+    {
+      "name": "runtime_state_v4.sqlite3.gz.b64",
+      "schema_version": 4,
+      "source_release": "P1-07 audited event operations",
+      "source_commit": "2faafd647ac5833ee16746c553e0a845a6b31f11",
+      "migration_name": "audited_event_operations",
+      "migration_checksum": "2d917943ae2f5c3718b64cabb9d855ad75c11ec731f8d4cf90be67f1ef73b2ac",
+      "gzip_sha256": "c8d82e6e5c0cf967c3def7a9e3b59dfec33aa02cb34f55aa660e11bbf49b4ffb",
+      "raw_sha256": "b049f0d975649695effeb75c764d94c49d254b5def6489cac380bebe9c16ab9e",
+      "raw_size": 147456
+    }
+  ]
+}
