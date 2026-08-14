@@ -1,0 +1,230 @@
+            )
+            if not result.passed and crop is not None and getattr(crop, "size", 0):
+                attendance.save_rejected(crop, "pad", cfg)
+
+        strict_pad_evidence = bool(cfg.get("production_mode", False)) or pad_gate.required
+        if pad_results and not all(
+            result.passed and not (strict_pad_evidence and result.skipped)
+            for result in pad_results
+        ):
+            reasons = ",".join(
+                f"{result.face_index}:{result.reason or 'rejected'}"
+                for result in pad_results
+                if not result.passed or (strict_pad_evidence and result.skipped)
+            )
+            record_pad_only_decisions(
+                state,
+                claim,
+                event_id,
+                faces,
+                pad_results,
+                pad_gate,
+                cfg,
+                gallery,
+                log_type,
+                "pad_rejected",
+            )
+            retention = reject_file(path, "pad_rejected", cfg, dry_run=dry_run)
+            claim_finalized = finish_claim(
+                state,
+                claim,
+                event_id,
+                status="rejected",
+                error=f"pad:{reasons}"[:2000],
+                reason_code="pad_rejected",
+                event_updates={"retention_state": retention},
+            )
+            return False
+
+        known = gallery.refresh()
+        versions = event_versions(gallery, cfg)
+        pad_provider = next(
+            (result.provider for result in pad_results if result.provider),
+            getattr(pad_gate, "provider", ""),
+        )
+        pad_model = next(
+            (result.model for result in pad_results if result.model),
+            "",
+        )
+        if not dry_run:
+            transition_claim(
+                state,
+                claim,
+                event_id,
+                to_state="recognizing",
+                reason_code="recognition_started",
+                event_updates={
+                    **versions,
+                    "pad_provider": pad_provider or "",
+                    "pad_model": pad_model or "",
+                },
+            )
+
+        def persist_decision(decision):
+            if dry_run or not claim or not claim.accepted:
+                return None
+            index = int(decision["face_index"])
+            pad_result = pad_result_for_index(pad_results, index, pad_gate)
+            return state.record_recognition_decision(
+                event_id=event_id,
+                pad_passed=bool(pad_result.passed),
+                pad_skipped=bool(pad_result.skipped),
+                pad_score=pad_result.score,
+                pad_provider=pad_result.provider or "",
+                pad_model=pad_result.model or "",
+                pad_evidence_id=pad_result.evidence_id or "",
+                pad_binding_id=pad_result.binding_id or "",
+                policy_version=versions["policy_version"],
+                gallery_version=versions["gallery_version"],
+                gallery_generated_at=versions["gallery_generated_at"],
+                gallery_model=versions["gallery_model"],
+                gallery_model_version=versions["gallery_model_version"],
+                recognition_model=versions["recognition_model"],
+                recognition_model_version=versions["recognition_model_version"],
+                preprocessing_version=versions["preprocessing_version"],
+                **decision,
+            )
+
+        bound_app = BoundFaceApp(faces)
+        recognition_cfg = dict(cfg)
+        recognition_cfg["log_type"] = log_type
+        try:
+            created = attendance.process_image(
+                image,
+                f"ftp:{path.name} event={event_id[:12]} {source_label}",
+                bound_app,
+                known,
+                recognition_cfg,
+                dry_run,
+                attach_source=None,
+                decision_callback=persist_decision,
+            )
+            if bound_app.calls != 1:
+                raise RuntimeError("recognition did not consume the bound face set exactly once")
+        except Exception as exc:
+            retention = reject_file(
+                path, "processing_failed", cfg, dry_run=dry_run
+            )
+            claim_finalized = finish_claim(
+                state,
+                claim,
+                event_id,
+                status="failed",
+                error=str(exc),
+                reason_code="processing_failed",
+                event_updates={"retention_state": retention},
+            )
+            attendance.log(
+                f"ftp:{path.name}: processing failed event={event_id} "
+                f"{source_label}: {exc}"
+            )
+            return False
+
+        if not dry_run:
+            if bool(cfg.get("delete_camera_uploads_after_processing", True)):
+                remove_source(path, cfg)
+                retention = "deleted"
+            else:
+                retention = "retained"
+        else:
+            retention = "not_retained"
+        claim_finalized = finish_claim(
+            state,
+            claim,
+            event_id,
+            status="checkin_created" if created else "processed_no_checkin",
+            reason_code="checkin_created" if created else "processed_no_checkin",
+            event_updates={"retention_state": retention},
+        )
+        return bool(created)
+    except (FileNotFoundError, ValueError) as exc:
+        retention = reject_file(path, "invalid_upload", cfg, dry_run=dry_run)
+        if claim and claim.accepted and not claim_finalized:
+            claim_finalized = finish_claim(
+                state,
+                claim,
+                event_id,
+                status="failed",
+                error=f"invalid_upload:{exc}",
+                reason_code="invalid_upload",
+                event_updates={"retention_state": retention},
+            )
+        attendance.log(f"ftp:{path.name}: rejected before processing: {exc}")
+        return False
+    except Exception as exc:
+        if claim and claim.accepted and not claim_finalized:
+            finish_claim(
+                state,
+                claim,
+                event_id,
+                status="failed",
+                error=f"unexpected:{exc}",
+                reason_code="unexpected_error",
+            )
+        attendance.log(f"ftp:{path.name}: unexpected processing error: {exc}")
+        raise
+
+
+'''
+    replace_between(
+        "watch_service.py",
+        "def process_path(\n",
+        "def run(*, once=False, dry_run=False, allow_stale=False):\n",
+        process_function,
+    )
+
+
+def patch_tests_and_config():
+    replace_once(
+        "test_runtime_state.py",
+        'self.assertEqual(state.migration_status()["schema_version"], 1)',
+        'self.assertEqual(\n            state.migration_status()["schema_version"], RUNTIME_SCHEMA_VERSION\n        )',
+    )
+    replace_once(
+        "test_runtime_state.py",
+        'self.assertEqual(states[0].migration_status()["schema_version"], 1)',
+        'self.assertEqual(\n            states[0].migration_status()["schema_version"],\n            RUNTIME_SCHEMA_VERSION,\n        )',
+    )
+    replace_once(
+        "test_runtime_state.py",
+        '''        bad = Migration(
+            2,
+            "intentional_failure",
+''',
+        '''        bad = Migration(
+            RUNTIME_SCHEMA_VERSION + 1,
+            "intentional_failure",
+''',
+    )
+    watch_tests = read("test_watch_service.py")
+    marker = '\n\nif __name__ == "__main__":\n    unittest.main()\n'
+    if watch_tests.count(marker) != 1:
+        raise SystemExit("could not locate test_watch_service insertion marker")
+    addition = r'''
+    def test_upload_size_rejection_persists_receipt_before_policy(self):
+        self.cfg["max_camera_upload_bytes"] = 1
+        app = FakeApp([FakeFace()])
+        result = watch_service.process_path(
+            self.image_path,
+            app,
+            [],
+            StaticGallery([]),
+            self.cfg,
+            self.state,
+            self.pad_gate,
+            sources=self.sources,
+        )
+        self.assertFalse(result)
+        self.assertEqual(app.calls, 0)
+        event = self.state.get_event(self.event_id())
+        self.assertEqual(event["status"], "rejected")
+        self.assertEqual(event["reason_code"], "upload_too_large")
+        self.assertEqual(event["transitions"][0]["to_state"], "received")
+        self.assertEqual(
+            event["transitions"][-1]["reason_code"],
+            "upload_too_large",
+        )
+
+    def test_recognition_decision_persists_pad_gallery_model_and_policy(self):
+        self.cfg.update(
+            model="buffalo_l",
