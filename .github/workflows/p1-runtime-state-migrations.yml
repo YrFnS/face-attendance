@@ -25,6 +25,7 @@ jobs:
           python p1_apply_runtime_state.py
           python p1_fix_post_runtime_state.py
           python p1_post_runtime_state.py
+          python p1_backup_portability.py
       - name: Install test dependencies
         run: |
           python -m pip install --upgrade pip
@@ -78,6 +79,7 @@ jobs:
           bash -n deploy/firewall/ufw-rules.example.sh
           grep -F -- '- [x] `P1-01`' docs/attendance-platform-plan.md
           grep -F -- '- [x] `P1-02`' docs/attendance-platform-plan.md
+          grep -F -- 'copied together to encrypted off-host storage' docs/runtime-state-migrations.md
           git diff --check
       - name: Publish clean stacked branch
         env:
@@ -86,6 +88,7 @@ jobs:
         run: |
           rm -f p1_payload.part.* p1_apply_runtime_state.py
           rm -f p1_post_runtime_state.py p1_fix_post_runtime_state.py
+          rm -f p1_backup_portability.py
           rm -f .github/workflows/p1-runtime-state-migrations.yml
           git add -A
           git diff --cached --check
