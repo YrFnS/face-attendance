@@ -1,0 +1,135 @@
+name: Verify final P1 released schema fixture branch
+
+on:
+  push:
+    branches:
+      - agent/p1-idempotency-stage
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: write
+
+jobs:
+  verify-final-branch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      BASE_SHA: 73d039568f4afb0e71f7dd0577fa812971722b92
+      TARGET_BRANCH: agent/p1-released-schema-fixtures
+      PR_NUMBER: "22"
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v7.0.0
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Select final published tree
+        run: |
+          set -euo pipefail
+          sleep 100
+          git fetch origin \
+            "+refs/heads/$TARGET_BRANCH:refs/remotes/origin/$TARGET_BRANCH"
+          git checkout --detach "origin/$TARGET_BRANCH"
+          test "$(git rev-list --count "$BASE_SHA..HEAD")" -eq 1
+          git diff --name-only "$BASE_SHA..HEAD" | sort > /tmp/changed.txt
+          cat > /tmp/expected.txt <<'EOF'
+          README.md
+          docs/attendance-platform-plan.md
+          docs/released-schema-fixtures.md
+          docs/runtime-state-migrations.md
+          docs/versioned-event-ledger.md
+          test_runtime_schema_fixtures.py
+          test_runtime_state.py
+          tests/fixtures/README.md
+          tests/fixtures/manifest.json
+          tests/fixtures/runtime_state_v1.sqlite3.gz.b64
+          tests/fixtures/runtime_state_v2.sqlite3.gz.b64
+          tests/fixtures/runtime_state_v3.sqlite3.gz.b64
+          tests/fixtures/runtime_state_v4.sqlite3.gz.b64
+          EOF
+          sed -i 's/^          //' /tmp/expected.txt
+          sort -o /tmp/expected.txt /tmp/expected.txt
+          diff -u /tmp/expected.txt /tmp/changed.txt
+          grep -F -- \
+            'from test_runtime_schema_fixtures import ReleasedSchemaFixtureTests' \
+            test_runtime_state.py
+          ! grep -q 'p1-released-schema-fixtures' .github/workflows/tests.yml
+          git diff --check "$BASE_SHA..HEAD"
+      - name: Install test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install \
+            "flask>=3.0.3,<4" \
+            "gunicorn>=26.0.0,<27" \
+            "numpy>=1.26.4" \
+            "opencv-python-headless>=4.10.0,<5" \
+            "pyftpdlib[ssl]>=2.0.1,<3" \
+            "requests>=2.32.3,<3" \
+            "cryptography>=43,<48"
+      - name: Compile Python files
+        run: python -m py_compile *.py
+      - name: Run permanent repository matrix
+        run: |
+          set -o pipefail
+          python -m unittest -v \
+            test_embedding_gallery.py \
+            test_gallery_contract.py \
+            test_camera_sources.py \
+            test_ftp_receiver.py \
+            test_match_employee.py \
+            test_secure_sync.py \
+            test_gallery_release.py \
+            test_legacy_gallery_converter.py \
+            test_runtime_policy.py \
+            test_model_runtime.py \
+            test_runtime_state.py \
+            test_web_security.py \
+            test_web_admin.py \
+            test_model_manifest.py \
+            test_pad.py \
+            test_production_readiness.py \
+            test_watch_service.py \
+            test_canonical_watcher.py \
+            test_install_linux.py 2>&1 | tee /tmp/test-output.txt
+          grep -E '^Ran [0-9]+ tests? in ' /tmp/test-output.txt | tail -1 \
+            > /tmp/test-summary.txt
+      - name: Validate fixtures, docs, and migration CLI
+        run: |
+          python -m json.tool config.example.json >/dev/null
+          python -m json.tool tests/fixtures/manifest.json >/dev/null
+          bash -n install_linux.sh
+          bash -n deploy/firewall/ufw-rules.example.sh
+          grep -F -- '- [x] `P1-09`' docs/attendance-platform-plan.md
+          test -s docs/released-schema-fixtures.md
+          test "$(find tests/fixtures -name 'runtime_state_v*.sqlite3.gz.b64' | wc -l)" -eq 4
+      - name: Record validation on pull request
+        run: |
+          set -euo pipefail
+          head_sha=$(git rev-parse HEAD)
+          test_summary=$(cat /tmp/test-summary.txt)
+          body=$(cat <<EOF
+          Final released-schema fixture validation passed.
+
+          - base: \`$BASE_SHA\` from PR #21
+          - head: \`$head_sha\`
+          - history: exactly one commit above the base
+          - scope: exactly 13 intended files; no staging workflows or workflow-file changes
+          - Python compilation: passed
+          - permanent repository matrix: **$test_summary**
+          - frozen schemas: versions 1, 2, 3, and 4 decoded and digest-verified
+          - migrations: every fixture reached schema 5 through the production runner
+          - backups: each migration produced a verified pre-migration SQLite backup and metadata sidecar
+          - compatibility: historical event identity and compatibility fields remained readable and unchanged
+          - retention: the migrated schema-v4 event pruned to an immutable replay tombstone and remained blocked on replay
+          - JSON, Linux installer, firewall template, plan marker, fixture count, and whitespace checks: passed
+
+          PR #22 completes \`P1-09\`; together with PR #21, Phase 1 items \`P1-01\` through \`P1-11\` are implemented in the stack.
+          EOF
+          )
+          gh api \
+            "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments" \
+            -f body="$body" >/dev/null
