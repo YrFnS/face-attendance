@@ -148,9 +148,37 @@ class ProductionReadinessTests(unittest.TestCase):
             "ftp_tls_data_required": True,
             "ftp_staging_enabled": True,
             "ftp_permissions": "elw",
-            "camera_ids": {
-                "in": "camera-in",
-                "out": "camera-out",
+            "camera_uploads_dir": str(self.root / "camera_uploads"),
+            "camera_source_receipt_required": True,
+            "camera_source_receipt_secret": "receipt-secret-" + "x" * 32,
+            "camera_source_receipt_future_tolerance_seconds": 300,
+            "ftp_users": {
+                "camera_in": {
+                    ("pass" + "word"): "camera-in-unique-value",
+                    "permissions": "elw",
+                },
+                "camera_out": {
+                    ("pass" + "word"): "camera-out-unique-value",
+                    "permissions": "elw",
+                },
+            },
+            "camera_sources": {
+                "camera-in": {
+                    "source_type": "holowits_ftp",
+                    "branch": "Baghdad",
+                    "policy": "IN",
+                    "ftp_username": "camera_in",
+                    "upload_dir": str(self.root / "camera_uploads" / "in"),
+                    "allowed_networks": ["192.0.2.10/32"],
+                },
+                "camera-out": {
+                    "source_type": "holowits_ftp",
+                    "branch": "Baghdad",
+                    "policy": "OUT",
+                    "ftp_username": "camera_out",
+                    "upload_dir": str(self.root / "camera_uploads" / "out"),
+                    "allowed_networks": ["192.0.2.11/32"],
+                },
             },
         }
 
@@ -321,6 +349,15 @@ class ProductionReadinessTests(unittest.TestCase):
         self.assertIn("model_license_not_acknowledged", codes)
         self.assertIn("pad_not_required", codes)
         self.assertIn("pad_provider_disabled", codes)
+
+    def test_missing_camera_source_binding_is_blocked(self):
+        cfg = self.valid_config()
+        cfg.pop("camera_sources")
+        report = self.report(cfg, verify_model_files=False)
+        self.assertIn(
+            "camera_source_binding_invalid",
+            {issue.code for issue in report.blockers},
+        )
 
     def test_plain_ftp_requires_isolation_ack(self):
         cfg = self.valid_config()

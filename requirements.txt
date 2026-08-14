@@ -5,5 +5,5 @@ numpy>=1.26.4
 cryptography>=43,<48
 flask>=3.0.3,<4
 gunicorn>=26.0.0,<27
-pyftpdlib>=2.0.1,<3
+pyftpdlib[ssl]>=2.0.1,<3
 requests>=2.32.3,<3

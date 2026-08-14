@@ -28,7 +28,7 @@ jobs:
             "gunicorn>=26.0.0,<27" \
             "numpy>=1.26.4" \
             "opencv-python-headless>=4.10.0,<5" \
-            "pyftpdlib>=2.0.1,<3" \
+            "pyftpdlib[ssl]>=2.0.1,<3" \
             "requests>=2.32.3,<3" \
             "cryptography>=43,<48"
       - name: Compile Python files
@@ -38,6 +38,8 @@ jobs:
           python -m unittest -v \
             test_embedding_gallery.py \
             test_gallery_contract.py \
+            test_camera_sources.py \
+            test_ftp_receiver.py \
             test_match_employee.py \
             test_secure_sync.py \
             test_gallery_release.py \
