@@ -1,0 +1,26 @@
+name: Export Phase 2 worker source
+
+on:
+  push:
+    branches:
+      - agent/p2-worker-source-export
+
+permissions:
+  contents: read
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          fetch-depth: 0
+      - name: Create source archive
+        run: |
+          git archive --format=tar.gz --output=face-attendance-p2-source.tar.gz HEAD
+      - uses: actions/upload-artifact@v4
+        with:
+          name: face-attendance-p2-source
+          path: face-attendance-p2-source.tar.gz
+          if-no-files-found: error
+          retention-days: 1
