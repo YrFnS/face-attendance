@@ -1,0 +1,98 @@
+name: Validate Phase 2 lease-boundary review fix
+
+on:
+  push:
+    branches:
+      - agent/p2-delivery-outbox-review-fix-stage
+
+permissions:
+  contents: write
+
+jobs:
+  validate-and-publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v7.0.0
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Apply reviewed lease-boundary fix
+        run: python p2_apply_review_fix.py
+      - name: Install test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install \
+            "flask>=3.0.3,<4" \
+            "gunicorn>=26.0.0,<27" \
+            "numpy>=1.26.4" \
+            "opencv-python-headless>=4.10.0,<5" \
+            "pyftpdlib[ssl]>=2.0.1,<3" \
+            "requests>=2.32.3,<3" \
+            "cryptography>=43,<48"
+      - name: Compile Python files
+        run: python -m py_compile *.py
+      - name: Run complete repository suite
+        run: |
+          python -m unittest -v \
+            test_embedding_gallery.py \
+            test_gallery_contract.py \
+            test_camera_sources.py \
+            test_ftp_receiver.py \
+            test_match_employee.py \
+            test_secure_sync.py \
+            test_gallery_release.py \
+            test_legacy_gallery_converter.py \
+            test_runtime_policy.py \
+            test_model_runtime.py \
+            test_runtime_state.py \
+            test_event_ledger.py \
+            test_event_operations.py \
+            test_processing_recovery.py \
+            test_event_identity.py \
+            test_event_tombstones.py \
+            test_runtime_schema_fixtures.py \
+            test_erpnext_adapter.py \
+            test_delivery_outbox.py \
+            test_h0_credential_auth.py \
+            test_web_security.py \
+            test_web_admin.py \
+            test_model_manifest.py \
+            test_pad.py \
+            test_production_readiness.py \
+            test_watch_service.py \
+            test_canonical_watcher.py \
+            test_install_linux.py
+      - name: Validate configuration and templates
+        run: |
+          python -m json.tool config.example.json >/dev/null
+          python -m json.tool tests/fixtures/manifest.json >/dev/null
+          bash -n install_linux.sh
+          bash -n deploy/firewall/ufw-rules.example.sh
+          git diff --check
+      - name: Publish code-only reviewed branch
+        env:
+          BASE_SHA: 1ddb0eb83f0e56ff447b02574985f80d711522c9
+          TARGET_BRANCH: agent/p2-delivery-outbox-review-fix-build
+        run: |
+          git read-tree "$BASE_SHA"
+          git add processing_recovery.py test_delivery_outbox.py
+          git diff --cached "$BASE_SHA" --check
+          git diff --cached "$BASE_SHA" --name-only | sort > /tmp/changed.txt
+          cat > /tmp/expected.txt <<'EOF'
+          processing_recovery.py
+          test_delivery_outbox.py
+          EOF
+          sort -o /tmp/expected.txt /tmp/expected.txt
+          diff -u /tmp/expected.txt /tmp/changed.txt
+          tree=$(git write-tree)
+          export GIT_AUTHOR_NAME='github-actions[bot]'
+          export GIT_AUTHOR_EMAIL='41898282+github-actions[bot]@users.noreply.github.com'
+          export GIT_COMMITTER_NAME="$GIT_AUTHOR_NAME"
+          export GIT_COMMITTER_EMAIL="$GIT_AUTHOR_EMAIL"
+          commit=$(printf '%s\n' 'reject delivery at exact lease expiry' \
+            | git commit-tree "$tree" -p "$BASE_SHA")
+          git push --force origin "$commit:refs/heads/$TARGET_BRANCH"
