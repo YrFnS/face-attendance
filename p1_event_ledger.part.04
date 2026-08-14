@@ -1,0 +1,200 @@
+        if pad_score is not None:
+            pad_score = _finite(pad_score, "pad_score", minimum=0, maximum=1)
+        reason_code = _enum(reason_code, "reason_code", EVENT_REASON_CODES)
+        retention_state = _enum(
+            retention_state, "retention_state", RETENTION_STATES
+        )
+        candidate_log_type = _text(
+            candidate_log_type, "candidate_log_type", max_chars=16
+        )
+        if candidate_log_type and candidate_log_type not in {"IN", "OUT"}:
+            raise EventLedgerValidationError(
+                "candidate_log_type must be empty, IN, or OUT"
+            )
+        decision_id = make_recognition_decision_id(
+            event_id, face_index, decision_version
+        )
+        created_at = utc_now()
+        values = (
+            decision_id,
+            event_id,
+            decision_version,
+            face_index,
+            face_count,
+            *bbox_values,
+            _finite(face_width, "face_width", minimum=0),
+            _finite(face_height, "face_height", minimum=0),
+            _finite(detection_score, "detection_score", minimum=0, maximum=1),
+            _text(best_employee, "best_employee", max_chars=180),
+            _finite(best_score, "best_score", minimum=-1, maximum=1),
+            _finite(runner_up_score, "runner_up_score", minimum=-1, maximum=1),
+            _finite(score_margin, "score_margin", minimum=-2, maximum=2),
+            int(pad_passed),
+            int(pad_skipped),
+            pad_score,
+            _text(pad_provider, "pad_provider", max_chars=128),
+            _text(pad_model, "pad_model", max_chars=128),
+            _text(pad_evidence_id, "pad_evidence_id", max_chars=512),
+            _text(pad_binding_id, "pad_binding_id", max_chars=128),
+            int(accepted),
+            reason_code,
+            candidate_log_type,
+            _text(policy_version, "policy_version", max_chars=128),
+            _text(gallery_version, "gallery_version", max_chars=128),
+            _timestamp(
+                gallery_generated_at, "gallery_generated_at", required=False
+            ),
+            _text(gallery_model, "gallery_model", max_chars=128),
+            _text(
+                gallery_model_version, "gallery_model_version", max_chars=128
+            ),
+            _text(recognition_model, "recognition_model", max_chars=128),
+            _text(
+                recognition_model_version,
+                "recognition_model_version",
+                max_chars=128,
+            ),
+            _text(preprocessing_version, "preprocessing_version", max_chars=128),
+            retention_state,
+            created_at,
+        )
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            if connection.execute(
+                "SELECT 1 FROM camera_events WHERE event_id = ?", (event_id,)
+            ).fetchone() is None:
+                raise EventLedgerValidationError(f"event does not exist: {event_id}")
+            connection.execute(
+                """
+                INSERT INTO recognition_decisions (
+                    decision_id, event_id, decision_version, face_index, face_count,
+                    bbox_x1, bbox_y1, bbox_x2, bbox_y2, face_width, face_height,
+                    detection_score, best_employee, best_score, runner_up_score,
+                    score_margin, pad_passed, pad_skipped, pad_score, pad_provider,
+                    pad_model, pad_evidence_id, pad_binding_id, accepted, reason_code,
+                    candidate_log_type, policy_version, gallery_version,
+                    gallery_generated_at, gallery_model, gallery_model_version,
+                    recognition_model, recognition_model_version,
+                    preprocessing_version, retention_state, created_at
+                ) VALUES (
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                )
+                """,
+                values,
+            )
+            connection.commit()
+            return decision_id
+        except sqlite3.IntegrityError as exc:
+            connection.rollback()
+            raise EventLedgerValidationError(
+                f"recognition decision already exists or is invalid: {decision_id}"
+            ) from exc
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def record_operator_action(
+        self,
+        *,
+        event_id,
+        actor,
+        action,
+        reason_code="operator_action",
+        detail=None,
+    ):
+        event_id = _identifier(event_id, "event_id")
+        actor = _text(actor, "actor", required=True, max_chars=256)
+        action = _text(action, "action", required=True, max_chars=128)
+        reason_code = _enum(reason_code, "reason_code", EVENT_REASON_CODES)
+        detail_json = _json_text(detail, "operator action detail")
+        created_at = utc_now()
+        action_id = hashlib.sha256(
+            "\0".join((event_id, actor, action, reason_code, created_at)).encode(
+                "utf-8"
+            )
+        ).hexdigest()
+        connection = self._connect()
+        try:
+            connection.execute(
+                """
+                INSERT INTO operator_actions (
+                    action_id, event_id, actor, action, reason_code,
+                    detail_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    action_id,
+                    event_id,
+                    actor,
+                    action,
+                    reason_code,
+                    detail_json,
+                    created_at,
+                ),
+            )
+            connection.commit()
+            return action_id
+        finally:
+            connection.close()
+
+    def event_details(self, event_id, *, include_history=True):
+        event_id = _identifier(event_id, "event_id")
+        connection = self._connect()
+        try:
+            row = connection.execute(
+                "SELECT * FROM camera_events WHERE event_id = ?", (event_id,)
+            ).fetchone()
+            if row is None:
+                return None
+            result = dict(row)
+            result["receipt"] = _parse_json_column(result, "receipt_json")
+            if not include_history:
+                return result
+            transitions = [
+                dict(item)
+                for item in connection.execute(
+                    """
+                    SELECT sequence, from_state, to_state, reason_code,
+                           actor_type, actor_id, detail_json, created_at
+                    FROM event_transitions
+                    WHERE event_id = ? ORDER BY sequence
+                    """,
+                    (event_id,),
+                ).fetchall()
+            ]
+            for item in transitions:
+                item["detail"] = _parse_json_column(item, "detail_json")
+            decisions = [
+                dict(item)
+                for item in connection.execute(
+                    """
+                    SELECT * FROM recognition_decisions
+                    WHERE event_id = ? ORDER BY face_index, decision_version
+                    """,
+                    (event_id,),
+                ).fetchall()
+            ]
+            actions = [
+                dict(item)
+                for item in connection.execute(
+                    """
+                    SELECT action_id, actor, action, reason_code,
+                           detail_json, created_at
+                    FROM operator_actions
+                    WHERE event_id = ? ORDER BY created_at, action_id
+                    """,
+                    (event_id,),
+                ).fetchall()
+            ]
+            for item in actions:
+                item["detail"] = _parse_json_column(item, "detail_json")
+            result["transitions"] = transitions
+            result["decisions"] = decisions
+            result["operator_actions"] = actions
+            return result
+        finally:
+            connection.close()
