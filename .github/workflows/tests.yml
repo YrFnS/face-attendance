@@ -53,6 +53,8 @@ jobs:
             test_event_identity.py \
             test_event_tombstones.py \
             test_runtime_schema_fixtures.py \
+            test_erpnext_adapter.py \
+            test_delivery_outbox.py \
             test_h0_credential_auth.py \
             test_web_security.py \
             test_web_admin.py \

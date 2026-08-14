@@ -34,6 +34,8 @@ The camera still sends an image because it cannot send an InsightFace embedding.
 
 - `face_attendance.py` — recognition/check-in helpers and legacy diagnostic commands that refuse live processing.
 - `watch_service.py` — production FTP watcher with readiness, PAD, replay protection, and event state.
+- `erpnext_adapter.py` — explicit, independently tested REST and local-bench Employee Checkin transports.
+- `delivery_outbox.py` — schema-v6 transactional delivery jobs created with accepted recognition decisions.
 - `embedding_gallery.py` — validates, normalizes, stores, and reloads galleries.
 - `secure_sync.py` — authoritative bounded gallery-sync client with authenticated, same-origin redirect validation.
 - `sync_embeddings.py` — manual or continuous gallery synchronization.

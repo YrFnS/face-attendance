@@ -9,6 +9,13 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
+from delivery_outbox import (
+    DELIVERY_OUTBOX_REQUIRED_INDEXES,
+    DELIVERY_OUTBOX_REQUIRED_TABLE_COLUMNS,
+    DELIVERY_OUTBOX_REQUIRED_TRIGGERS,
+    DELIVERY_OUTBOX_SCHEMA_STATEMENTS,
+    DeliveryOutboxMixin,
+)
 from event_identity import (
     IDENTITY_REQUIRED_INDEXES,
     IDENTITY_REQUIRED_TABLE_COLUMNS,
@@ -39,7 +46,7 @@ from processing_recovery import (
 )
 
 
-RUNTIME_SCHEMA_VERSION = 5
+RUNTIME_SCHEMA_VERSION = 6
 MIGRATION_TABLE = "schema_migrations"
 DEFAULT_BACKUP_DIRECTORY = "runtime_state_backups"
 
@@ -191,6 +198,11 @@ MIGRATIONS = (
         5,
         "idempotency_tombstones_and_identifier_schemes",
         IDENTITY_SCHEMA_STATEMENTS,
+    ),
+    Migration(
+        6,
+        "transactional_erpnext_delivery_outbox",
+        DELIVERY_OUTBOX_SCHEMA_STATEMENTS,
     ),
 )
 MIGRATION_BY_VERSION = {migration.version: migration for migration in MIGRATIONS}
@@ -383,6 +395,11 @@ def _required_schema_errors(connection, version=None):
             table_requirements.setdefault(table, {}).update(columns)
         index_requirements.update(IDENTITY_REQUIRED_INDEXES)
         trigger_requirements.update(IDENTITY_REQUIRED_TRIGGERS)
+    if version >= 6:
+        for table, columns in DELIVERY_OUTBOX_REQUIRED_TABLE_COLUMNS.items():
+            table_requirements.setdefault(table, {}).update(columns)
+        index_requirements.update(DELIVERY_OUTBOX_REQUIRED_INDEXES)
+        trigger_requirements.update(DELIVERY_OUTBOX_REQUIRED_TRIGGERS)
 
     errors = []
     for table, required in table_requirements.items():
@@ -831,7 +848,12 @@ def restore_runtime_backup(
             pass
 
 
-class RuntimeState(EventOperationsMixin, ProcessingRecoveryMixin, EventLedgerMixin):
+class RuntimeState(
+    DeliveryOutboxMixin,
+    EventOperationsMixin,
+    ProcessingRecoveryMixin,
+    EventLedgerMixin,
+):
     def __init__(self, path, backup_dir=None):
         self.path = Path(path)
         self.backup_dir = _backup_directory(self.path, backup_dir)
@@ -1052,6 +1074,14 @@ class RuntimeState(EventOperationsMixin, ProcessingRecoveryMixin, EventLedgerMix
                       'processed', 'checkin_created', 'rejected', 'failed', 'dismissed'
                   )
                   AND retention_state <> 'quarantined'
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM delivery_jobs j
+                      WHERE j.event_id = camera_events.event_id
+                        AND j.state NOT IN (
+                            'delivered', 'permanent_failure', 'cancelled'
+                        )
+                  )
                 ORDER BY created_unix, event_id
                 """,
                 (cutoff,),
