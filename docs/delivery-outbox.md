@@ -158,3 +158,11 @@ exponential backoff, jitter, retry budgets, and queue/disk safeguards.
 `P2-04` must add the ERPNext-side atomic idempotency dependency keyed by
 `face_attendance_delivery_id`. Until that server-enforced dependency exists, the
 system must not claim exactly-once delivery.
+
+## P2-03 leased worker
+
+Schema version 7 adds `submission_started_at` and retry-delay evidence. The
+single-node worker claims due jobs atomically, renews its lease during ERPNext
+calls, retries only provably safe failures, and marks ambiguous post-submission
+outcomes `uncertain`. Full configuration and operations are documented in
+`docs/delivery-worker.md`.

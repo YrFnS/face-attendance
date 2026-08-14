@@ -68,11 +68,14 @@ write_service_override \
   face-attendance-web.service \
   "\"$APP_DIR/.venv/bin/gunicorn\" --config \"$APP_DIR/gunicorn.conf.py\" web_admin:app"
 write_service_override \
+  face-attendance-delivery.service \
+  "\"$APP_DIR/.venv/bin/python\" -u \"$APP_DIR/delivery_service.py\""
+write_service_override \
   face-attendance-sync.service \
   "\"$APP_DIR/.venv/bin/python\" -u \"$APP_DIR/sync_embeddings.py\" --scheduled"
 
 sudo systemctl daemon-reload
-sudo systemctl enable face-attendance-ftp face-attendance-watch face-attendance-web
+sudo systemctl enable face-attendance-ftp face-attendance-watch face-attendance-web face-attendance-delivery
 sudo systemctl enable --now face-attendance-sync.timer
 
 # FTP collection and the locked admin UI are safe to start before enrollment is ready.
@@ -84,6 +87,14 @@ if [ -s "$APP_DIR/embedding_gallery.json" ]; then
 else
   sudo systemctl stop face-attendance-watch 2>/dev/null || true
   echo "Watcher left stopped: configure and sync a valid embedding_gallery.json first; a legacy pickle does not enable live processing."
+fi
+
+DELIVERY_WORKER_ENABLED="$(sudo -u "$SERVICE_USER" "$APP_DIR/.venv/bin/python" -c 'import json,sys; cfg=json.load(open(sys.argv[1], encoding="utf-8")); mode=str(cfg.get("delivery_mode") or "synchronous").strip().lower(); print("1" if mode in {"worker", "outbox"} and cfg.get("delivery_worker_enabled") is True else "0")' "$APP_DIR/config.json")"
+if [ "$DELIVERY_WORKER_ENABLED" = "1" ]; then
+  sudo systemctl restart face-attendance-delivery
+else
+  sudo systemctl stop face-attendance-delivery 2>/dev/null || true
+  echo "Delivery worker left stopped: set delivery_mode=worker and delivery_worker_enabled=true for staging after disabling crop attachment."
 fi
 
 if [ "$SERVICE_USER" = "root" ]; then
@@ -101,4 +112,6 @@ echo "5. Configure and validate the PAD/liveness service."
 echo "6. Sync embeddings: sudo -u $SERVICE_USER $APP_DIR/.venv/bin/python $APP_DIR/sync_embeddings.py"
 echo "7. Run readiness checks: sudo -u $SERVICE_USER $APP_DIR/.venv/bin/python $APP_DIR/production_readiness.py --strict"
 echo "8. Validate old samples safely: sudo -u $SERVICE_USER $APP_DIR/.venv/bin/python $APP_DIR/watch_service.py --once --dry-run --allow-stale"
-echo "9. After controlled validation, set production_mode=true and start face-attendance-watch."
+echo "9. Validate the worker in non-production with delivery_mode=worker, delivery_worker_enabled=true, and attach_checkin_crop=false."
+echo "10. Do not enable production worker delivery until ERPNext atomic delivery-id idempotency from P2-04 is verified."
+echo "11. After controlled validation, set production_mode=true and start face-attendance-watch."

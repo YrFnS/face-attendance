@@ -832,6 +832,20 @@ class ProcessingRecoveryMixin:
                 transport=transport,
                 now=now,
             )
+            delivery_cursor = connection.execute(
+                """
+                UPDATE delivery_jobs
+                SET submission_started_at = ?, lease_heartbeat_at = ?,
+                    updated_at = ?
+                WHERE decision_id = ? AND state = 'leased'
+                  AND lease_owner = ?
+                """,
+                (stamp, stamp, stamp, decision_id, owner),
+            )
+            if delivery_cursor.rowcount != 1:
+                raise ProcessingLeaseError(
+                    "delivery job submission boundary could not be recorded"
+                )
             self._transition_tx(
                 connection,
                 row,
@@ -1110,6 +1124,108 @@ class ProcessingRecoveryMixin:
                             existing_event_id=row["reservation_event_id"],
                             existing_decision_id=row["reservation_decision_id"],
                         )
+                    reserved_event = connection.execute(
+                        """
+                        SELECT lifecycle_state, processing_phase,
+                               delivery_started_at, lease_expires_unix
+                        FROM camera_events WHERE event_id = ?
+                        """,
+                        (row["reservation_event_id"],),
+                    ).fetchone()
+                    if (
+                        reserved_event is not None
+                        and reserved_event["lifecycle_state"]
+                        not in TERMINAL_EVENT_STATES
+                        and (
+                            reserved_event["processing_phase"]
+                            == "delivery_in_progress"
+                            or bool(reserved_event["delivery_started_at"])
+                        )
+                    ):
+                        connection.execute(
+                            """
+                            UPDATE attendance_policy_state
+                            SET reservation_state = 'uncertain',
+                                reservation_expires_unix = 0,
+                                updated_at = ?
+                            WHERE scope_key = ?
+                              AND reservation_state = 'pending'
+                            """,
+                            (utc_now(), scope_key),
+                        )
+                        connection.commit()
+                        return PolicyReservation(
+                            False,
+                            scope_key,
+                            "uncertain_reservation",
+                            existing_event_id=row["reservation_event_id"],
+                            existing_decision_id=row["reservation_decision_id"],
+                        )
+                    reserved_job = connection.execute(
+                        """
+                        SELECT state, next_attempt_unix, lease_expires_unix
+                        FROM delivery_jobs WHERE decision_id = ?
+                        """,
+                        (row["reservation_decision_id"],),
+                    ).fetchone()
+                    if reserved_job is not None:
+                        job_state = reserved_job["state"]
+                        if job_state in {"pending", "retry_wait", "leased"}:
+                            active_until = max(
+                                float(reserved_job["next_attempt_unix"] or 0),
+                                float(reserved_job["lease_expires_unix"] or 0),
+                                now + 1,
+                            )
+                            connection.rollback()
+                            return PolicyReservation(
+                                False,
+                                scope_key,
+                                "reservation_active",
+                                remaining_seconds=max(1, int(active_until - now)),
+                                existing_event_id=row["reservation_event_id"],
+                                existing_decision_id=row["reservation_decision_id"],
+                            )
+                        if job_state in {"uncertain", "delivered"}:
+                            connection.execute(
+                                """
+                                UPDATE attendance_policy_state
+                                SET reservation_state = 'uncertain',
+                                    reservation_expires_unix = 0,
+                                    updated_at = ?
+                                WHERE scope_key = ?
+                                  AND reservation_state = 'pending'
+                                """,
+                                (utc_now(), scope_key),
+                            )
+                            connection.commit()
+                            return PolicyReservation(
+                                False,
+                                scope_key,
+                                "uncertain_reservation",
+                                existing_event_id=row["reservation_event_id"],
+                                existing_decision_id=row["reservation_decision_id"],
+                            )
+                        if job_state in {"permanent_failure", "cancelled"}:
+                            connection.execute(
+                                """
+                                UPDATE attendance_policy_state
+                                SET reservation_event_id = '',
+                                    reservation_decision_id = '',
+                                    reservation_effective_at = '',
+                                    reservation_effective_unix = 0,
+                                    reservation_state = 'none',
+                                    reservation_expires_unix = 0,
+                                    updated_at = ?
+                                WHERE scope_key = ?
+                                  AND reservation_state = 'pending'
+                                """,
+                                (utc_now(), scope_key),
+                            )
+                            row = connection.execute(
+                                "SELECT * FROM attendance_policy_state "
+                                "WHERE scope_key = ?",
+                                (scope_key,),
+                            ).fetchone()
                     reserved_event = connection.execute(
                         """
                         SELECT lifecycle_state, processing_phase,
