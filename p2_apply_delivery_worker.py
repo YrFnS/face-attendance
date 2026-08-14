@@ -11,3 +11,5 @@ if [part.name for part in parts] != [
 payload = "".join(part.read_text(encoding="ascii") for part in parts)
 source = gzip.decompress(base64.b64decode(payload, validate=True))
 exec(compile(source, "p2_apply_delivery_worker_impl.py", "exec"))
+fix = root / ".p2" / "worker_apply_fix.py"
+exec(compile(fix.read_bytes(), str(fix), "exec"))
