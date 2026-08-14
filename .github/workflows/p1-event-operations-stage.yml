@@ -22,7 +22,10 @@ jobs:
           cache: pip
       - name: Apply reviewed P1 operator patch
         run: |
-          base64 --decode p1_event_operations.patch.gz.b64 | gzip --decompress > /tmp/p1-event-operations.patch
+          cat p1_event_operations.patch.gz.b64.part.* \
+            | base64 --decode \
+            | gzip --decompress \
+            > /tmp/p1-event-operations.patch
           echo "470fb1f5e0cb5741bd6fafe6af3f56983c2c6a057d39593985c4614c3b3991b2  /tmp/p1-event-operations.patch" | sha256sum --check
           git apply --whitespace=error-all /tmp/p1-event-operations.patch
       - name: Install test dependencies
@@ -119,6 +122,7 @@ jobs:
           TARGET_BRANCH: agent/p1-event-operations
         run: |
           rm -f p1_event_operations.patch.gz.b64
+          rm -f p1_event_operations.patch.gz.b64.part.*
           rm -f .github/workflows/p1-event-operations-stage.yml
           git add -A
           git diff --cached --check
