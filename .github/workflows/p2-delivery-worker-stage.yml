@@ -22,6 +22,19 @@ jobs:
           cache: pip
       - name: Apply P2-03 delivery worker integration
         run: python p2_apply_delivery_worker.py
+      - name: Archive generated source
+        run: |
+          tar \
+            --exclude=.git \
+            --exclude=.p2 \
+            --exclude=.github/workflows/p2-delivery-worker-stage.yml \
+            --exclude=p2_apply_delivery_worker.py \
+            -czf /tmp/p2-delivery-worker-source.tgz .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: p2-delivery-worker-source
+          path: /tmp/p2-delivery-worker-source.tgz
+          retention-days: 1
       - name: Install test dependencies
         run: |
           python -m pip install --upgrade pip
