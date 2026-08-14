@@ -63,6 +63,25 @@ def patch_tests():
     )
 
 
+def patch_time_sensitive_sync_fixture():
+    replace_once(
+        "test_secure_sync.py",
+        "        self.private = Ed25519PrivateKey.generate()\n",
+        "        self.release_base_time = (\n"
+        "            datetime.now(timezone.utc).replace(microsecond=0)\n"
+        "            - timedelta(minutes=10)\n"
+        "        )\n"
+        "        self.private = Ed25519PrivateKey.generate()\n",
+    )
+    replace_once(
+        "test_secure_sync.py",
+        "            generated_at=f\"2026-08-13T12:{sequence:02d}:00Z\",\n",
+        "            generated_at=(\n"
+        "                self.release_base_time + timedelta(minutes=sequence)\n"
+        "            ).isoformat().replace(\"+00:00\", \"Z\"),\n",
+    )
+
+
 def patch_plan():
     replace_once(
         "docs/attendance-platform-plan.md",
@@ -117,6 +136,7 @@ def main():
     assemble_event_operations()
     patch_runtime_state()
     patch_tests()
+    patch_time_sensitive_sync_fixture()
     patch_plan()
     patch_readme()
     patch_lease_runbook()
