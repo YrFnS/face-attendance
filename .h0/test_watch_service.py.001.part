@@ -1,0 +1,66 @@
+H0-09 fragment test_watch_service.py 2/3
+            "delete_rejected_camera_uploads": False,
+            "delete_camera_uploads_after_processing": False,
+            "delete_duplicate_camera_uploads": False,
+            "pad_require_single_face": True,
+        }
+        self.sources = load_camera_sources(self.cfg, self.root)
+        self.write_receipt()
+        self.pad_gate = PADGate({"pad_provider": "disabled", "pad_required": False, "pad_fail_closed": True})
+        self.original_process_image = attendance.process_image
+
+    def tearDown(self):
+        attendance.process_image = self.original_process_image
+        self.temp.cleanup()
+
+    def write_receipt(self):
+        digest, size = file_sha256(self.image_path)
+        source = source_by_username(self.sources, "camera_in")
+        write_source_receipt(self.image_path, source, self.cfg, remote_ip="192.0.2.10", source_sha256=digest, source_size=size)
+
+    def event_id(self):
+        digest, _ = file_sha256(self.image_path)
+        return make_event_id("camera-in", "IN", digest)
+
+    def test_missing_receipt_is_claimed_and_rejected_before_recognition(self):
+        receipt_path(self.image_path).unlink()
+        app = FakeApp([FakeFace()])
+        result = watch_service.process_path(self.image_path, app, [], StaticGallery([]), self.cfg, self.state, self.pad_gate, sources=self.sources)
+        self.assertFalse(result)
+        self.assertEqual(app.calls, 0)
+        event = self.state.get_event(self.event_id())
+        self.assertEqual(event["status"], "rejected")
+        self.assertIn("source_binding", event["error"])
+        self.assertIn("receipt is missing", event["error"])
+
+    def test_tampered_receipt_is_rejected_before_pad_or_recognition(self):
+        data = json.loads(receipt_path(self.image_path).read_text(encoding="utf-8"))
+        data["ftp_username"] = "other-camera"
+        receipt_path(self.image_path).write_text(json.dumps(data), encoding="utf-8")
+        app = FakeApp([FakeFace()])
+        pad = PassingPAD()
+        result = watch_service.process_path(self.image_path, app, [], StaticGallery([]), self.cfg, self.state, pad, sources=self.sources)
+        self.assertFalse(result)
+        self.assertEqual(app.calls, 0)
+        self.assertEqual(pad.calls, [])
+        event = self.state.get_event(self.event_id())
+        self.assertEqual(event["status"], "rejected")
+        self.assertIn("ftp_username", event["error"])
+
+    def test_handled_error_after_claim_is_finalized(self):
+        result = watch_service.process_path(self.image_path, FakeApp([FakeFace()]), [], StaticGallery(error=ValueError("invalid gallery")), self.cfg, self.state, self.pad_gate, sources=self.sources)
+        self.assertFalse(result)
+        event = self.state.get_event(self.event_id())
+        self.assertEqual(event["status"], "failed")
+        self.assertIn("invalid gallery", event["error"])
+        self.assertIsNotNone(event["completed_at"])
+
+    def test_unexpected_error_after_claim_is_finalized_before_reraise(self):
+        with self.assertRaisesRegex(RuntimeError, "gallery offline"):
+            watch_service.process_path(self.image_path, FakeApp([FakeFace()]), [], StaticGallery(error=RuntimeError("gallery offline")), self.cfg, self.state, self.pad_gate, sources=self.sources)
+        event = self.state.get_event(self.event_id())
+        self.assertEqual(event["status"], "failed")
+        self.assertIn("gallery offline", event["error"])
+        self.assertIsNotNone(event["completed_at"])
+
+    def test_multiple_faces_are_rejected_before_pad_or_recognition(self):
