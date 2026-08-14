@@ -1,0 +1,230 @@
+                receipt_verified=False,
+                receipt_detail={
+                    "receipt_file": receipt_path(path).name,
+                    "receipt_present": receipt_path(path).exists(),
+                    "upload_route": camera_source.upload_route,
+                },
+                policy_version=str(
+                    cfg.get("attendance_policy_version") or "directional-v1"
+                ),
+            )
+            if not claim.accepted:
+                attendance.log(
+                    f"ftp:{path.name}: replay skipped event={claim.event_id} "
+                    f"camera={camera_id} policy={log_type} "
+                    f"status={claim.existing_status}"
+                )
+                if (
+                    bool(cfg.get("delete_camera_uploads_after_processing", True))
+                    and bool(cfg.get("delete_duplicate_camera_uploads", True))
+                ):
+                    remove_source(path, cfg)
+                return False
+
+        max_bytes = int(cfg.get("max_camera_upload_bytes", 20 * 1024 * 1024))
+        if max_bytes and source_size > max_bytes:
+            retention = reject_file(path, "upload_too_large", cfg, dry_run=dry_run)
+            claim_finalized = finish_claim(
+                state,
+                claim,
+                event_id,
+                status="rejected",
+                error="upload_too_large",
+                reason_code="upload_too_large",
+                event_updates={"retention_state": retention},
+            )
+            return False
+
+        try:
+            verified_source, source_receipt = verify_source_receipt(
+                path,
+                cfg,
+                ROOT,
+                source_sha256=source_sha256,
+                source_size=source_size,
+                sources=sources,
+            )
+        except CameraSourceError as exc:
+            retention = reject_file(
+                path, "source_binding_invalid", cfg, dry_run=dry_run
+            )
+            claim_finalized = finish_claim(
+                state,
+                claim,
+                event_id,
+                status="rejected",
+                error=f"source_binding:{exc}"[:2000],
+                reason_code="source_binding_invalid",
+                event_updates={
+                    "receipt_state": "invalid",
+                    "retention_state": retention,
+                },
+            )
+            attendance.log(
+                f"ftp:{path.name}: source binding rejected camera={camera_id} "
+                f"policy={log_type} error={exc}"
+            )
+            return False
+        if verified_source != camera_source:
+            raise CameraSourceError("verified source does not match the upload route")
+
+        receipt_detail = {
+            "camera_id": source_receipt.camera_id,
+            "source_type": source_receipt.source_type,
+            "branch": source_receipt.branch,
+            "policy": source_receipt.policy,
+            "ftp_username": source_receipt.ftp_username,
+            "remote_ip": source_receipt.remote_ip,
+            "received_at": source_receipt.received_at,
+            "source_sha256": source_receipt.source_sha256,
+            "source_size": source_receipt.source_size,
+            "source_binding_id": source_receipt.source_binding_id,
+            "signature": source_receipt.signature,
+            "verified": bool(source_receipt.verified),
+        }
+        if not dry_run:
+            transition_claim(
+                state,
+                claim,
+                event_id,
+                to_state="source_verified",
+                reason_code="source_verified",
+                event_updates={
+                    "transport_received_at": source_receipt.received_at,
+                    "source_remote_ip": source_receipt.remote_ip,
+                    "receipt_state": (
+                        "verified" if source_receipt.verified else "route_only"
+                    ),
+                    "receipt_verified": bool(source_receipt.verified),
+                    "receipt_json": receipt_detail,
+                },
+            )
+
+        receipt_ip = source_receipt.remote_ip or "-"
+        receipt_state = "verified" if source_receipt.verified else "route-only"
+        source_label = (
+            f"camera={camera_id} policy={log_type} branch={camera_source.branch} "
+            f"principal={camera_source.ftp_username} ip={receipt_ip} "
+            f"receipt={receipt_state}"
+        )
+        attendance.log(f"ftp:{path.name}: source bound {source_label}")
+
+        time_error = event_time_error(path, cfg, allow_stale=allow_stale)
+        if time_error:
+            retention = reject_file(path, time_error, cfg, dry_run=dry_run)
+            claim_finalized = finish_claim(
+                state,
+                claim,
+                event_id,
+                status="rejected",
+                error=time_error,
+                reason_code=time_error,
+                event_updates={"retention_state": retention},
+            )
+            return False
+
+        image = cv2.imread(str(path))
+        if image is None:
+            retention = reject_file(path, "unreadable_image", cfg, dry_run=dry_run)
+            claim_finalized = finish_claim(
+                state,
+                claim,
+                event_id,
+                status="rejected",
+                error="unreadable_image",
+                reason_code="unreadable_image",
+                event_updates={"retention_state": retention},
+            )
+            return False
+        height, width = image.shape[:2]
+        max_pixels = int(cfg.get("max_camera_image_pixels", 20_000_000))
+        if max_pixels and width * height > max_pixels:
+            retention = reject_file(path, "image_too_large", cfg, dry_run=dry_run)
+            claim_finalized = finish_claim(
+                state,
+                claim,
+                event_id,
+                status="rejected",
+                error="image_too_large",
+                reason_code="image_too_large",
+                event_updates={"retention_state": retention},
+            )
+            return False
+
+        if not dry_run:
+            transition_claim(
+                state,
+                claim,
+                event_id,
+                to_state="validating",
+                reason_code="image_validated",
+                detail={"width": width, "height": height},
+            )
+
+        detect_frame = attendance.scaled_frame(image, cfg)
+        faces = ordered_faces(app.get(detect_frame))
+        if not faces:
+            retention = reject_file(path, "no_face", cfg, dry_run=dry_run)
+            claim_finalized = finish_claim(
+                state,
+                claim,
+                event_id,
+                status="rejected",
+                error="no_face",
+                reason_code="no_face",
+                event_updates={"retention_state": retention},
+            )
+            return False
+
+        pad_results, pad_crops, pad_event_error = evaluate_pad(
+            detect_frame,
+            faces,
+            cfg,
+            pad_gate,
+            {
+                "camera_id": camera_id,
+                "log_type": log_type,
+                "branch": camera_source.branch,
+                "source_principal": camera_source.ftp_username,
+                "source_remote_ip": source_receipt.remote_ip,
+                "source_binding_id": camera_source.binding_id,
+                "event_id": event_id,
+                "source_name": path.name,
+                "source_sha256": source_sha256,
+            },
+        )
+        if pad_event_error:
+            reason_code = pad_reason_code(pad_event_error)
+            record_pad_only_decisions(
+                state,
+                claim,
+                event_id,
+                faces,
+                pad_results,
+                pad_gate,
+                cfg,
+                gallery,
+                log_type,
+                reason_code,
+            )
+            retention = reject_file(path, "pad_rejected", cfg, dry_run=dry_run)
+            claim_finalized = finish_claim(
+                state,
+                claim,
+                event_id,
+                status="rejected",
+                error=f"pad:{pad_event_error}"[:2000],
+                reason_code=reason_code,
+                event_updates={"retention_state": retention},
+            )
+            return False
+
+        for result, crop in zip(pad_results, pad_crops):
+            score_text = "-" if result.score is None else f"{result.score:.3f}"
+            attendance.log(
+                f"ftp:{path.name}: pad face={result.face_index}/{result.face_count} "
+                f"{source_label} provider={result.provider or '-'} "
+                f"model={result.model or '-'} passed={int(result.passed)} "
+                f"score={score_text} reason={result.reason or '-'} "
+                f"evidence={result.evidence_id or '-'} "
+                f"binding={result.binding_id[:16] or '-'}"
