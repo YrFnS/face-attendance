@@ -1,0 +1,230 @@
+import hashlib
+import json
+import math
+import re
+import sqlite3
+import unicodedata
+from dataclasses import dataclass
+from datetime import datetime, timezone
+
+
+HEX64_RE = re.compile(r"^[0-9a-f]{64}$")
+
+EVENT_STATES = frozenset(
+    {
+        "legacy",
+        "received",
+        "processing",
+        "source_verified",
+        "validating",
+        "recognizing",
+        "processed",
+        "checkin_created",
+        "rejected",
+        "failed",
+        "uncertain",
+        "quarantined",
+        "dismissed",
+    }
+)
+EVENT_REASON_CODES = frozenset(
+    {
+        "legacy_import",
+        "receipt_recorded",
+        "processing_started",
+        "source_verified",
+        "source_binding_invalid",
+        "upload_too_large",
+        "future_timestamp",
+        "stale_event",
+        "unreadable_image",
+        "image_too_large",
+        "image_validated",
+        "no_face",
+        "pad_face_limit",
+        "pad_single_face_required",
+        "pad_rejected",
+        "recognition_started",
+        "quality_rejected",
+        "unknown_employee",
+        "score_below_threshold",
+        "margin_below_threshold",
+        "duplicate_face",
+        "accepted_candidate",
+        "cooldown_suppressed",
+        "checkin_created",
+        "processed_no_checkin",
+        "processing_failed",
+        "invalid_upload",
+        "unexpected_error",
+        "generic_rejected",
+        "generic_failed",
+        "operator_action",
+    }
+)
+ACTOR_TYPES = frozenset({"system", "watcher", "operator", "migration"})
+RECEIPT_STATES = frozenset(
+    {"pending", "verified", "route_only", "missing", "invalid", "legacy"}
+)
+RETENTION_STATES = frozenset(
+    {
+        "pending",
+        "retained",
+        "temporary",
+        "not_retained",
+        "deleted",
+        "quarantined",
+        "unknown",
+    }
+)
+TERMINAL_EVENT_STATES = frozenset(
+    {"processed", "checkin_created", "rejected", "failed", "uncertain", "dismissed"}
+)
+
+
+def _sql_values(values):
+    return ", ".join("'" + value.replace("'", "''") + "'" for value in sorted(values))
+
+
+_STATE_SQL = _sql_values(EVENT_STATES)
+_REASON_SQL = _sql_values(EVENT_REASON_CODES)
+_ACTOR_SQL = _sql_values(ACTOR_TYPES)
+_RECEIPT_SQL = _sql_values(RECEIPT_STATES)
+_RETENTION_SQL = _sql_values(RETENTION_STATES)
+
+
+LEDGER_SCHEMA_STATEMENTS = (
+    "ALTER TABLE camera_events ADD COLUMN capture_id TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE camera_events ADD COLUMN received_at TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE camera_events ADD COLUMN received_unix REAL NOT NULL DEFAULT 0",
+    "ALTER TABLE camera_events ADD COLUMN transport_received_at TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE camera_events ADD COLUMN source_at TEXT",
+    "ALTER TABLE camera_events ADD COLUMN source_time_provenance TEXT NOT NULL DEFAULT 'legacy'",
+    "ALTER TABLE camera_events ADD COLUMN effective_at TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE camera_events ADD COLUMN branch TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE camera_events ADD COLUMN source_type TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE camera_events ADD COLUMN source_principal TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE camera_events ADD COLUMN source_remote_ip TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE camera_events ADD COLUMN source_binding_id TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE camera_events ADD COLUMN policy TEXT NOT NULL DEFAULT ''",
+    f"ALTER TABLE camera_events ADD COLUMN receipt_state TEXT NOT NULL DEFAULT 'legacy' CHECK(receipt_state IN ({_RECEIPT_SQL}))",
+    "ALTER TABLE camera_events ADD COLUMN receipt_verified INTEGER NOT NULL DEFAULT 0 CHECK(receipt_verified IN (0, 1))",
+    "ALTER TABLE camera_events ADD COLUMN receipt_json TEXT NOT NULL DEFAULT '{}'",
+    f"ALTER TABLE camera_events ADD COLUMN lifecycle_state TEXT NOT NULL DEFAULT 'legacy' CHECK(lifecycle_state IN ({_STATE_SQL}))",
+    "ALTER TABLE camera_events ADD COLUMN state_version INTEGER NOT NULL DEFAULT 1 CHECK(state_version >= 1)",
+    f"ALTER TABLE camera_events ADD COLUMN reason_code TEXT NOT NULL DEFAULT 'legacy_import' CHECK(reason_code IN ({_REASON_SQL}))",
+    "ALTER TABLE camera_events ADD COLUMN gallery_version TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE camera_events ADD COLUMN gallery_generated_at TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE camera_events ADD COLUMN gallery_model TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE camera_events ADD COLUMN gallery_model_version TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE camera_events ADD COLUMN recognition_model TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE camera_events ADD COLUMN recognition_model_version TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE camera_events ADD COLUMN preprocessing_version TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE camera_events ADD COLUMN pad_provider TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE camera_events ADD COLUMN pad_model TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE camera_events ADD COLUMN policy_version TEXT NOT NULL DEFAULT ''",
+    f"ALTER TABLE camera_events ADD COLUMN retention_state TEXT NOT NULL DEFAULT 'unknown' CHECK(retention_state IN ({_RETENTION_SQL}))",
+    "ALTER TABLE camera_events ADD COLUMN final_disposition TEXT NOT NULL DEFAULT ''",
+    """
+    UPDATE camera_events
+    SET capture_id = event_id,
+        received_at = strftime('%Y-%m-%dT%H:%M:%fZ', created_unix, 'unixepoch'),
+        received_unix = created_unix,
+        source_at = CASE
+            WHEN source_mtime IS NULL THEN NULL
+            ELSE strftime('%Y-%m-%dT%H:%M:%fZ', source_mtime, 'unixepoch')
+        END,
+        source_time_provenance = 'legacy_filesystem_mtime',
+        effective_at = strftime('%Y-%m-%dT%H:%M:%fZ', created_unix, 'unixepoch'),
+        policy = log_type,
+        lifecycle_state = CASE status
+            WHEN 'processing' THEN 'processing'
+            WHEN 'checkin_created' THEN 'checkin_created'
+            WHEN 'processed_no_checkin' THEN 'processed'
+            WHEN 'processed' THEN 'processed'
+            WHEN 'rejected' THEN 'rejected'
+            WHEN 'failed' THEN 'failed'
+            WHEN 'uncertain' THEN 'uncertain'
+            ELSE 'legacy'
+        END,
+        state_version = 1,
+        reason_code = 'legacy_import',
+        policy_version = 'legacy',
+        retention_state = 'unknown',
+        final_disposition = CASE
+            WHEN completed_at IS NULL THEN ''
+            ELSE status
+        END
+    """,
+    f"""
+    CREATE TABLE recognition_decisions (
+        decision_id TEXT PRIMARY KEY,
+        event_id TEXT NOT NULL REFERENCES camera_events(event_id) ON DELETE CASCADE,
+        decision_version INTEGER NOT NULL CHECK(decision_version >= 1),
+        face_index INTEGER NOT NULL CHECK(face_index >= 1),
+        face_count INTEGER NOT NULL CHECK(face_count >= face_index),
+        bbox_x1 INTEGER NOT NULL,
+        bbox_y1 INTEGER NOT NULL,
+        bbox_x2 INTEGER NOT NULL,
+        bbox_y2 INTEGER NOT NULL,
+        face_width REAL NOT NULL,
+        face_height REAL NOT NULL,
+        detection_score REAL NOT NULL,
+        best_employee TEXT NOT NULL DEFAULT '',
+        best_score REAL NOT NULL,
+        runner_up_score REAL NOT NULL,
+        score_margin REAL NOT NULL,
+        pad_passed INTEGER NOT NULL CHECK(pad_passed IN (0, 1)),
+        pad_skipped INTEGER NOT NULL CHECK(pad_skipped IN (0, 1)),
+        pad_score REAL,
+        pad_provider TEXT NOT NULL DEFAULT '',
+        pad_model TEXT NOT NULL DEFAULT '',
+        pad_evidence_id TEXT NOT NULL DEFAULT '',
+        pad_binding_id TEXT NOT NULL DEFAULT '',
+        accepted INTEGER NOT NULL CHECK(accepted IN (0, 1)),
+        reason_code TEXT NOT NULL CHECK(reason_code IN ({_REASON_SQL})),
+        candidate_log_type TEXT NOT NULL DEFAULT '',
+        policy_version TEXT NOT NULL DEFAULT '',
+        gallery_version TEXT NOT NULL DEFAULT '',
+        gallery_generated_at TEXT NOT NULL DEFAULT '',
+        gallery_model TEXT NOT NULL DEFAULT '',
+        gallery_model_version TEXT NOT NULL DEFAULT '',
+        recognition_model TEXT NOT NULL DEFAULT '',
+        recognition_model_version TEXT NOT NULL DEFAULT '',
+        preprocessing_version TEXT NOT NULL DEFAULT '',
+        retention_state TEXT NOT NULL CHECK(retention_state IN ({_RETENTION_SQL})),
+        created_at TEXT NOT NULL,
+        UNIQUE(event_id, face_index, decision_version)
+    )
+    """,
+    f"""
+    CREATE TABLE event_transitions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        event_id TEXT NOT NULL REFERENCES camera_events(event_id) ON DELETE CASCADE,
+        sequence INTEGER NOT NULL CHECK(sequence >= 1),
+        from_state TEXT NOT NULL DEFAULT '',
+        to_state TEXT NOT NULL CHECK(to_state IN ({_STATE_SQL})),
+        reason_code TEXT NOT NULL CHECK(reason_code IN ({_REASON_SQL})),
+        actor_type TEXT NOT NULL CHECK(actor_type IN ({_ACTOR_SQL})),
+        actor_id TEXT NOT NULL DEFAULT '',
+        detail_json TEXT NOT NULL DEFAULT '{{}}',
+        created_at TEXT NOT NULL,
+        UNIQUE(event_id, sequence)
+    )
+    """,
+    f"""
+    CREATE TABLE operator_actions (
+        action_id TEXT PRIMARY KEY,
+        event_id TEXT NOT NULL REFERENCES camera_events(event_id) ON DELETE CASCADE,
+        actor TEXT NOT NULL,
+        action TEXT NOT NULL,
+        reason_code TEXT NOT NULL CHECK(reason_code IN ({_REASON_SQL})),
+        detail_json TEXT NOT NULL DEFAULT '{{}}',
+        created_at TEXT NOT NULL
+    )
+    """,
+    "CREATE INDEX recognition_decisions_event ON recognition_decisions(event_id, face_index)",
+    "CREATE INDEX event_transitions_event ON event_transitions(event_id, sequence)",
+    "CREATE INDEX operator_actions_event ON operator_actions(event_id, created_at)",
+    "CREATE INDEX camera_events_capture_id ON camera_events(capture_id)",
+    "CREATE INDEX camera_events_lifecycle ON camera_events(lifecycle_state, received_unix)",
