@@ -34,8 +34,9 @@ jobs:
           echo "61a15e10e1fa143a6ddd428adad4770fb3bf8e551e26f581f9d83d41105fe2c0  /tmp/p205.patch.xz" | sha256sum -c -
           xz -dc /tmp/p205.patch.xz > /tmp/p205.patch
           echo "ca4e733d62782c2da1090849a2c3738aada89a7c32beaad97c7911ce28d9d32d  /tmp/p205.patch" | sha256sum -c -
-          git apply --check /tmp/p205.patch
-          git apply /tmp/p205.patch
+          rm -f .gitignore
+          git apply --check --exclude=.github/workflows/tests.yml /tmp/p205.patch
+          git apply --exclude=.github/workflows/tests.yml /tmp/p205.patch
       - name: Install test dependencies
         run: |
           python -m pip install --upgrade pip
