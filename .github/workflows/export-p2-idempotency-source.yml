@@ -1,0 +1,29 @@
+name: Export P2-04 source
+
+on:
+  push:
+    branches:
+      - agent/p2-idempotency-source-export
+
+permissions:
+  contents: read
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - name: Prepare source snapshot
+        run: |
+          mkdir -p /tmp/face-attendance-p204
+          rsync -a \
+            --exclude .git \
+            --exclude .github/workflows/export-p2-idempotency-source.yml \
+            ./ /tmp/face-attendance-p204/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: face-attendance-p204-source
+          path: /tmp/face-attendance-p204
+          if-no-files-found: error
+          retention-days: 1
