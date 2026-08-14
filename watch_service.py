@@ -7,6 +7,13 @@ from pathlib import Path
 import cv2
 
 import face_attendance as attendance
+from camera_sources import (
+    CameraSourceError,
+    load_camera_sources,
+    receipt_path,
+    source_for_upload_path,
+    verify_source_receipt,
+)
 from pad import PADConfigError, PADGate, PADResult
 from production_readiness import check_production_readiness, format_report
 from runtime_state import RuntimeState, file_sha256, make_event_id, resolve_runtime_path
@@ -52,30 +59,6 @@ def image_files(folder):
     ]
 
 
-def direction_for_path(path):
-    parts = {part.lower() for part in Path(path).parts}
-    if "out" in parts:
-        return "out"
-    if "in" in parts:
-        return "in"
-    return ""
-
-
-def camera_context(cfg, path):
-    direction = direction_for_path(path)
-    log_type = cfg.get("folder_log_types", {}).get(
-        direction, cfg.get("log_type", "IN")
-    )
-    camera_ids = cfg.get("camera_ids") or {}
-    camera_id = str(
-        camera_ids.get(direction)
-        or camera_ids.get(str(log_type).lower())
-        or direction
-        or "default-camera"
-    )
-    return camera_id, str(log_type)
-
-
 def event_time_error(path, cfg, allow_stale=False):
     stat = Path(path).stat()
     now = time.time()
@@ -90,38 +73,51 @@ def event_time_error(path, cfg, allow_stale=False):
     return ""
 
 
+def _move_path(source, destination):
+    try:
+        os.replace(source, destination)
+    except OSError:
+        shutil.move(str(source), str(destination))
+
+
 def quarantine(path, reason, cfg, *, dry_run=False):
     if dry_run:
         return None
     if not bool(cfg.get("quarantine_invalid_uploads", True)):
         return None
     source = Path(path)
+    source_receipt = receipt_path(source)
     folder = attendance.LOGS / "quarantine" / str(reason)
     folder.mkdir(parents=True, exist_ok=True)
     stamp = time.strftime("%Y%m%d_%H%M%S")
     destination = folder / f"{stamp}_{source.name}"
     counter = 1
-    while destination.exists():
+    while destination.exists() or receipt_path(destination).exists():
         destination = folder / f"{stamp}_{counter}_{source.name}"
         counter += 1
     try:
-        os.replace(source, destination)
-        return destination
+        _move_path(source, destination)
     except OSError:
+        return None
+    if source_receipt.exists():
         try:
-            shutil.move(str(source), str(destination))
-            return destination
+            _move_path(source_receipt, receipt_path(destination))
         except OSError:
-            return None
+            try:
+                source_receipt.unlink()
+            except FileNotFoundError:
+                pass
+    return destination
 
 
 def remove_source(path, cfg):
     if not bool(cfg.get("delete_camera_uploads_after_processing", True)):
         return
-    try:
-        Path(path).unlink()
-    except FileNotFoundError:
-        pass
+    for candidate in (Path(path), receipt_path(path)):
+        try:
+            candidate.unlink()
+        except FileNotFoundError:
+            pass
 
 
 def reject_file(path, reason, cfg, *, dry_run=False):
@@ -227,6 +223,7 @@ def process_path(
     *,
     dry_run=False,
     allow_stale=False,
+    sources=None,
 ):
     path = Path(path)
     claim = None
@@ -236,13 +233,13 @@ def process_path(
         if not attendance.wait_until_stable(path):
             attendance.log(f"ftp:{path.name}: skipped unstable file")
             return False
-        time_error = event_time_error(path, cfg, allow_stale=allow_stale)
-        if time_error:
-            reject_file(path, time_error, cfg, dry_run=dry_run)
-            return False
+
         max_bytes = int(cfg.get("max_camera_upload_bytes", 20 * 1024 * 1024))
         source_sha256, source_size = file_sha256(path, max_bytes=max_bytes)
-        camera_id, log_type = camera_context(cfg, path)
+        sources = tuple(sources or load_camera_sources(cfg, ROOT))
+        camera_source = source_for_upload_path(sources, path)
+        camera_id = camera_source.camera_id
+        log_type = camera_source.policy
         event_id = make_event_id(camera_id, log_type, source_sha256)
         if not dry_run:
             claim = state.claim_event(
@@ -257,6 +254,7 @@ def process_path(
             if not claim.accepted:
                 attendance.log(
                     f"ftp:{path.name}: replay skipped event={claim.event_id} "
+                    f"camera={camera_id} policy={log_type} "
                     f"status={claim.existing_status}"
                 )
                 if (
@@ -265,6 +263,49 @@ def process_path(
                 ):
                     remove_source(path, cfg)
                 return False
+
+        try:
+            verified_source, source_receipt = verify_source_receipt(
+                path,
+                cfg,
+                ROOT,
+                source_sha256=source_sha256,
+                source_size=source_size,
+                sources=sources,
+            )
+        except CameraSourceError as exc:
+            claim_finalized = finish_claim(
+                state,
+                claim,
+                event_id,
+                status="rejected",
+                error=f"source_binding:{exc}"[:2000],
+            )
+            attendance.log(
+                f"ftp:{path.name}: source binding rejected camera={camera_id} "
+                f"policy={log_type} error={exc}"
+            )
+            reject_file(path, "source_binding_invalid", cfg, dry_run=dry_run)
+            return False
+        if verified_source != camera_source:
+            raise CameraSourceError("verified source does not match the upload route")
+
+        receipt_ip = source_receipt.remote_ip or "-"
+        receipt_state = "verified" if source_receipt.verified else "route-only"
+        source_label = (
+            f"camera={camera_id} policy={log_type} branch={camera_source.branch} "
+            f"principal={camera_source.ftp_username} ip={receipt_ip} "
+            f"receipt={receipt_state}"
+        )
+        attendance.log(f"ftp:{path.name}: source bound {source_label}")
+
+        time_error = event_time_error(path, cfg, allow_stale=allow_stale)
+        if time_error:
+            claim_finalized = finish_claim(
+                state, claim, event_id, status="rejected", error=time_error
+            )
+            reject_file(path, time_error, cfg, dry_run=dry_run)
+            return False
 
         image = cv2.imread(str(path))
         if image is None:
@@ -292,6 +333,10 @@ def process_path(
             {
                 "camera_id": camera_id,
                 "log_type": log_type,
+                "branch": camera_source.branch,
+                "source_principal": camera_source.ftp_username,
+                "source_remote_ip": source_receipt.remote_ip,
+                "source_binding_id": camera_source.binding_id,
                 "event_id": event_id,
                 "source_name": path.name,
                 "source_sha256": source_sha256,
@@ -312,9 +357,10 @@ def process_path(
             score_text = "-" if result.score is None else f"{result.score:.3f}"
             attendance.log(
                 f"ftp:{path.name}: pad face={result.face_index}/{result.face_count} "
-                f"provider={result.provider or '-'} model={result.model or '-'} "
-                f"passed={int(result.passed)} score={score_text} "
-                f"reason={result.reason or '-'} evidence={result.evidence_id or '-'} "
+                f"{source_label} provider={result.provider or '-'} "
+                f"model={result.model or '-'} passed={int(result.passed)} "
+                f"score={score_text} reason={result.reason or '-'} "
+                f"evidence={result.evidence_id or '-'} "
                 f"binding={result.binding_id[:16] or '-'}"
             )
             if not result.passed and crop is not None and getattr(crop, "size", 0):
@@ -342,15 +388,20 @@ def process_path(
 
         known = gallery.refresh()
         bound_app = BoundFaceApp(faces)
+        # The legacy recognition helper still has a path-based fallback for
+        # dry-run diagnostics. Canonical production passes no path and pins the
+        # already verified source policy into the per-event configuration.
+        recognition_cfg = dict(cfg)
+        recognition_cfg["log_type"] = log_type
         try:
             created = attendance.process_image(
                 image,
-                f"ftp:{path.name} event={event_id[:12]} camera={camera_id}",
+                f"ftp:{path.name} event={event_id[:12]} {source_label}",
                 bound_app,
                 known,
-                cfg,
+                recognition_cfg,
                 dry_run,
-                attach_source=path,
+                attach_source=None,
             )
             if bound_app.calls != 1:
                 raise RuntimeError("recognition did not consume the bound face set exactly once")
@@ -358,7 +409,10 @@ def process_path(
             claim_finalized = finish_claim(
                 state, claim, event_id, status="failed", error=str(exc)
             )
-            attendance.log(f"ftp:{path.name}: processing failed event={event_id}: {exc}")
+            attendance.log(
+                f"ftp:{path.name}: processing failed event={event_id} "
+                f"{source_label}: {exc}"
+            )
             reject_file(path, "processing_failed", cfg, dry_run=dry_run)
             return False
 
@@ -412,6 +466,11 @@ def run(*, once=False, dry_run=False, allow_stale=False):
         raise SystemExit("Production readiness check failed:\n" + format_report(report))
 
     try:
+        sources = load_camera_sources(cfg, ROOT)
+    except CameraSourceError as exc:
+        raise SystemExit(f"Invalid camera source configuration: {exc}") from exc
+
+    try:
         pad_gate = PADGate(cfg)
     except PADConfigError as exc:
         if bool(cfg.get("pad_required", False)) or bool(cfg.get("production_mode", False)):
@@ -438,9 +497,14 @@ def run(*, once=False, dry_run=False, allow_stale=False):
     attendance.cleanup_old_audit_files(cfg)
     state.prune_events(cfg.get("event_retention_days", 30))
     last_cleanup = time.monotonic()
+    source_summary = ",".join(
+        f"{item.camera_id}:{item.policy}:{item.ftp_username}"
+        for item in sources
+    )
     attendance.log(
         f"secure folder watcher started: {folder}; pad={pad_gate.provider}; "
-        f"production_mode={int(bool(cfg.get('production_mode', False)))}"
+        f"production_mode={int(bool(cfg.get('production_mode', False)))}; "
+        f"sources={source_summary}"
     )
 
     while True:
@@ -458,6 +522,7 @@ def run(*, once=False, dry_run=False, allow_stale=False):
                     pad_gate,
                     dry_run=dry_run,
                     allow_stale=allow_stale,
+                    sources=sources,
                 )
                 or created
             )
@@ -473,7 +538,7 @@ def run(*, once=False, dry_run=False, allow_stale=False):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Replay-resistant camera upload watcher.")
+    parser = argparse.ArgumentParser(description="Source-bound camera upload watcher.")
     parser.add_argument("--once", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument(
