@@ -17,28 +17,40 @@ from flask import (
     session,
     url_for,
 )
+from auth_backends import (
+    AuthBackendError,
+    auth_configured,
+    auth_mode,
+    authenticate_local,
+    begin_external_login,
+    complete_external_login,
+)
 from data_contract import (
     employee_directory,
     validate_employee_id,
     validate_gallery_label,
 )
 from embedding_gallery import GalleryError, gallery_status, load_gallery, read_sync_status
+from gallery_credentials import (
+    GalleryCredentialError,
+    authenticate_export_credential,
+)
 from production_readiness import check_production_readiness
 from runtime_policy import effective_gallery_options
 from runtime_state import RuntimeState, resolve_runtime_path
+from secret_store import ConfigLoadError, RuntimeConfig, load_runtime_config
 from secure_sync import sync_gallery
 from web_security import (
     add_security_headers,
     admin_user,
-    auth_configured,
     configure_app,
     csrf_protected,
     csrf_token,
     login_required,
+    peer_address,
     remote_address,
     safe_next_url,
     validate_csrf,
-    verify_password,
 )
 
 
@@ -71,6 +83,9 @@ SETUP = """<!doctype html><style>{{style}}</style><div class=card><h1>Admin setu
 source .venv/bin/activate
 python manage_admin.py set-password</pre></div>"""
 
+AUTH_ERROR = """<!doctype html><style>{{style}}</style><div class=card>
+<h1>Authentication unavailable</h1><p class=bad>{{message}}</p></div>"""
+
 HOME = """<!doctype html><style>{{style}}</style><h1>Face Attendance</h1>
 <form method=post action="{{url_for('logout')}}"><input type=hidden name=csrf_token value="{{csrf}}"><button>Sign out {{user}}</button></form>
 {% if msg %}<p class="{{'bad' if error else 'ok'}}">{{msg}}</p>{% endif %}
@@ -90,14 +105,17 @@ HOME = """<!doctype html><style>{{style}}</style><h1>Face Attendance</h1>
 
 def load_config():
     try:
-        data = json.loads(CONFIG.read_text(encoding="utf-8"))
-        return data if isinstance(data, dict) else {}
-    except (FileNotFoundError, OSError, json.JSONDecodeError):
-        return {}
+        return load_runtime_config(CONFIG)
+    except ConfigLoadError:
+        return RuntimeConfig()
+
+
 
 
 def apply_security_config():
-    return configure_app(app, load_config())
+    cfg = load_config()
+    configure_app(app, cfg)
+    return auth_configured(cfg)
 
 
 apply_security_config()
@@ -110,16 +128,27 @@ def state_store(cfg=None):
     )
 
 
-def audit(action, detail=None, actor=None):
+def audit(action, detail=None, actor=None, cfg=None, *, required=False):
+    cfg = cfg or load_config()
+    detail = dict(detail or {})
+    peer = peer_address()
+    client = remote_address(cfg)
+    if peer != client:
+        detail.setdefault("proxy_peer", peer)
+    required = required or str(action).startswith("embedding_export_")
     try:
-        state_store().audit(
+        state_store(cfg).audit(
             actor=actor or admin_user() or "anonymous",
             action=action,
-            remote_addr=remote_address(),
-            detail=detail or {},
+            remote_addr=client,
+            detail=detail,
         )
     except Exception:
         app.logger.exception("audit write failed")
+        if required:
+            raise
+
+
 
 
 def payload(cfg):
@@ -196,25 +225,63 @@ def login():
     cfg = load_config()
     if not auth_configured(cfg):
         return render_template_string(SETUP, style=STYLE), 503
+    mode = auth_mode(cfg)
     if request.method == "GET":
         if session.get("admin_authenticated"):
             return redirect(url_for("index"))
+        next_url = safe_next_url(request.args.get("next"))
+        if mode == "adapter":
+            state = secrets.token_urlsafe(32)
+            session.clear()
+            session.update(
+                external_auth_state=state,
+                external_auth_next=next_url,
+            )
+            session.permanent = True
+            callback_url = str(
+                cfg.get("web_auth_callback_url")
+                or url_for("auth_callback", _external=True)
+            )
+            try:
+                target = begin_external_login(
+                    cfg,
+                    next_url=next_url,
+                    state=state,
+                    callback_url=callback_url,
+                )
+            except AuthBackendError as exc:
+                audit(
+                    "external_login_begin_failed",
+                    {"error": str(exc)[:500]},
+                    "anonymous",
+                    cfg,
+                )
+                return render_template_string(
+                    AUTH_ERROR,
+                    style=STYLE,
+                    message="External authentication could not be started.",
+                ), 503
+            return redirect(target)
         return render_template_string(
             LOGIN,
             style=STYLE,
             csrf=csrf_token(),
-            next_url=safe_next_url(request.args.get("next")),
+            next_url=next_url,
             message="",
         )
+
+    if mode != "local":
+        abort(405)
     validate_csrf()
     user = str(request.form.get("username") or "").strip()
     password = str(request.form.get("password") or "")
     next_url = safe_next_url(request.form.get("next"))
-    limiter_key = f"login:{remote_address()}"
+    client_ip = remote_address(cfg)
+    limiter_key = f"login:{client_ip}"
     store = state_store(cfg)
     allowed, retry = store.login_allowed(limiter_key)
     if not allowed:
-        audit("login_locked", {"username": user}, "anonymous")
+        audit("login_locked", {"username": user}, "anonymous", cfg)
         return (
             render_template_string(
                 LOGIN,
@@ -225,18 +292,15 @@ def login():
             ),
             429,
         )
-    expected = str(cfg.get("web_admin_username") or "")
-    valid = secrets.compare_digest(user, expected) and verify_password(
-        password, cfg.get("web_admin_password_hash")
-    )
-    if not valid:
+    principal = authenticate_local(cfg, user, password)
+    if principal is None:
         store.record_login_failure(
             limiter_key,
             max_attempts=cfg.get("web_login_attempts", 5),
             window_seconds=cfg.get("web_login_window_seconds", 300),
             lockout_seconds=cfg.get("web_lockout_seconds", 900),
         )
-        audit("login_failed", {"username": user}, "anonymous")
+        audit("login_failed", {"username": user}, "anonymous", cfg)
         return (
             render_template_string(
                 LOGIN,
@@ -249,10 +313,73 @@ def login():
         )
     store.clear_login_failures(limiter_key)
     session.clear()
-    session.update(admin_authenticated=True, admin_user=expected)
+    session.update(
+        admin_authenticated=True,
+        admin_user=principal.subject,
+        auth_assurance=principal.assurance,
+        auth_mfa=principal.mfa,
+    )
     session.permanent = True
     csrf_token()
-    audit("login_succeeded", actor=expected)
+    audit(
+        "login_succeeded",
+        {"assurance": principal.assurance, "mfa": principal.mfa},
+        principal.subject,
+        cfg,
+    )
+    return redirect(next_url)
+
+
+@app.get("/auth/callback")
+def auth_callback():
+    cfg = load_config()
+    if auth_mode(cfg) != "adapter" or not auth_configured(cfg):
+        abort(404)
+    expected_state = str(session.get("external_auth_state") or "")
+    next_url = safe_next_url(session.get("external_auth_next"))
+    callback_url = str(
+        cfg.get("web_auth_callback_url")
+        or url_for("auth_callback", _external=True)
+    )
+    try:
+        principal = complete_external_login(
+            cfg,
+            query=request.args.to_dict(flat=True),
+            expected_state=expected_state,
+            callback_url=callback_url,
+        )
+    except AuthBackendError as exc:
+        session.clear()
+        audit(
+            "external_login_failed",
+            {"error": str(exc)[:500]},
+            "anonymous",
+            cfg,
+        )
+        return render_template_string(
+            AUTH_ERROR,
+            style=STYLE,
+            message="External authentication was rejected.",
+        ), 401
+    session.clear()
+    session.update(
+        admin_authenticated=True,
+        admin_user=principal.subject,
+        auth_assurance=principal.assurance,
+        auth_mfa=principal.mfa,
+    )
+    session.permanent = True
+    csrf_token()
+    audit(
+        "login_succeeded",
+        {
+            "backend": "adapter",
+            "assurance": principal.assurance,
+            "mfa": principal.mfa,
+        },
+        principal.subject,
+        cfg,
+    )
     return redirect(next_url)
 
 
@@ -406,11 +533,11 @@ def build():
     )
 
 
-def export_allowed(cfg):
-    expected = str(cfg.get("embedding_export_token") or "").strip()
-    return expected.upper() not in PLACEHOLDERS and secrets.compare_digest(
-        request.headers.get("Authorization", ""), f"Bearer {expected}"
-    )
+def _rate_limit_response(retry_after):
+    response = jsonify(error="rate limit exceeded")
+    response.status_code = 429
+    response.headers["Retry-After"] = str(max(1, int(retry_after)))
+    return response
 
 
 @app.get("/api/faces/embeddings")
@@ -418,32 +545,152 @@ def export_embeddings():
     cfg = load_config()
     if not cfg.get("embedding_export_enabled"):
         abort(404)
-    if not export_allowed(cfg):
+    client_ip = remote_address(cfg)
+    store = state_store(cfg)
+    credential_id = str(
+        request.headers.get("X-Face-Attendance-Credential-ID") or ""
+    ).strip()
+    try:
+        credential = authenticate_export_credential(
+            cfg,
+            request.headers.get("Authorization", ""),
+            credential_id,
+            branch=str(cfg.get("branch_name") or ""),
+            model=str(cfg.get("model") or ""),
+            model_version=str(cfg.get("model_version") or ""),
+        )
+    except GalleryCredentialError as exc:
+        allowed, retry, _remaining = store.consume_rate_limit(
+            f"embedding-export-auth:{client_ip}",
+            limit=max(1, int(cfg.get("embedding_export_auth_failures", 10))),
+            window_seconds=max(
+                1,
+                int(cfg.get("embedding_export_auth_failure_window_seconds", 300)),
+            ),
+        )
+        audit(
+            "embedding_export_denied",
+            {
+                "credential_id": credential_id[:128],
+                "reason": str(exc)[:200],
+            },
+            "anonymous",
+            cfg,
+        )
+        if not allowed:
+            audit(
+                "embedding_export_rate_limited",
+                {"bucket": "authentication", "retry_after": retry},
+                "anonymous",
+                cfg,
+            )
+            return _rate_limit_response(retry)
         abort(401)
+
+    window = max(
+        1,
+        int(cfg.get("embedding_export_rate_limit_window_seconds", 60)),
+    )
+    allowed, retry, _remaining = store.consume_rate_limit(
+        f"embedding-export-credential:{credential.credential_id}",
+        limit=max(1, int(cfg.get("embedding_export_rate_limit_requests", 120))),
+        window_seconds=window,
+    )
+    if allowed:
+        allowed, retry, _remaining = store.consume_rate_limit(
+            f"embedding-export-client:{credential.credential_id}:{client_ip}",
+            limit=max(
+                1,
+                int(cfg.get("embedding_export_ip_rate_limit_requests", 60)),
+            ),
+            window_seconds=window,
+        )
+    if not allowed:
+        audit(
+            "embedding_export_rate_limited",
+            {
+                "credential_id": credential.credential_id,
+                "credential_fingerprint": credential.fingerprint,
+                "retry_after": retry,
+            },
+            f"credential:{credential.credential_id}",
+            cfg,
+        )
+        return _rate_limit_response(retry)
+
     try:
         data = payload(cfg)
     except GalleryError as exc:
-        return jsonify(error=str(exc)), 503
-    try:
-        requested = validate_gallery_label(
-            request.args.get("branch"),
-            "branch",
-            required=False,
-            max_chars=128,
+        audit(
+            "embedding_export_failed",
+            {
+                "credential_id": credential.credential_id,
+                "error": str(exc)[:500],
+            },
+            f"credential:{credential.credential_id}",
+            cfg,
         )
-    except GalleryError as exc:
-        return jsonify(error=str(exc)), 400
-    actual = str(data.get("branch") or "")
-    if requested and requested != actual:
+        return jsonify(error=str(exc)), 503
+
+    requested = {}
+    for name in ("branch", "model", "model_version"):
+        try:
+            requested[name] = validate_gallery_label(
+                request.args.get(name),
+                name,
+                required=False,
+                max_chars=128,
+            )
+        except GalleryError as exc:
+            return jsonify(error=str(exc)), 400
+    actual = {
+        "branch": str(data.get("branch") or ""),
+        "model": str(data.get("model") or ""),
+        "model_version": str(data.get("model_version") or ""),
+    }
+    if any(requested[name] and requested[name] != actual[name] for name in requested):
+        audit(
+            "embedding_export_scope_mismatch",
+            {
+                "credential_id": credential.credential_id,
+                "requested": requested,
+            },
+            f"credential:{credential.credential_id}",
+            cfg,
+        )
         abort(404)
+
     checksum = str(data["checksum"])
+    not_modified = bool(
+        request.if_none_match and request.if_none_match.contains(checksum)
+    )
     response = (
         make_response("", 304)
-        if request.if_none_match and request.if_none_match.contains(checksum)
+        if not_modified
         else make_response(jsonify(data))
     )
     response.headers["Cache-Control"] = "no-store"
     response.headers["ETag"] = f'"{checksum}"'
+    response.headers[
+        "X-Face-Attendance-Credential-ID"
+    ] = credential.credential_id
+    audit(
+        "embedding_export_not_modified"
+        if not_modified
+        else "embedding_export_succeeded",
+        {
+            "credential_id": credential.credential_id,
+            "credential_fingerprint": credential.fingerprint,
+            "branch": actual["branch"],
+            "model": actual["model"],
+            "model_version": actual["model_version"],
+            "checksum": checksum[:16],
+            "status": 304 if not_modified else 200,
+            "user_agent": str(request.headers.get("User-Agent") or "")[:200],
+        },
+        f"credential:{credential.credential_id}",
+        cfg,
+    )
     return response
 
 

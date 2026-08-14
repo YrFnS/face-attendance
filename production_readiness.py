@@ -4,7 +4,9 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from urllib.parse import urlparse
 
+from auth_backends import auth_configuration_issues as auth_backend_configuration_issues
 from camera_sources import camera_source_configuration_issues
+from gallery_credentials import gallery_credential_configuration_issues
 from model_manifest import (
     is_placeholder,
     resolve_path,
@@ -13,7 +15,12 @@ from model_manifest import (
 )
 from pad import configuration_issues as pad_configuration_issues
 from runtime_policy import inspect_gallery, strict_profile_issues
-from web_security import auth_configuration_issues
+from secret_store import (
+    ConfigLoadError,
+    external_secret_configuration_issues,
+    load_runtime_config,
+)
+from web_security import proxy_configuration_issues
 
 
 FTP_UPLOAD_ONLY_PERMISSIONS = frozenset("elw")
@@ -147,6 +154,11 @@ def check_production_readiness(
     for code, message in strict_profile_issues(cfg):
         issues.append(ReadinessIssue(code, message))
 
+    for message in gallery_credential_configuration_issues(cfg):
+        issues.append(ReadinessIssue("gallery_credentials_invalid", message))
+    for message in external_secret_configuration_issues(cfg):
+        issues.append(ReadinessIssue("external_secret_delivery_invalid", message))
+
     if not bool(cfg.get("model_license_acknowledged", False)):
         issues.append(
             ReadinessIssue(
@@ -251,9 +263,13 @@ def check_production_readiness(
             )
         )
 
-    for message in auth_configuration_issues(cfg):
+    for message in auth_backend_configuration_issues(cfg):
         issues.append(
             ReadinessIssue("web_admin_auth_invalid", message)
+        )
+    for message in proxy_configuration_issues(cfg):
+        issues.append(
+            ReadinessIssue("trusted_proxy_configuration_invalid", message)
         )
     if _text(cfg.get("web_bind_host", "127.0.0.1")) not in {
         "127.0.0.1",
@@ -371,16 +387,6 @@ def check_production_readiness(
             ReadinessIssue("camera_source_binding_invalid", message)
         )
 
-    if bool(cfg.get("embedding_export_enabled", False)) and is_placeholder(
-        cfg.get("embedding_export_token")
-    ):
-        issues.append(
-            ReadinessIssue(
-                "embedding_export_token_missing",
-                "embedding_export_enabled requires a non-placeholder token",
-            )
-        )
-
     blockers = [
         issue for issue in issues if issue.severity == "blocker"
     ]
@@ -431,14 +437,11 @@ def format_report(report):
 
 def load_config(path):
     try:
-        data = json.loads(Path(path).read_text(encoding="utf-8"))
-    except FileNotFoundError as exc:
-        raise SystemExit(f"missing config: {path}") from exc
-    except json.JSONDecodeError as exc:
-        raise SystemExit(f"invalid JSON in {path}: {exc}") from exc
-    if not isinstance(data, dict):
-        raise SystemExit("config must contain a JSON object")
-    return data
+        return load_runtime_config(path)
+    except ConfigLoadError as exc:
+        raise SystemExit(str(exc)) from exc
+
+
 
 
 def main():

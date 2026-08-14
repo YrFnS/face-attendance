@@ -230,11 +230,20 @@ def strict_profile_issues(cfg):
                     "central_url is required when embedding synchronization is enabled in production",
                 )
             )
-        if is_placeholder(cfg.get("central_api_token")):
+        structured_credentials = cfg.get("central_api_credentials")
+        selected_credential = _text(cfg.get("central_api_credential_id"))
+        has_structured_credential = (
+            isinstance(structured_credentials, dict)
+            and bool(selected_credential)
+            and selected_credential in structured_credentials
+        )
+        if not has_structured_credential and is_placeholder(
+            cfg.get("central_api_token")
+        ):
             issues.append(
                 (
                     "central_api_token_missing",
-                    "central_api_token must be a non-placeholder value in production",
+                    "a scoped central gallery credential is required in production",
                 )
             )
     return tuple(issues)

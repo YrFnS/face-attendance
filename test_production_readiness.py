@@ -18,6 +18,7 @@ from gallery_release import (
 )
 from model_manifest import build_manifest, write_manifest_atomic
 from production_readiness import check_production_readiness
+from secret_store import RuntimeConfig
 from web_security import hash_password
 
 
@@ -89,7 +90,7 @@ class ProductionReadinessTests(unittest.TestCase):
         self.temp.cleanup()
 
     def valid_config(self):
-        return {
+        cfg = {
             "production_mode": True,
             "branch_name": "Baghdad",
             "model": "licensed_model",
@@ -108,7 +109,18 @@ class ProductionReadinessTests(unittest.TestCase):
             "embedding_sync_enabled": True,
             "embedding_sync_inline_enabled": False,
             "central_url": "https://central.example.test",
-            "central_api_token": "secret",
+            "central_api_credential_id": "readiness-node-2026",
+            "central_api_credentials": {
+                "readiness-node-2026": {
+                    "token": "c" * 48,
+                    "scopes": ["gallery:read"],
+                    "branches": ["Baghdad"],
+                    "models": ["licensed_model"],
+                    "model_versions": ["v1"],
+                    "enabled": True,
+                }
+            },
+            "production_external_secrets_required": True,
             "embedding_release_publisher": "central-enrollment",
             "embedding_release_trusted_keys": {
                 "key-2026": {
@@ -124,7 +136,7 @@ class ProductionReadinessTests(unittest.TestCase):
             "pad_require_single_face": True,
             "pad_min_score": 0.8,
             "pad_http_url": "https://pad.example.test/v1/check",
-            "pad_http_token": "secret",
+            "pad_http_token": "p" * 48,
             "pad_expected_provider": "approved-provider",
             "pad_allowed_models": ["liveness-v3"],
             "pad_require_binding_echo": True,
@@ -132,6 +144,8 @@ class ProductionReadinessTests(unittest.TestCase):
             "pad_max_faces_per_event": 8,
             "pad_allow_insecure_url": False,
             "pad_allow_unauthenticated_local": False,
+            "web_auth_mode": "local",
+            "web_mfa_required": False,
             "web_admin_username": "admin",
             "web_admin_password_hash": self.valid_password_hash,
             "web_session_secret": "s" * 48,
@@ -139,6 +153,10 @@ class ProductionReadinessTests(unittest.TestCase):
             "web_cookie_secure": True,
             "web_hsts_enabled": True,
             "https_reverse_proxy_acknowledged": True,
+            "web_trust_proxy_headers": True,
+            "web_trusted_proxy_networks": ["127.0.0.1/32", "::1/128"],
+            "web_forwarded_for_header": "X-Forwarded-For",
+            "web_max_forwarded_hops": 8,
             "frappe_url": "https://erp.example.test",
             "allow_insecure_frappe_url": False,
             "ftp_tls_enabled": True,
@@ -181,6 +199,18 @@ class ProductionReadinessTests(unittest.TestCase):
                 },
             },
         }
+        return RuntimeConfig(
+            cfg,
+            secret_sources={
+                "central_api_credentials.readiness-node-2026.token": "systemd://central_gallery_token",
+                "pad_http_token": "systemd://pad_http_token",
+                "web_admin_password_hash": "systemd://web_admin_password_hash",
+                "web_session_secret": "systemd://web_session_secret",
+                "camera_source_receipt_secret": "systemd://camera_source_receipt_secret",
+                "ftp_users.camera_in.password": "systemd://ftp_camera_in_password",
+                "ftp_users.camera_out.password": "systemd://ftp_camera_out_password",
+            },
+        )
 
     def activate_gallery(
         self,
@@ -356,6 +386,29 @@ class ProductionReadinessTests(unittest.TestCase):
         report = self.report(cfg, verify_model_files=False)
         self.assertIn(
             "camera_source_binding_invalid",
+            {issue.code for issue in report.blockers},
+        )
+
+    def test_inline_secret_and_untrusted_proxy_are_blocked(self):
+        cfg = self.valid_config()
+        cfg.secret_sources.pop("web_session_secret")
+        cfg["web_trust_proxy_headers"] = False
+        report = self.report(cfg, verify_model_files=False)
+        codes = {issue.code for issue in report.blockers}
+        self.assertIn("external_secret_delivery_invalid", codes)
+        self.assertIn("trusted_proxy_configuration_invalid", codes)
+
+    def test_gallery_credential_scope_mismatch_is_blocked(self):
+        cfg = self.valid_config()
+        cfg["central_api_credentials"] = {
+            "readiness-node-2026": {
+                **cfg["central_api_credentials"]["readiness-node-2026"],
+                "branches": ["Basra"],
+            }
+        }
+        report = self.report(cfg, verify_model_files=False)
+        self.assertIn(
+            "gallery_credentials_invalid",
             {issue.code for issue in report.blockers},
         )
 
