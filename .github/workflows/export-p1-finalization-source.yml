@@ -1,0 +1,26 @@
+name: Export P1 finalization source snapshot
+
+on:
+  push:
+    branches:
+      - agent/p1-finalization-export
+
+permissions:
+  contents: read
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          fetch-depth: 0
+      - name: Package repository source
+        run: git archive --format=tar.gz --output=source-snapshot.tar.gz HEAD
+      - uses: actions/upload-artifact@v4
+        with:
+          name: p1-finalization-source-snapshot
+          path: source-snapshot.tar.gz
+          if-no-files-found: error
+          retention-days: 1
