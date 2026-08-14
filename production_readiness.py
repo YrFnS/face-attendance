@@ -4,6 +4,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from urllib.parse import urlparse
 
+from camera_sources import camera_source_configuration_issues
 from model_manifest import (
     is_placeholder,
     resolve_path,
@@ -365,26 +366,9 @@ def check_production_readiness(
     for message in _ftp_permission_issues(cfg):
         issues.append(ReadinessIssue("ftp_permissions_unsafe", message))
 
-    camera_ids = (
-        cfg.get("camera_ids")
-        if isinstance(cfg.get("camera_ids"), dict)
-        else {}
-    )
-    in_id = _text(camera_ids.get("in"))
-    out_id = _text(camera_ids.get("out"))
-    if not in_id or not out_id:
+    for message in camera_source_configuration_issues(cfg, root):
         issues.append(
-            ReadinessIssue(
-                "camera_ids_missing",
-                "stable and explicit camera_ids.in and camera_ids.out are required",
-            )
-        )
-    elif in_id == out_id:
-        issues.append(
-            ReadinessIssue(
-                "camera_ids_duplicate",
-                "IN and OUT cameras must not use the same camera ID",
-            )
+            ReadinessIssue("camera_source_binding_invalid", message)
         )
 
     if bool(cfg.get("embedding_export_enabled", False)) and is_placeholder(
