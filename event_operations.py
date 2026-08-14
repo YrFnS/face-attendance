@@ -14,6 +14,7 @@ import unicodedata
 from datetime import datetime, timezone
 from pathlib import Path
 
+from event_identity import identity_contract
 from event_ledger import EVENT_REASON_CODES, EVENT_STATES, RETENTION_STATES
 
 
@@ -319,6 +320,7 @@ def explain_event(event, *, include_paths=False):
     if event is None:
         return None
     return {
+        "identifier_contract": identity_contract(),
         "event": {
             key: event.get(key)
             for key in (
@@ -360,6 +362,7 @@ def explain_event(event, *, include_paths=False):
         "decisions": [
             {
                 "decision_id": item.get("decision_id"),
+                "delivery_id": item.get("delivery_id"),
                 "version": item.get("decision_version"),
                 "face": f"{item.get('face_index')}/{item.get('face_count')}",
                 "accepted": bool(item.get("accepted")),

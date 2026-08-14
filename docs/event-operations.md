@@ -146,6 +146,8 @@ It also adds query indexes and a trigger that makes a nonempty `source_path` wri
 
 The existing migration framework creates and verifies a schema-version-3 backup before applying migration 4. Rollback requires the matching PR #15 application revision and that verified backup.
 
+Schema version 5 builds on these operator fields without changing their behavior; it adds the replay tombstones and identifier contract documented in `docs/event-identifiers-and-tombstones.md`.
+
 ## Operational acceptance
 
 Before shadow deployment, verify:

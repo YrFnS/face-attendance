@@ -34,6 +34,9 @@ The camera still sends an image because it cannot send an InsightFace embedding.
 
 - `face_attendance.py` — recognition/check-in helpers and legacy diagnostic commands that refuse live processing.
 - `watch_service.py` — production FTP watcher with readiness, PAD, replay protection, and event state.
+- `event_identity.py` — canonical content, capture, event, decision, and future delivery identifier semantics.
+- `idempotency_tombstones.py` — schema-v5 minimal replay tombstones retained after detailed event pruning.
+- `event_operations.py` and `event_admin.py` — redacted inspection plus audited pre-delivery operator workflows.
 - `embedding_gallery.py` — validates, normalizes, stores, and reloads galleries.
 - `secure_sync.py` — authoritative bounded gallery-sync client with authenticated, same-origin redirect validation.
 - `sync_embeddings.py` — manual or continuous gallery synchronization.
@@ -42,6 +45,7 @@ The camera still sends an image because it cannot send an InsightFace embedding.
 - `ftp_receiver.py` — receives camera FTP uploads.
 - `import_faces.py` — compatibility wrapper; now syncs embeddings instead of downloading images.
 - `docs/embedding-api.md` — API contract for an existing central dashboard.
+- `docs/event-identifiers-and-tombstones.md` — identifier scopes, replay behavior, pruning guarantees, and residual risks.
 - `docs/attendance-platform-plan.md` — phased plan for durable delivery, camera policy, operator workflows, enrollment, biometric assurance, and production validation.
 
 ## Linux install

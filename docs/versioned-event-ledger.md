@@ -8,14 +8,15 @@ This slice implements `P1-03` and `P1-04`. It does **not** yet make ERPNext deli
 
 The ledger keeps these identifiers distinct:
 
-- `event_id`: current camera, direction, and content-hash idempotency identity.
-- `capture_id`: deterministic capture identity using camera, content hash, source filename, byte size, and observed filesystem time.
-- `source_sha256`: complete source-file digest.
+- `source_sha256`: exact uploaded-byte content hash; identical bytes have the same digest across cameras.
+- `capture_id`: deterministic upload fingerprint using camera, content hash, source filename, byte size, and observed filesystem time.
+- `event_id`: backward-compatible local camera/direction/content key; it is not the ERPNext idempotency key.
 - `decision_id`: immutable hash of event ID, face index, and decision version.
+- `delivery_id`: domain-separated hash of one immutable decision ID; this is the only identifier intended to become the Phase 2 ERPNext idempotency key.
 
 `received_at` is the attendance node's immutable observation time and is the default `effective_at`. The signed FTP receipt time is stored separately as `transport_received_at`. Filesystem modification time is stored as `source_at` with provenance `filesystem_mtime_untrusted`; it is not silently promoted to authoritative attendance time.
 
-Phase 2 will add a separate immutable delivery ID. Phase 1 does not reuse a capture or event identifier as an ERPNext idempotency key.
+Phase 1 derives the immutable delivery ID so its scope is fixed before the outbox exists. Phase 2 will persist it on delivery jobs and enforce it on the ERPNext side. A capture or local event identifier is never reused as that idempotency key.
 
 ## Schema version 2
 
@@ -61,7 +62,7 @@ The mutable `camera_events.lifecycle_state` is a summary only; explanations come
 
 An append-only operator record for future reprocess, quarantine, dismissal, and review actions. The table is protected here; the audited inspection, reprocess, quarantine-resolution, and dismissal commands are documented in `docs/event-operations.md`.
 
-Update and direct-delete triggers prevent decisions, transitions, and operator actions from being rewritten. Normal parent-event retention deletion may cascade to detailed history. Long-lived replay tombstones are intentionally deferred to `P1-10`.
+Update and direct-delete triggers prevent decisions, transitions, and operator actions from being rewritten. Normal parent-event retention deletion may cascade to detailed history only after schema version 5 writes a minimal replay tombstone in the same transaction. See `docs/event-identifiers-and-tombstones.md`.
 
 ## Stable reason codes
 
@@ -141,4 +142,5 @@ The next ledger slices are:
 - `P1-06`: transactional cooldown and policy state.
 - `P1-07`: read-only list, inspect, and explain commands.
 - `P1-08`: audited reprocess, quarantine resolution, and dismissal.
-- `P1-10`: long-lived idempotency tombstones after detailed-event pruning.
+- `P1-09`: migration fixtures from a real released database copy.
+- Phase 2: durable delivery jobs and ERPNext-enforced use of the already-defined per-decision delivery ID.
