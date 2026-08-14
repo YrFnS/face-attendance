@@ -5,6 +5,7 @@ import unittest
 from pathlib import Path
 
 from event_ledger import (
+    EventLedgerValidationError,
     LEDGER_REQUIRED_TRIGGERS,
     make_capture_id,
     make_recognition_decision_id,
@@ -176,6 +177,38 @@ class EventLedgerTests(unittest.TestCase):
             event["operator_actions"][0]["detail"]["note"],
             "verified against source receipt",
         )
+
+    def test_event_identity_policy_and_effective_time_are_immutable(self):
+        self.record_receipt()
+        original = self.state.get_event(self.event_id)
+        for field, value in (
+            ("effective_at", "2026-08-15T00:00:00Z"),
+            ("branch", "Other Branch"),
+            ("source_principal", "other-camera"),
+            ("source_binding_id", "c" * 64),
+            ("policy", "OUT"),
+        ):
+            with self.assertRaisesRegex(
+                EventLedgerValidationError,
+                "unsupported event update fields",
+            ):
+                self.state.transition_event(
+                    self.event_id,
+                    to_state="source_verified",
+                    reason_code="source_verified",
+                    event_updates={field: value},
+                    compatibility_status="processing",
+                )
+        unchanged = self.state.get_event(self.event_id)
+        for field in (
+            "effective_at",
+            "branch",
+            "source_principal",
+            "source_binding_id",
+            "policy",
+        ):
+            self.assertEqual(unchanged[field], original[field])
+        self.assertEqual(len(unchanged["transitions"]), 1)
 
     def test_decisions_transitions_and_actions_cannot_be_changed_directly(self):
         self.record_receipt()
