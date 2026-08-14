@@ -1,0 +1,223 @@
+            "camera_source_receipt_secret": self._resolved_secret(
+                self.document.get("camera_source_receipt_secret"),
+                "camera_source_receipt_secret",
+            ),
+            "camera_source_receipt_future_tolerance_seconds": self.document.get(
+                "camera_source_receipt_future_tolerance_seconds",
+                300,
+            ),
+        }
+        try:
+            sources = load_camera_sources(minimal, self.root)
+        except CameraSourceError as exc:
+            raise EventOperationError(
+                f"camera source configuration is invalid: {exc}"
+            ) from exc
+        source = sources[0]
+        if event.get("branch") and event.get("branch") != source.branch:
+            raise EventOperationError(
+                "event branch does not match the configured camera"
+            )
+        if event.get("log_type") and event.get("log_type") != source.policy:
+            raise EventOperationError(
+                "event direction does not match the configured camera"
+            )
+        if (
+            event.get("source_principal")
+            and event.get("source_principal") != source.ftp_username
+        ):
+            raise EventOperationError(
+                "event source principal does not match the configured camera"
+            )
+        return minimal, source, sources
+
+    def _verify_content(self, event, path):
+        digest, size = self._file_sha256(path)
+        if digest != str(event.get("source_sha256") or ""):
+            raise EventOperationError(
+                "source evidence SHA-256 does not match the event"
+            )
+        if int(size) != int(event.get("source_size") or -1):
+            raise EventOperationError(
+                "source evidence size does not match the event"
+            )
+        return digest, size
+
+    def verify_original_source(self, event):
+        cfg, source, sources = self._camera_config(event)
+        name = self._safe_source_name(event.get("source_name"))
+        path = source.upload_dir / name
+        digest, size = self._verify_content(event, path)
+        try:
+            verified_source, source_receipt = verify_source_receipt(
+                path,
+                cfg,
+                self.root,
+                source_sha256=digest,
+                source_size=size,
+                sources=sources,
+            )
+        except CameraSourceError as exc:
+            raise EventOperationError(
+                f"source receipt verification failed: {exc}"
+            ) from exc
+        if verified_source != source or not source_receipt.verified:
+            raise EventOperationError("source receipt is not fully verified")
+        return path.resolve()
+
+    def find_quarantine_source(
+        self,
+        event,
+        *,
+        max_scan=QUARANTINE_SCAN_LIMIT_DEFAULT,
+    ):
+        if isinstance(max_scan, bool) or not isinstance(max_scan, int):
+            raise EventOperationError("max_scan must be an integer")
+        if not 1 <= max_scan <= QUARANTINE_SCAN_LIMIT_MAX:
+            raise EventOperationError(
+                f"max_scan must be between 1 and {QUARANTINE_SCAN_LIMIT_MAX}"
+            )
+        name = self._safe_source_name(event.get("source_name"))
+        raw_quarantine_root = self.root / "logs" / "quarantine"
+        try:
+            quarantine_root = _assert_no_symlink_components(
+                raw_quarantine_root,
+                label="quarantine root",
+            )
+        except EventInspectionError as exc:
+            raise EventOperationError(str(exc)) from exc
+        if not quarantine_root.is_dir():
+            raise EventOperationError(
+                f"quarantine directory does not exist: {quarantine_root}"
+            )
+        matches = []
+        scanned = 0
+        for candidate in quarantine_root.rglob("*"):
+            if candidate.name.endswith(".source.json"):
+                continue
+            if not candidate.is_file() or candidate.is_symlink():
+                continue
+            scanned += 1
+            if scanned > max_scan:
+                raise EventOperationError(
+                    f"quarantine scan exceeded {max_scan} regular files"
+                )
+            if (
+                candidate.name != name
+                and not candidate.name.endswith("_" + name)
+            ):
+                continue
+            try:
+                self._verify_content(event, candidate)
+            except EventOperationError:
+                continue
+            matches.append(candidate.resolve())
+        if not matches:
+            raise EventOperationError(
+                "matching source evidence was not found in quarantine"
+            )
+        if len(matches) != 1:
+            raise EventOperationError(
+                f"quarantine contains {len(matches)} matching source files; "
+                "resolve ambiguity manually"
+            )
+        if not receipt_path(matches[0]).is_file():
+            raise EventOperationError(
+                "matching quarantine source receipt is missing"
+            )
+        return matches[0]
+
+    @staticmethod
+    def _move(source, destination):
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            os.replace(source, destination)
+        except OSError:
+            shutil.move(str(source), str(destination))
+
+    def requeue_quarantine_source(
+        self,
+        event,
+        *,
+        max_scan=QUARANTINE_SCAN_LIMIT_DEFAULT,
+    ):
+        cfg, source, sources = self._camera_config(event)
+        quarantine_image = self.find_quarantine_source(
+            event,
+            max_scan=max_scan,
+        )
+        quarantine_receipt = receipt_path(quarantine_image)
+        destination_image = source.upload_dir / self._safe_source_name(
+            event.get("source_name")
+        )
+        destination_receipt = receipt_path(destination_image)
+        if destination_image.exists() or destination_receipt.exists():
+            raise EventOperationError(
+                "destination upload or receipt already exists; no files were moved"
+            )
+        self._move(quarantine_image, destination_image)
+        try:
+            self._move(quarantine_receipt, destination_receipt)
+            digest, size = self._verify_content(event, destination_image)
+            verified_source, source_receipt = verify_source_receipt(
+                destination_image,
+                cfg,
+                self.root,
+                source_sha256=digest,
+                source_size=size,
+                sources=sources,
+            )
+            if verified_source != source or not source_receipt.verified:
+                raise EventOperationError(
+                    "requeued source receipt is not fully verified"
+                )
+        except Exception as exc:
+            try:
+                if destination_receipt.exists():
+                    self._move(destination_receipt, quarantine_receipt)
+                if destination_image.exists():
+                    self._move(destination_image, quarantine_image)
+            except Exception as rollback_exc:
+                raise EventOperationError(
+                    "requeue validation failed and file rollback also failed: "
+                    f"{rollback_exc}"
+                ) from exc
+            if isinstance(exc, EventOperationError):
+                raise
+            if isinstance(exc, CameraSourceError):
+                raise EventOperationError(
+                    f"requeued source receipt is invalid: {exc}"
+                ) from exc
+            raise EventOperationError(
+                f"could not requeue quarantine source: {exc}"
+            ) from exc
+        return QuarantineMove(
+            quarantine_image=quarantine_image,
+            quarantine_receipt=quarantine_receipt,
+            destination_image=destination_image.resolve(),
+            destination_receipt=destination_receipt.resolve(),
+        )
+
+    def rollback_requeue(self, move):
+        errors = []
+        try:
+            if move.destination_receipt.exists():
+                self._move(
+                    move.destination_receipt,
+                    move.quarantine_receipt,
+                )
+        except Exception as exc:
+            errors.append(str(exc))
+        try:
+            if move.destination_image.exists():
+                self._move(
+                    move.destination_image,
+                    move.quarantine_image,
+                )
+        except Exception as exc:
+            errors.append(str(exc))
+        if errors:
+            raise EventOperationError(
+                "database update failed and source rollback was incomplete: "
+                + "; ".join(errors)
+            )
