@@ -1,0 +1,313 @@
+            row = connection.execute(
+                "SELECT * FROM camera_events WHERE event_id = ?",
+                (event_id,),
+            ).fetchone()
+            if row is None:
+                raise EventOperationError(f"event does not exist: {event_id}")
+            if self._active_lease(row, now):
+                raise EventOperationError("event has an active processing lease")
+            if self._delivery_started(row):
+                raise EventOperationError(
+                    "event crossed the delivery boundary; delivery retry is "
+                    "unavailable before Phase 2"
+                )
+            if row["lifecycle_state"] not in REPROCESSABLE_STATES:
+                raise EventOperationError(
+                    "event state cannot be reprocessed: "
+                    f"{row['lifecycle_state']}"
+                )
+            if self._uncertain_policy_tx(connection, event_id):
+                raise EventOperationError(
+                    "event has an uncertain attendance-policy reservation"
+                )
+            if source_file.name != row["source_name"]:
+                raise EventOperationError(
+                    "source evidence basename does not match the immutable event "
+                    "source_name"
+                )
+            digest = hashlib.sha256()
+            with source_file.open("rb") as handle:
+                while True:
+                    chunk = handle.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    digest.update(chunk)
+            if digest.hexdigest() != row["source_sha256"]:
+                raise EventOperationError(
+                    "source evidence SHA-256 does not match the immutable event "
+                    "content hash"
+                )
+            if int(metadata.st_size) != int(row["source_size"]):
+                raise EventOperationError(
+                    "source evidence size does not match the immutable event source "
+                    "size"
+                )
+            companion = receipt_path(source_file)
+            if companion.is_symlink() or not companion.is_file():
+                raise EventOperationError(
+                    "source evidence companion receipt is missing or is not a "
+                    "regular file"
+                )
+            self._release_policy_for_event_tx(
+                connection,
+                event_id,
+                uncertain=False,
+            )
+            action_id = self._insert_operator_action_tx(
+                connection,
+                event_id=event_id,
+                actor=actor,
+                action=action,
+                reason=reason,
+                detail={
+                    "source_path": source_path,
+                    "previous_state": row["lifecycle_state"],
+                    "previous_reason_code": row["reason_code"],
+                    "previous_processing_attempt": int(
+                        row["processing_attempt"]
+                    ),
+                },
+                created_at=created_at,
+            )
+            self._transition_tx(
+                connection,
+                row,
+                to_state="received",
+                reason_code="operator_action",
+                detail={
+                    "action": action,
+                    "action_id": action_id,
+                    "operator_reason": reason,
+                    "source_path": source_path,
+                },
+                compatibility_status="received",
+                actor_type="operator",
+                actor_id=actor,
+                error="",
+                column_updates={
+                    "completed_at": None,
+                    "final_disposition": "",
+                    "processing_phase": "idle",
+                    "lease_owner": "",
+                    "lease_acquired_at": "",
+                    "lease_heartbeat_at": "",
+                    "lease_expires_unix": 0.0,
+                    "delivery_started_at": "",
+                    "delivery_decision_id": "",
+                    "retention_state": "retained",
+                    "recovery_count": int(row["recovery_count"]) + 1,
+                },
+                terminal=False,
+                now=now,
+            )
+            connection.commit()
+            return {
+                "event_id": event_id,
+                "action_id": action_id,
+                "action": action,
+                "actor": actor,
+                "state": "received",
+                "source_path": source_path,
+                "delivery_retry_created": False,
+            }
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def operator_record_quarantine_resolution(
+        self,
+        event_id,
+        *,
+        actor,
+        reason,
+        source_path,
+        resolution="retain",
+        now=None,
+    ):
+        event_id = _identifier(event_id, "event_id")
+        actor, reason = _operator_actor_reason(actor, reason)
+        resolution = _text(
+            resolution,
+            "quarantine resolution",
+            required=True,
+            max_chars=32,
+        )
+        if resolution != "retain":
+            raise EventOperationError(
+                "record-only quarantine resolution supports retain; use requeue "
+                "for reprocessing"
+            )
+        source_path = _text(
+            str(source_path),
+            "source_path",
+            required=True,
+            max_chars=4096,
+        )
+        now = _finite(
+            now if now is not None else datetime.now(timezone.utc).timestamp(),
+            "now",
+            minimum=0,
+        )
+        created_at = timestamp_from_unix(now)
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT * FROM camera_events WHERE event_id = ?",
+                (event_id,),
+            ).fetchone()
+            if row is None:
+                raise EventOperationError(f"event does not exist: {event_id}")
+            if row["retention_state"] != "quarantined":
+                raise EventOperationError(
+                    "quarantine resolution requires an event whose "
+                    "retention_state is quarantined"
+                )
+            if self._active_lease(row, now):
+                raise EventOperationError("event has an active processing lease")
+            action_id = self._insert_operator_action_tx(
+                connection,
+                event_id=event_id,
+                actor=actor,
+                action="quarantine_retained",
+                reason=reason,
+                detail={
+                    "source_path": source_path,
+                    "resolution": "retain",
+                    "event_state": row["lifecycle_state"],
+                },
+                created_at=created_at,
+            )
+            connection.execute(
+                """
+                UPDATE camera_events
+                SET retention_state = 'quarantined', updated_unix = ?
+                WHERE event_id = ?
+                """,
+                (now, event_id),
+            )
+            connection.commit()
+            return {
+                "event_id": event_id,
+                "action_id": action_id,
+                "action": "quarantine_retained",
+                "actor": actor,
+                "state": row["lifecycle_state"],
+                "source_path": source_path,
+                "delivery_retry_created": False,
+            }
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+
+class EventSourceResolver:
+    """Validate and move retained source evidence without resolving unrelated secrets."""
+
+    def __init__(self, config_path):
+        try:
+            self.config_path = _assert_no_symlink_components(
+                config_path,
+                label="runtime configuration",
+            )
+        except EventInspectionError as exc:
+            raise EventOperationError(str(exc)) from exc
+        self.root = self.config_path.parent
+        try:
+            self.document = load_config_document(self.config_path)
+        except ConfigLoadError as exc:
+            raise EventOperationError(str(exc)) from exc
+
+    @staticmethod
+    def _safe_source_name(value):
+        name = _text(value, "source_name", required=True, max_chars=1024)
+        if (
+            Path(name).name != name
+            or name in {".", ".."}
+            or name.startswith(".")
+        ):
+            raise EventOperationError(
+                "event source_name is not a safe basename"
+            )
+        return name
+
+    @staticmethod
+    def _file_sha256(path, *, max_bytes=1024 * 1024 * 1024):
+        path = Path(path)
+        metadata = path.lstat()
+        if path.is_symlink() or not path.is_file():
+            raise EventOperationError(
+                "source evidence must be a regular non-symlink file: "
+                f"{path}"
+            )
+        if metadata.st_size > max_bytes:
+            raise EventOperationError(
+                f"source evidence exceeds {max_bytes} bytes"
+            )
+        digest = hashlib.sha256()
+        with path.open("rb") as handle:
+            while True:
+                chunk = handle.read(1024 * 1024)
+                if not chunk:
+                    break
+                digest.update(chunk)
+        return digest.hexdigest(), metadata.st_size
+
+    def _resolved_secret(self, value, field):
+        try:
+            resolved, _source = resolve_secret_reference(value, field=field)
+            return resolved
+        except SecretStoreError as exc:
+            raise EventOperationError(str(exc)) from exc
+
+    def _camera_config(self, event):
+        camera_id = _text(
+            event.get("camera_id"),
+            "camera_id",
+            required=True,
+            max_chars=128,
+        )
+        raw_sources = self.document.get("camera_sources")
+        if not isinstance(raw_sources, dict) or camera_id not in raw_sources:
+            raise EventOperationError(f"camera is not configured: {camera_id}")
+        camera_item = raw_sources[camera_id]
+        if not isinstance(camera_item, dict):
+            raise EventOperationError(
+                f"camera source is invalid: {camera_id}"
+            )
+        username = camera_item.get("ftp_username")
+        raw_users = self.document.get("ftp_users")
+        if not isinstance(raw_users, dict) or username not in raw_users:
+            raise EventOperationError(
+                f"camera FTP user is not configured: {username}"
+            )
+        user_item = raw_users[username]
+        if not isinstance(user_item, dict):
+            raise EventOperationError(
+                f"camera FTP user is invalid: {username}"
+            )
+        resolved_user = dict(user_item)
+        resolved_user["password"] = self._resolved_secret(
+            user_item.get("password"),
+            f"ftp_users.{username}.password",
+        )
+        minimal = {
+            "production_mode": bool(
+                self.document.get("production_mode", False)
+            ),
+            "branch_name": self.document.get("branch_name", ""),
+            "camera_uploads_dir": self.document.get(
+                "camera_uploads_dir",
+                str(self.root / "camera_uploads"),
+            ),
+            "camera_sources": {camera_id: dict(camera_item)},
+            "ftp_users": {username: resolved_user},
+            "ftp_permissions": self.document.get("ftp_permissions", "elw"),
+            "camera_source_receipt_required": self.document.get(
+                "camera_source_receipt_required",
+                True,
+            ),
