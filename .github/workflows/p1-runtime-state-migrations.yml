@@ -23,6 +23,7 @@ jobs:
       - name: Apply reviewed P1 payload
         run: |
           python p1_apply_runtime_state.py
+          python p1_fix_post_runtime_state.py
           python p1_post_runtime_state.py
       - name: Install test dependencies
         run: |
@@ -83,7 +84,8 @@ jobs:
           BASE_SHA: ff5288b6d42a342b699cff527c728d205229c6cd
           TARGET_BRANCH: agent/p1-runtime-state-migrations
         run: |
-          rm -f p1_payload.part.* p1_apply_runtime_state.py p1_post_runtime_state.py
+          rm -f p1_payload.part.* p1_apply_runtime_state.py
+          rm -f p1_post_runtime_state.py p1_fix_post_runtime_state.py
           rm -f .github/workflows/p1-runtime-state-migrations.yml
           git add -A
           git diff --cached --check
