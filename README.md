@@ -182,6 +182,9 @@ Recommended privacy-oriented settings:
   "save_rejected_crops": true,
   "save_checkin_crops": true,
   "attach_checkin_crop": true,
+  "attachment_worker_enabled": false,
+  "attachment_spool_dir": "/opt/face-attendance/attachment_spool",
+  "attachment_delete_spool_after_success": true,
   "delete_camera_uploads_after_processing": true,
   "audit_retention_days": 7
 }
@@ -192,7 +195,8 @@ Behavior:
 - `delete_camera_uploads_after_processing` deletes a readable FTP capture only after processing completes. A processing exception preserves the source image for investigation.
 - `save_rejected_crops` retains rejected audit crops under `logs/unknown/`.
 - `save_checkin_crops` retains accepted audit crops under `logs/checkins/`.
-- `attach_checkin_crop` attaches the accepted crop to ERPNext. It can work with `save_checkin_crops: false`; a temporary file is deleted after upload.
+- `attach_checkin_crop` creates a separate durable private-attachment job. The crop is copied into the protected attachment spool, remains independent from Employee Checkin delivery, and is deleted after confirmed upload by default. See `docs/attachment-jobs.md`.
+- Set `attachment_worker_enabled: true` when `delivery_mode` is `worker`; the synchronous compatibility path performs a separate best-effort upload without durable attachment retries.
 - `audit_retention_days` removes old accepted/rejected crops hourly. Set `0` to disable cleanup.
 
 ## Matching safeguards
@@ -310,6 +314,10 @@ Audited reprocess, quarantine-resolution, and dismissal commands require an acto
 ### Event identity and replay retention
 
 Runtime schema version 5 stores domain-separated capture, event, recognition-decision, and future ERPNext delivery IDs. A minimal camera/content tombstone is written with every receipt and survives detailed event pruning, so an old upload does not become eligible again merely because its verbose history expired. Frozen synthetic databases for released schema versions 1–4 exercise the real backup-before-migrate path. See `docs/event-identity-tombstones.md`.
+
+### Separate private crop delivery
+
+Runtime schema version 8 creates durable private crop attachment jobs. Employee Checkin creation and crop upload have independent leases and outcomes, so an attachment failure never downgrades a confirmed check-in. Protected spool media is retained until the attachment job becomes terminal. See `docs/attachment-jobs.md`.
 
 ## Durable delivery worker (P2-03)
 

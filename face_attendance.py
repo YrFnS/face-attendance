@@ -501,10 +501,20 @@ def create_checkin_api(employee, log_type, image_path=None, event_time=None):
         timeout_seconds=cfg.get("erpnext_request_timeout_seconds", 30),
     )
     request = EmployeeCheckinRequest.build(employee, log_type, event_time)
-    result = adapter.create_employee_checkin(request, image_path)
-    if image_path:
-        log(f"checkin attachment added: {result.docname} {Path(image_path).name}")
+    result = adapter.create_employee_checkin(request)
     log(f"checkin created: {request.employee} {request.log_type} {result.docname}")
+    if image_path:
+        try:
+            adapter.attach_private_file(result.docname, Path(image_path))
+            log(
+                f"checkin attachment added: {result.docname} "
+                f"{Path(image_path).name}"
+            )
+        except Exception as exc:
+            # P2-05: attachment failure never changes a confirmed check-in
+            # into a failed attendance delivery. The durable worker path uses
+            # an attachment job; this compatibility path records the failure.
+            log(f"checkin attachment failed after delivery: {exc}")
     return result.docname
 
 
@@ -523,8 +533,13 @@ def create_checkin_bench(employee, log_type, image_path=None, event_time=None):
         attach=attach,
         attachment_error_handler=attachment_failed,
     )
-    result = adapter.create_employee_checkin(request, image_path)
+    result = adapter.create_employee_checkin(request)
     log(f"checkin created: {request.employee} {request.log_type} {result.docname}")
+    if image_path:
+        try:
+            adapter.attach_private_file(result.docname, Path(image_path))
+        except Exception as exc:
+            attachment_failed(exc)
     return result.docname
 
 

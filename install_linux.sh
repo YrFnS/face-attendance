@@ -17,6 +17,8 @@ sudo rsync -a \
   --exclude .venv \
   --exclude config.json \
   --exclude camera_uploads \
+  --exclude delivery_attachments \
+  --exclude attachment_spool \
   --exclude logs \
   --exclude faces \
   --exclude embedding_gallery.json \
@@ -37,8 +39,8 @@ if [ ! -f "$APP_DIR/config.json" ]; then
   sudo -u "$SERVICE_USER" cp "$APP_DIR/config.example.json" "$APP_DIR/config.json"
 fi
 sudo chmod 600 "$APP_DIR/config.json"
-sudo -u "$SERVICE_USER" mkdir -p "$APP_DIR/faces" "$APP_DIR/camera_uploads" "$APP_DIR/logs"
-sudo chmod 700 "$APP_DIR/faces" "$APP_DIR/camera_uploads" "$APP_DIR/logs"
+sudo -u "$SERVICE_USER" mkdir -p "$APP_DIR/faces" "$APP_DIR/camera_uploads" "$APP_DIR/delivery_attachments" "$APP_DIR/attachment_spool" "$APP_DIR/logs"
+sudo chmod 700 "$APP_DIR/faces" "$APP_DIR/camera_uploads" "$APP_DIR/delivery_attachments" "$APP_DIR/attachment_spool" "$APP_DIR/logs"
 
 sudo cp "$APP_DIR"/deploy/systemd/*.service /etc/systemd/system/
 sudo cp "$APP_DIR"/deploy/systemd/*.timer /etc/systemd/system/
@@ -89,12 +91,12 @@ else
   echo "Watcher left stopped: configure and sync a valid embedding_gallery.json first; a legacy pickle does not enable live processing."
 fi
 
-DELIVERY_WORKER_ENABLED="$(sudo -u "$SERVICE_USER" "$APP_DIR/.venv/bin/python" -c 'import json,sys; cfg=json.load(open(sys.argv[1], encoding="utf-8")); mode=str(cfg.get("delivery_mode") or "synchronous").strip().lower(); print("1" if mode in {"worker", "outbox"} and cfg.get("delivery_worker_enabled") is True else "0")' "$APP_DIR/config.json")"
+DELIVERY_WORKER_ENABLED="$(sudo -u "$SERVICE_USER" "$APP_DIR/.venv/bin/python" -c 'import json,sys; cfg=json.load(open(sys.argv[1], encoding="utf-8")); mode=str(cfg.get("delivery_mode") or "synchronous").strip().lower(); delivery=mode in {"worker", "outbox"} and cfg.get("delivery_worker_enabled") is True; attachment=cfg.get("attach_checkin_crop", True) is True and cfg.get("attachment_worker_enabled") is True; print("1" if delivery or attachment else "0")' "$APP_DIR/config.json")"
 if [ "$DELIVERY_WORKER_ENABLED" = "1" ]; then
   sudo systemctl restart face-attendance-delivery
 else
   sudo systemctl stop face-attendance-delivery 2>/dev/null || true
-  echo "Delivery worker left stopped: set delivery_mode=worker and delivery_worker_enabled=true for staging after disabling crop attachment."
+  echo "Delivery service left stopped: enable worker delivery or the private attachment worker in a validated staging configuration."
 fi
 
 if [ "$SERVICE_USER" = "root" ]; then
@@ -112,6 +114,6 @@ echo "5. Configure and validate the PAD/liveness service."
 echo "6. Sync embeddings: sudo -u $SERVICE_USER $APP_DIR/.venv/bin/python $APP_DIR/sync_embeddings.py"
 echo "7. Run readiness checks: sudo -u $SERVICE_USER $APP_DIR/.venv/bin/python $APP_DIR/production_readiness.py --strict"
 echo "8. Validate old samples safely: sudo -u $SERVICE_USER $APP_DIR/.venv/bin/python $APP_DIR/watch_service.py --once --dry-run --allow-stale"
-echo "9. Validate the worker in non-production with delivery_mode=worker, delivery_worker_enabled=true, and attach_checkin_crop=false."
+echo "9. Validate worker delivery in non-production. For private crops also set attach_checkin_crop=true and attachment_worker_enabled=true."
 echo "10. Do not enable production worker delivery until ERPNext atomic delivery-id idempotency from P2-04 is verified."
 echo "11. After controlled validation, set production_mode=true and start face-attendance-watch."

@@ -11,6 +11,8 @@ from pathlib import Path
 import cv2
 
 import face_attendance as attendance
+from attachment_service import attachment_capacity_status
+from attachment_spool import discard_spooled_crop, spool_private_crop
 from delivery_service import delivery_capacity_status, delivery_mode
 from camera_sources import (
     CameraSourceError,
@@ -1042,7 +1044,7 @@ def process_path(
         selected_delivery_mode = delivery_mode(cfg)
         queued_decisions = 0
 
-        def persist_decision(decision):
+        def persist_decision(decision, attachment=None):
             if dry_run or not claim or not claim.accepted:
                 return None
             index = int(decision["face_index"])
@@ -1065,6 +1067,7 @@ def process_path(
                 recognition_model_version=versions["recognition_model_version"],
                 preprocessing_version=versions["preprocessing_version"],
                 decision_version=processing_attempt,
+                attachment=attachment,
                 **decision,
             )
 
@@ -1117,15 +1120,74 @@ def process_path(
                     f"reason={reservation.reason} remaining={reservation.remaining_seconds}s"
                 )
                 return False
+            attachment_record = None
+            attachment_metadata = None
+            decision_persisted = False
+            attachment_requested = bool(
+                selected_delivery_mode == "worker"
+                and cfg.get("attach_checkin_crop", True)
+            )
+            wants_attachment = bool(attachment_requested and image_path)
             try:
-                stored_decision_id = persist_decision(decision)
+                if attachment_requested and image_path is None:
+                    attachment_metadata = {
+                        "error_class": "attachment_crop_unavailable",
+                        "error": "accepted face crop could not be saved for attachment",
+                    }
+                    attendance.log(
+                        f"attachment crop unavailable decision={decision_id}"
+                    )
+                elif wants_attachment:
+                    capacity = attachment_capacity_status(state, cfg, ROOT)
+                    if capacity["ok"]:
+                        try:
+                            attachment_record = spool_private_crop(
+                                image_path,
+                                decision_id=decision_id,
+                                root=ROOT,
+                                cfg=cfg,
+                            )
+                            attachment_metadata = (
+                                attachment_record.to_job_metadata()
+                            )
+                        except Exception as exc:
+                            attachment_metadata = {
+                                "error_class": "attachment_spool_failed",
+                                "error": str(exc),
+                            }
+                            attendance.log(
+                                f"attachment spool failed decision={decision_id}: {exc}"
+                            )
+                    else:
+                        attachment_metadata = {
+                            "error_class": "attachment_capacity_unavailable",
+                            "error": "; ".join(capacity["reasons"]),
+                        }
+                        attendance.log(
+                            f"attachment job recorded without media "
+                            f"decision={decision_id}: "
+                            + "; ".join(capacity["reasons"])
+                        )
+                stored_decision_id = persist_decision(
+                    decision, attachment=attachment_metadata
+                )
                 if stored_decision_id != decision_id:
                     raise RuntimeError("recognition decision identity mismatch")
+                decision_persisted = True
                 if selected_delivery_mode == "worker":
                     queued_decisions += 1
+                    attachment_job = state.attachment_job_for_decision(
+                        decision_id
+                    )
+                    attachment_state = (
+                        attachment_job["state"]
+                        if attachment_job is not None
+                        else "not_requested"
+                    )
                     attendance.log(
                         f"delivery queued decision={decision_id} "
-                        f"employee={employee} direction={log_type}"
+                        f"employee={employee} direction={log_type} "
+                        f"attachment={attachment_state}"
                     )
                     return False
                 delivery_transport = getattr(
@@ -1141,6 +1203,15 @@ def process_path(
                     transport=delivery_transport,
                 )
             except Exception:
+                if (
+                    attachment_record is not None
+                    and attachment_record.newly_created
+                    and not decision_persisted
+                ):
+                    discard_spooled_crop(
+                        attachment_record,
+                        spool_root=Path(attachment_record.source_path).parent,
+                    )
                 state.release_attendance_policy_reservation(
                     scope_key=reservation.scope_key,
                     event_id=event_id,

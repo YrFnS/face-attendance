@@ -21,6 +21,11 @@ from pathlib import Path
 
 import requests
 
+from attachment_service import (
+    AttachmentWorker,
+    configuration_issues as attachment_configuration_issues,
+    settings_from_config as attachment_settings_from_config,
+)
 from erpnext_adapter import (
     ERPNextAdapter,
     ERPNextAdapterConfigurationError,
@@ -176,11 +181,7 @@ def configuration_issues(cfg):
         issues.append(
             "delivery_worker_enabled must be true when delivery_mode is worker"
         )
-    if mode == "worker" and bool(cfg.get("attach_checkin_crop", True)):
-        issues.append(
-            "attach_checkin_crop must be false in worker mode until P2-05 "
-            "adds separate attachment jobs"
-        )
+    issues.extend(attachment_configuration_issues(cfg, root=ROOT))
     if bool(cfg.get("production_mode", False)) and mode == "worker":
         issues.append(
             "production worker delivery remains blocked until P2-04 verifies "
@@ -392,6 +393,9 @@ class DeliveryWorker:
         sleep=time.sleep,
         random_source=random.random,
         logger=print,
+        attachment_settings=None,
+        attachment_cfg=None,
+        attachment_root=None,
     ):
         self.state = state
         self.adapter = adapter
@@ -402,36 +406,78 @@ class DeliveryWorker:
         self.logger = logger
         host = socket.gethostname().strip() or "unknown-host"
         self.owner = owner or f"delivery:{host}:{uuid.uuid4().hex}"
+        self.delivery_enabled = settings.mode == "worker" and settings.enabled
+        self.attachment_worker = None
+        if attachment_settings is not None and attachment_settings.enabled:
+            self.attachment_worker = AttachmentWorker(
+                state,
+                adapter,
+                attachment_settings,
+                owner=f"{self.owner}:attachment",
+                clock=clock,
+                random_source=random_source,
+                logger=logger,
+                cfg=attachment_cfg,
+                root=attachment_root,
+            )
 
     def recover(self):
-        return self.state.recover_expired_delivery_job_leases(
-            max_attempts=self.settings.max_attempts,
-            now=self.clock(),
-        )
+        outcomes = {"delivery": [], "attachments": []}
+        if self.delivery_enabled:
+            outcomes["delivery"] = self.state.recover_expired_delivery_job_leases(
+                max_attempts=self.settings.max_attempts,
+                now=self.clock(),
+            )
+        if self.attachment_worker is not None:
+            outcomes["attachments"] = self.attachment_worker.recover()
+        return outcomes
 
     def run_once(self, *, max_jobs=None):
         self.recover()
-        limit = self.settings.batch_size if max_jobs is None else int(max_jobs)
+        default_limit = 0
+        if self.delivery_enabled:
+            default_limit += self.settings.batch_size
+        if self.attachment_worker is not None:
+            default_limit += self.attachment_worker.settings.batch_size
+        limit = default_limit if max_jobs is None else int(max_jobs)
         if limit < 1 or limit > 1000:
             raise DeliveryWorkerConfigurationError(
                 "max_jobs must be between 1 and 1000"
             )
-        processed = 0
+        delivery_processed = 0
+        attachment_processed = 0
         outcomes = []
-        while processed < limit:
-            job = self.state.claim_next_delivery_job(
-                owner=self.owner,
-                lease_seconds=self.settings.lease_seconds,
-                transport=self.adapter.transport,
-                max_attempts=self.settings.max_attempts,
-                now=self.clock(),
+        if self.delivery_enabled:
+            delivery_limit = min(limit, self.settings.batch_size)
+            while delivery_processed < delivery_limit:
+                job = self.state.claim_next_delivery_job(
+                    owner=self.owner,
+                    lease_seconds=self.settings.lease_seconds,
+                    transport=self.adapter.transport,
+                    max_attempts=self.settings.max_attempts,
+                    now=self.clock(),
+                )
+                if job is None:
+                    break
+                outcomes.append(self._process_job(job))
+                delivery_processed += 1
+        remaining = limit - delivery_processed
+        if self.attachment_worker is not None and remaining > 0:
+            attachment_limit = min(
+                remaining,
+                self.attachment_worker.settings.batch_size,
             )
-            if job is None:
-                break
-            outcome = self._process_job(job)
-            outcomes.append(outcome)
-            processed += 1
-        return {"processed": processed, "outcomes": outcomes}
+            attached = self.attachment_worker.run_once(
+                max_jobs=attachment_limit
+            )
+            attachment_processed = int(attached["processed"])
+            outcomes.extend(attached["outcomes"])
+        return {
+            "processed": delivery_processed + attachment_processed,
+            "delivery_processed": delivery_processed,
+            "attachment_processed": attachment_processed,
+            "outcomes": outcomes,
+        }
 
     def _process_job(self, job):
         delivery_id = job["delivery_id"]
@@ -606,6 +652,9 @@ def _runtime_adapter(cfg):
     return build_erpnext_adapter(
         cfg,
         bench_execute=attendance.bench_execute,
+        bench_attach=lambda docname, path: attendance.attach_image(
+            "Employee Checkin", docname, path
+        ),
     )
 
 
@@ -626,8 +675,12 @@ def main(argv=None):
 
     cfg = load_config(Path(args.config))
     settings = settings_from_config(cfg)
-    if settings.mode != "worker" or not settings.enabled:
-        print("delivery worker disabled by configuration", flush=True)
+    attachment_settings = attachment_settings_from_config(cfg, root=ROOT)
+    if (
+        (settings.mode != "worker" or not settings.enabled)
+        and not attachment_settings.enabled
+    ):
+        print("delivery and attachment workers disabled by configuration", flush=True)
         return 0
 
     database = (
@@ -641,7 +694,14 @@ def main(argv=None):
     )
     state = RuntimeState(database)
     adapter = _runtime_adapter(cfg)
-    worker = DeliveryWorker(state, adapter, settings)
+    worker = DeliveryWorker(
+        state,
+        adapter,
+        settings,
+        attachment_settings=attachment_settings,
+        attachment_cfg=cfg,
+        attachment_root=ROOT,
+    )
 
     if args.once:
         result = worker.run_once(max_jobs=args.max_jobs)

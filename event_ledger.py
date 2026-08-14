@@ -7,6 +7,7 @@ import unicodedata
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
+from attachment_outbox import insert_attachment_job_tx
 from event_identity import (
     CAPTURE_ID_SCHEME,
     CONTENT_HASH_ALGORITHM,
@@ -1000,6 +1001,7 @@ class EventLedgerMixin:
         retention_state="pending",
         decision_version=1,
         delivery_contract_version=DEFAULT_DELIVERY_CONTRACT_VERSION,
+        attachment=None,
     ):
         event_id = _identifier(event_id, "event_id")
         face_index = _integer(face_index, "face_index", minimum=1)
@@ -1019,6 +1021,10 @@ class EventLedgerMixin:
             )
         if not isinstance(accepted, bool):
             raise EventLedgerValidationError("accepted must be a boolean")
+        if attachment is not None and not accepted:
+            raise EventLedgerValidationError(
+                "only accepted recognition decisions may request an attachment"
+            )
         if pad_score is not None:
             pad_score = _finite(pad_score, "pad_score", minimum=0, maximum=1)
         reason_code = _enum(reason_code, "reason_code", EVENT_REASON_CODES)
@@ -1125,6 +1131,12 @@ class EventLedgerMixin:
                 )
                 """,
                 values,
+            )
+            insert_attachment_job_tx(
+                connection,
+                decision_id,
+                attachment,
+                created_at,
             )
             connection.commit()
             return decision_id

@@ -152,9 +152,9 @@ class DeliveryWorkerTests(unittest.TestCase):
             logger=lambda _message: None,
         )
 
-    def test_schema_v7_has_worker_submission_boundary(self):
-        self.assertEqual(RUNTIME_SCHEMA_VERSION, 7)
-        self.assertEqual(self.state.migration_status()["schema_version"], 7)
+    def test_schema_v8_has_worker_submission_boundary(self):
+        self.assertEqual(RUNTIME_SCHEMA_VERSION, 8)
+        self.assertEqual(self.state.migration_status()["schema_version"], 8)
         connection = sqlite3.connect(self.state.path)
         try:
             columns = {
@@ -211,12 +211,13 @@ class DeliveryWorkerTests(unittest.TestCase):
                 "delivery_mode": "worker",
                 "delivery_worker_enabled": False,
                 "attach_checkin_crop": True,
+                "attachment_worker_enabled": False,
                 "production_mode": True,
             }
         )
         text = "\n".join(issues)
         self.assertIn("delivery_worker_enabled", text)
-        self.assertIn("attach_checkin_crop", text)
+        self.assertIn("attachment_worker_enabled", text)
         self.assertIn("P2-04", text)
 
     def test_claim_is_exclusive_and_pre_submission_expiry_requeues(self):

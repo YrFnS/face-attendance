@@ -1,6 +1,21 @@
+import sys
 import tempfile
+import types
 import unittest
 from pathlib import Path
+from unittest import mock
+
+import requests
+
+if "insightface.app" not in sys.modules:
+    insightface = types.ModuleType("insightface")
+    insightface_app = types.ModuleType("insightface.app")
+    insightface_app.FaceAnalysis = object
+    insightface.app = insightface_app
+    sys.modules["insightface"] = insightface
+    sys.modules["insightface.app"] = insightface_app
+
+import face_attendance
 
 from erpnext_adapter import (
     BenchERPNextAdapter,
@@ -117,9 +132,11 @@ class ERPNextAdapterTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             image = Path(temp) / "checkin.jpg"
             image.write_bytes(b"jpeg")
-            result = adapter.create_employee_checkin(request, image)
+            result = adapter.create_employee_checkin(request)
+            attachment = adapter.attach_private_file(result.docname, image)
 
         self.assertEqual(result.docname, "CHK-0001")
+        self.assertEqual(attachment.file_docname, "FILE-0001")
         self.assertEqual(result.transport, "rest")
         self.assertEqual(len(session.calls), 2)
         create_url, create = session.calls[0]
@@ -175,7 +192,8 @@ class ERPNextAdapterTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             image = Path(temp) / "out.jpg"
             image.write_bytes(b"jpeg")
-            result = adapter.create_employee_checkin(request, image)
+            result = adapter.create_employee_checkin(request)
+            attachment = adapter.attach_private_file(result.docname, image)
 
         self.assertEqual(result.docname, "CHK-BENCH-1")
         self.assertEqual(result.transport, "bench")
@@ -190,6 +208,53 @@ class ERPNextAdapterTests(unittest.TestCase):
             },
         )
         self.assertEqual(attachments, [("CHK-BENCH-1", "out.jpg")])
+
+    def test_synchronous_attachment_failure_does_not_fail_created_checkin(self):
+        class Adapter:
+            def create_employee_checkin(self, request, image_path=None):
+                self.request = request
+                return type(
+                    "Result",
+                    (),
+                    {"docname": "CHK-SAFE-1", "transport": "rest"},
+                )()
+
+            def attach_private_file(self, docname, image_path):
+                raise requests.ReadTimeout("attachment response lost")
+
+        with tempfile.TemporaryDirectory() as temp:
+            image = Path(temp) / "crop.jpg"
+            image.write_bytes(b"jpeg")
+            with (
+                mock.patch.object(
+                    face_attendance,
+                    "load_config",
+                    return_value={
+                        "frappe_url": "https://erp.example.com",
+                        "frappe_api_key": "key",
+                        "frappe_api_secret": "secret",
+                    },
+                ),
+                mock.patch.object(
+                    face_attendance,
+                    "RESTERPNextAdapter",
+                    return_value=Adapter(),
+                ),
+                mock.patch.object(face_attendance, "log") as logger,
+            ):
+                docname = face_attendance.create_checkin_api(
+                    "HR-0001",
+                    "IN",
+                    image,
+                    "2026-08-14T00:00:00Z",
+                )
+        self.assertEqual(docname, "CHK-SAFE-1")
+        self.assertTrue(
+            any(
+                "attachment failed after delivery" in str(call)
+                for call in logger.call_args_list
+            )
+        )
 
     def test_factory_requires_bench_callback(self):
         with self.assertRaisesRegex(
