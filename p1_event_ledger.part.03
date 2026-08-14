@@ -1,0 +1,230 @@
+
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            existing = connection.execute(
+                """
+                SELECT event_id, status, capture_id
+                FROM camera_events
+                WHERE event_id = ? OR (camera_id = ? AND source_sha256 = ?)
+                LIMIT 1
+                """,
+                (event_id, camera_id, source_sha256),
+            ).fetchone()
+            if existing:
+                connection.rollback()
+                return LedgerClaim(
+                    False,
+                    existing["event_id"],
+                    reason="duplicate",
+                    existing_status=existing["status"],
+                    capture_id=existing["capture_id"] or "",
+                )
+            connection.execute(
+                """
+                INSERT INTO camera_events (
+                    event_id, camera_id, log_type, source_sha256, source_name,
+                    source_mtime, source_size, status, created_unix, updated_unix,
+                    completed_at, error, capture_id, received_at, received_unix,
+                    transport_received_at, source_at, source_time_provenance,
+                    effective_at, branch, source_type, source_principal,
+                    source_remote_ip, source_binding_id, policy, receipt_state,
+                    receipt_verified, receipt_json, lifecycle_state, state_version,
+                    reason_code, policy_version, retention_state
+                ) VALUES (
+                    ?, ?, ?, ?, ?, ?, ?, 'received', ?, ?, NULL, '', ?, ?, ?,
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'received', 1, ?, ?, 'pending'
+                )
+                """,
+                (
+                    event_id,
+                    camera_id,
+                    log_type,
+                    source_sha256,
+                    source_name,
+                    source_mtime,
+                    source_size,
+                    received_unix,
+                    received_unix,
+                    capture_id,
+                    received_at,
+                    received_unix,
+                    transport_received_at,
+                    source_at or None,
+                    _text(
+                        source_time_provenance,
+                        "source_time_provenance",
+                        max_chars=128,
+                    ),
+                    effective_at,
+                    _text(branch, "branch", max_chars=128),
+                    _text(source_type, "source_type", max_chars=64),
+                    _text(source_principal, "source_principal", max_chars=128),
+                    _text(source_remote_ip, "source_remote_ip", max_chars=128),
+                    _text(source_binding_id, "source_binding_id", max_chars=128),
+                    policy,
+                    receipt_state,
+                    int(receipt_verified),
+                    receipt_json,
+                    reason_code,
+                    _text(policy_version, "policy_version", max_chars=128),
+                ),
+            )
+            connection.execute(
+                """
+                INSERT INTO event_transitions (
+                    event_id, sequence, from_state, to_state, reason_code,
+                    actor_type, actor_id, detail_json, created_at
+                ) VALUES (?, 1, '', 'received', ?, 'watcher', '', ?, ?)
+                """,
+                (event_id, reason_code, receipt_json, received_at),
+            )
+            connection.commit()
+            return LedgerClaim(True, event_id, capture_id=capture_id)
+        finally:
+            connection.close()
+
+    def transition_event(
+        self,
+        event_id,
+        *,
+        to_state,
+        reason_code,
+        actor_type="watcher",
+        actor_id="",
+        detail=None,
+        event_updates=None,
+        compatibility_status=None,
+        error="",
+    ):
+        event_id = _identifier(event_id, "event_id")
+        to_state = _enum(to_state, "to_state", EVENT_STATES)
+        reason_code = _enum(reason_code, "reason_code", EVENT_REASON_CODES)
+        actor_type = _enum(actor_type, "actor_type", ACTOR_TYPES)
+        actor_id = _text(actor_id, "actor_id", max_chars=256)
+        detail_json = _json_text(detail, "transition detail")
+        updates = self._event_update_values(event_updates or {})
+        status = _text(
+            compatibility_status or to_state,
+            "compatibility_status",
+            required=True,
+            max_chars=64,
+        )
+        error = _text(str(error or "")[:2000], "error", max_chars=2000)
+        created_at = utc_now()
+        now = datetime.fromisoformat(created_at.replace("Z", "+00:00")).timestamp()
+
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """
+                SELECT lifecycle_state, state_version
+                FROM camera_events WHERE event_id = ?
+                """,
+                (event_id,),
+            ).fetchone()
+            if row is None:
+                raise EventLedgerValidationError(f"event does not exist: {event_id}")
+            from_state = row["lifecycle_state"]
+            sequence = int(row["state_version"]) + 1
+            assignments = [
+                "status = ?",
+                "lifecycle_state = ?",
+                "state_version = ?",
+                "reason_code = ?",
+                "updated_unix = ?",
+                "error = ?",
+            ]
+            values = [status, to_state, sequence, reason_code, now, error]
+            for key, value in updates.items():
+                assignments.append(f"{key} = ?")
+                values.append(value)
+            if to_state in TERMINAL_EVENT_STATES:
+                assignments.extend(["completed_at = ?", "final_disposition = ?"])
+                values.extend([created_at, updates.get("final_disposition") or reason_code])
+            values.append(event_id)
+            connection.execute(
+                f"UPDATE camera_events SET {', '.join(assignments)} WHERE event_id = ?",
+                values,
+            )
+            connection.execute(
+                """
+                INSERT INTO event_transitions (
+                    event_id, sequence, from_state, to_state, reason_code,
+                    actor_type, actor_id, detail_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    event_id,
+                    sequence,
+                    from_state,
+                    to_state,
+                    reason_code,
+                    actor_type,
+                    actor_id,
+                    detail_json,
+                    created_at,
+                ),
+            )
+            connection.commit()
+            return sequence
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def record_recognition_decision(
+        self,
+        *,
+        event_id,
+        face_index,
+        face_count,
+        bbox,
+        face_width,
+        face_height,
+        detection_score,
+        best_employee="",
+        best_score=0.0,
+        runner_up_score=0.0,
+        score_margin=0.0,
+        pad_passed=False,
+        pad_skipped=False,
+        pad_score=None,
+        pad_provider="",
+        pad_model="",
+        pad_evidence_id="",
+        pad_binding_id="",
+        accepted=False,
+        reason_code,
+        candidate_log_type="",
+        policy_version="",
+        gallery_version="",
+        gallery_generated_at="",
+        gallery_model="",
+        gallery_model_version="",
+        recognition_model="",
+        recognition_model_version="",
+        preprocessing_version="",
+        retention_state="pending",
+        decision_version=1,
+    ):
+        event_id = _identifier(event_id, "event_id")
+        face_index = _integer(face_index, "face_index", minimum=1)
+        face_count = _integer(face_count, "face_count", minimum=face_index)
+        decision_version = _integer(
+            decision_version, "decision_version", minimum=1, maximum=1_000_000
+        )
+        if not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
+            raise EventLedgerValidationError("bbox must contain four integers")
+        bbox_values = [
+            int(round(_finite(value, f"bbox[{index}]")))
+            for index, value in enumerate(bbox)
+        ]
+        if not isinstance(pad_passed, bool) or not isinstance(pad_skipped, bool):
+            raise EventLedgerValidationError(
+                "pad_passed and pad_skipped must be booleans"
+            )
+        if not isinstance(accepted, bool):
+            raise EventLedgerValidationError("accepted must be a boolean")
