@@ -280,8 +280,8 @@ Release A requires no Redis, Celery, PostgreSQL, or message broker. Introduce on
 - [x] `P1-04` Persist a normalized receipt before time/size/decode rejection, then persist model, gallery, PAD, scores, margin, policy, immutable event times, and retention outcome for every decision.
 - [x] `P1-05` Replace permanent `processing` claims with leases and explicit startup recovery: safely retry pre-delivery work; classify delivery ambiguity as `uncertain`.
 - [x] `P1-06` Move cooldown and event-policy state into the transactional store. Scope cooldown deliberately by employee, direction, branch, and policy; eliminate crash-stranded lock files.
-- [ ] `P1-07` Add read-only CLI commands to list, inspect, and explain events without exposing secrets or biometric vectors.
-- [ ] `P1-08` Add audited event reprocess, quarantine-resolution, and dismissal commands with required reasons. Delivery retry/cancel begins only after Phase 2 creates delivery jobs.
+- [x] `P1-07` Add read-only CLI commands to list, inspect, and explain events without exposing secrets or biometric vectors.
+- [x] `P1-08` Add audited event reprocess, quarantine-resolution, and dismissal commands with required reasons. Delivery retry/cancel begins only after Phase 2 creates delivery jobs.
 - [ ] `P1-09` Keep old event rows readable through the retention window and test migration from a real copy of the current schema.
 - [ ] `P1-10` Retain minimal content/capture idempotency tombstones after detailed event/media expiry so normal pruning cannot make an old upload eligible again.
 - [ ] `P1-11` Define and test distinct capture ID, content hash, recognition-decision ID, and delivery ID semantics.

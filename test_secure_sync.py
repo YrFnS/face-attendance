@@ -77,6 +77,9 @@ class SecureSyncTests(unittest.TestCase):
             "embedding_sync_retries": 0,
             "embedding_max_response_bytes": 1024 * 1024,
         }
+        self.release_time = datetime.now(timezone.utc).replace(
+            microsecond=0
+        ) - timedelta(minutes=10)
         self.private = Ed25519PrivateKey.generate()
         public = self.private.public_key().public_bytes(
             encoding=serialization.Encoding.Raw,
@@ -127,7 +130,9 @@ class SecureSyncTests(unittest.TestCase):
             publisher="central-enrollment",
             key_id="key-2026",
             sequence=sequence,
-            generated_at=f"2026-08-13T12:{sequence:02d}:00Z",
+            generated_at=(
+                self.release_time + timedelta(minutes=sequence)
+            ).isoformat().replace("+00:00", "Z"),
             validation_options={
                 "expected_model": "buffalo_l",
                 "expected_model_version": "approved-v1",

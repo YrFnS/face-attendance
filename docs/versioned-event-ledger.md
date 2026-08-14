@@ -59,7 +59,7 @@ The mutable `camera_events.lifecycle_state` is a summary only; explanations come
 
 ### `operator_actions`
 
-An append-only operator record for future reprocess, quarantine, dismissal, and review actions. This slice creates and protects the table; audited mutation commands arrive in `P1-08`.
+An append-only operator record for future reprocess, quarantine, dismissal, and review actions. The table is protected here; the audited inspection, reprocess, quarantine-resolution, and dismissal commands are documented in `docs/event-operations.md`.
 
 Update and direct-delete triggers prevent decisions, transitions, and operator actions from being rewritten. Normal parent-event retention deletion may cascade to detailed history. Long-lived replay tombstones are intentionally deferred to `P1-10`.
 
