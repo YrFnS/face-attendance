@@ -126,13 +126,13 @@ jobs:
           rm -f .github/workflows/p1-event-operations-stage.yml
           git add -A
           git diff --cached --check
-          echo "Final changed files:"
-          git diff --cached --name-only
-          test "$(git diff --cached --name-only | wc -l)" -eq 17
           tree=$(git write-tree)
           export GIT_AUTHOR_NAME='github-actions[bot]'
           export GIT_AUTHOR_EMAIL='41898282+github-actions[bot]@users.noreply.github.com'
           export GIT_COMMITTER_NAME="$GIT_AUTHOR_NAME"
           export GIT_COMMITTER_EMAIL="$GIT_AUTHOR_EMAIL"
           commit=$(printf '%s\n' 'add audited event inspection and operator workflows' | git commit-tree "$tree" -p "$BASE_SHA")
+          echo "Final changed files:"
+          git diff-tree --no-commit-id --name-only -r "$commit"
+          test "$(git diff-tree --no-commit-id --name-only -r "$commit" | wc -l)" -eq 17
           git push --force origin "$commit:refs/heads/$TARGET_BRANCH"
