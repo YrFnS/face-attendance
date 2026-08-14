@@ -7,10 +7,10 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 TREE_SHA = "e33f2cc1e959b818763843f2356e2ca74ee14593"
 EXPECTED = {
-    **{f".h0/camera_sources.py.{index:03d}.part" for index in range(7)},
-    **{f".h0/test_camera_sources.py.{index:03d}.part" for index in range(3)},
-    **{f".h0/test_ftp_receiver.py.{index:03d}.part" for index in range(2)},
-    **{f".h0/test_watch_service.py.{index:03d}.part" for index in range(3)},
+    *{f".h0/camera_sources.py.{index:03d}.part" for index in range(7)},
+    *{f".h0/test_camera_sources.py.{index:03d}.part" for index in range(3)},
+    *{f".h0/test_ftp_receiver.py.{index:03d}.part" for index in range(2)},
+    *{f".h0/test_watch_service.py.{index:03d}.part" for index in range(3)},
 }
 
 
