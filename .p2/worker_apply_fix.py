@@ -1,6 +1,6 @@
 from pathlib import Path
 
-path = Path(__file__).resolve().parent.parent / "processing_recovery.py"
+path = Path.cwd() / "processing_recovery.py"
 source = path.read_text(encoding="utf-8")
 needle = '''                    reserved_job = connection.execute(
                         """
