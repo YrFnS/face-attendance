@@ -348,6 +348,100 @@ class WatchServiceTests(unittest.TestCase):
         self.assertEqual(event["status"], "rejected")
         self.assertIn("2:presentation_attack", event["error"])
 
+    def test_upload_size_rejection_persists_receipt_before_policy(self):
+        self.cfg["max_camera_upload_bytes"] = 1
+        app = FakeApp([FakeFace()])
+        result = watch_service.process_path(
+            self.image_path,
+            app,
+            [],
+            StaticGallery([]),
+            self.cfg,
+            self.state,
+            self.pad_gate,
+            sources=self.sources,
+        )
+        self.assertFalse(result)
+        self.assertEqual(app.calls, 0)
+        event = self.state.get_event(self.event_id())
+        self.assertEqual(event["status"], "rejected")
+        self.assertEqual(event["reason_code"], "upload_too_large")
+        self.assertEqual(event["transitions"][0]["to_state"], "received")
+        self.assertEqual(
+            event["transitions"][-1]["reason_code"],
+            "upload_too_large",
+        )
+
+    def test_recognition_decision_persists_pad_gallery_model_and_policy(self):
+        self.cfg.update(
+            model="buffalo_l",
+            model_version="approved-v1",
+            preprocessing_version="preprocess-v1",
+            attendance_policy_version="directional-v2",
+        )
+
+        class MetadataGallery(StaticGallery):
+            def __init__(self):
+                super().__init__([{"employee": "HR-1"}])
+                self.reloader = types.SimpleNamespace(
+                    metadata={
+                        "gallery_version": "gallery-42",
+                        "generated_at": "2026-08-14T00:00:00Z",
+                        "model": "buffalo_l",
+                        "model_version": "approved-v1",
+                    }
+                )
+
+        def process_image(_image, _source, bound_app, _known, _cfg, _dry_run, **kwargs):
+            bound_app.get(np.zeros((1, 1, 3), dtype=np.uint8))
+            kwargs["decision_callback"](
+                {
+                    "face_index": 1,
+                    "face_count": 1,
+                    "bbox": [5, 2, 25, 30],
+                    "face_width": 20.0,
+                    "face_height": 28.0,
+                    "detection_score": 0.99,
+                    "best_employee": "HR-1",
+                    "best_score": 0.91,
+                    "runner_up_score": 0.55,
+                    "score_margin": 0.36,
+                    "accepted": True,
+                    "reason_code": "accepted_candidate",
+                    "candidate_log_type": "IN",
+                    "retention_state": "retained",
+                }
+            )
+            return False
+
+        attendance.process_image = process_image
+        result = watch_service.process_path(
+            self.image_path,
+            FakeApp([FakeFace(5)]),
+            [],
+            MetadataGallery(),
+            self.cfg,
+            self.state,
+            PassingPAD(),
+            sources=self.sources,
+        )
+        self.assertFalse(result)
+        event = self.state.get_event(self.event_id())
+        self.assertTrue(event["receipt_verified"])
+        self.assertEqual(event["gallery_version"], "gallery-42")
+        self.assertEqual(event["policy_version"], "directional-v2")
+        self.assertEqual(len(event["decisions"]), 1)
+        decision = event["decisions"][0]
+        self.assertEqual(decision["best_employee"], "HR-1")
+        self.assertAlmostEqual(decision["best_score"], 0.91)
+        self.assertAlmostEqual(decision["runner_up_score"], 0.55)
+        self.assertAlmostEqual(decision["score_margin"], 0.36)
+        self.assertEqual(decision["pad_provider"], "approved-provider")
+        self.assertEqual(decision["pad_model"], "liveness-v3")
+        self.assertEqual(decision["gallery_version"], "gallery-42")
+        self.assertEqual(decision["recognition_model_version"], "approved-v1")
+        self.assertEqual(decision["reason_code"], "accepted_candidate")
+
 
 if __name__ == "__main__":
     unittest.main()

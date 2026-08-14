@@ -7,6 +7,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest.mock import patch
 
+from test_event_ledger import EventLedgerTests
 from runtime_state import (
     MIGRATION_BY_VERSION,
     RUNTIME_SCHEMA_VERSION,
@@ -153,7 +154,9 @@ class RuntimeStateTests(unittest.TestCase):
             0,
         )
         self.assertEqual(state.get_event(legacy_event)["status"], "processed")
-        self.assertEqual(state.migration_status()["schema_version"], 1)
+        self.assertEqual(
+            state.migration_status()["schema_version"], RUNTIME_SCHEMA_VERSION
+        )
 
     def test_incompatible_legacy_schema_rolls_back_after_verified_backup(self):
         incompatible = self.root / "incompatible.sqlite3"
@@ -215,7 +218,10 @@ class RuntimeStateTests(unittest.TestCase):
                 states = [future.result(timeout=20) for future in futures]
 
         self.assertTrue(all(state.migration_status()["ok"] for state in states))
-        self.assertEqual(states[0].migration_status()["schema_version"], 1)
+        self.assertEqual(
+            states[0].migration_status()["schema_version"],
+            RUNTIME_SCHEMA_VERSION,
+        )
         self.assertGreaterEqual(len(list(self.backups.glob("*.sqlite3"))), 1)
 
     def test_legacy_schema_type_and_index_shape_are_verified(self):
@@ -273,7 +279,7 @@ class RuntimeStateTests(unittest.TestCase):
 
     def test_failed_migration_is_transactional(self):
         bad = Migration(
-            2,
+            RUNTIME_SCHEMA_VERSION + 1,
             "intentional_failure",
             (
                 "CREATE TABLE migration_should_rollback (id INTEGER PRIMARY KEY)",
