@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
+from event_operations import EventOperationsMixin
 from event_ledger import (
     EventLedgerMixin,
     LEDGER_REQUIRED_INDEXES,
@@ -806,7 +807,11 @@ def restore_runtime_backup(
             pass
 
 
-class RuntimeState(ProcessingRecoveryMixin, EventLedgerMixin):
+class RuntimeState(
+    EventOperationsMixin,
+    ProcessingRecoveryMixin,
+    EventLedgerMixin,
+):
     def __init__(self, path, backup_dir=None):
         self.path = Path(path)
         self.backup_dir = _backup_directory(self.path, backup_dir)

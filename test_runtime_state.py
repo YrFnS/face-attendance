@@ -7,6 +7,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest.mock import patch
 
+from test_event_admin import EventAdminTests
 from test_event_ledger import EventLedgerTests
 from test_processing_recovery import ProcessingRecoveryTests
 from runtime_state import (

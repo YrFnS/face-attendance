@@ -175,6 +175,10 @@ python runtime_state_admin.py verify \
 
 Rollback requires the matching older application revision and the verified schema-version-2 pre-migration backup. Follow `docs/runtime-state-migrations.md` rather than editing schema versions or policy rows manually.
 
+## Event inspection and operator resolution
+
+Use `event_admin.py` for read-only list, inspect, and explain commands, and for the narrowly scoped audited pre-delivery actions implemented in Phase 1. See `docs/event-operations-cli.md`. The CLI deliberately provides no delivery retry or cancel command before Phase 2 idempotent delivery jobs.
+
 ## Acceptance checks
 
 Before a shadow deployment, verify all of these cases:
