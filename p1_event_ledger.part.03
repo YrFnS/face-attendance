@@ -110,7 +110,13 @@
             required=True,
             max_chars=64,
         )
-        error = _text(str(error or "")[:2000], "error", max_chars=2000)
+        raw_error = str(error or "")[:2000]
+        error = "".join(
+            character
+            if unicodedata.category(character) not in {"Cc", "Cf", "Cs"}
+            else f"\\u{ord(character):04x}"
+            for character in raw_error
+        )
         created_at = utc_now()
         now = datetime.fromisoformat(created_at.replace("Z", "+00:00")).timestamp()
 
@@ -137,12 +143,13 @@
                 "error = ?",
             ]
             values = [status, to_state, sequence, reason_code, now, error]
+            final_disposition = updates.pop("final_disposition", "")
             for key, value in updates.items():
                 assignments.append(f"{key} = ?")
                 values.append(value)
             if to_state in TERMINAL_EVENT_STATES:
                 assignments.extend(["completed_at = ?", "final_disposition = ?"])
-                values.extend([created_at, updates.get("final_disposition") or reason_code])
+                values.extend([created_at, final_disposition or reason_code])
             values.append(event_id)
             connection.execute(
                 f"UPDATE camera_events SET {', '.join(assignments)} WHERE event_id = ?",
