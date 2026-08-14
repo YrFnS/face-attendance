@@ -126,6 +126,7 @@ jobs:
           BASE_SHA: 28828795ad57cb8788578f1ee7d877b07e74796b
           TARGET_BRANCH: agent/p1-event-operations
         run: |
+          git reset "$BASE_SHA"
           rm -f p1_apply_event_operations.py
           rm -f p1_event_operations_final.*.part
           rm -f .github/workflows/p1-event-operations.yml
