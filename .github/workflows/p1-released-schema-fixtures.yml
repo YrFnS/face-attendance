@@ -1,0 +1,676 @@
+name: P1 released schema fixtures
+
+on:
+  push:
+    branches:
+      - agent/p1-idempotency-stage
+
+permissions:
+  contents: write
+
+jobs:
+  validate-and-publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      BASE_SHA: 73d039568f4afb0e71f7dd0577fa812971722b92
+      FIXTURE_SHA: 9850bae81d1b8a0f3d545726a9c48961163a0bfd
+      TARGET_BRANCH: agent/p1-released-schema-fixtures
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v7.0.0
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Build released-schema compatibility slice
+        run: |
+          set -euo pipefail
+          git cat-file -e "$BASE_SHA^{commit}"
+          git cat-file -e "$FIXTURE_SHA^{commit}"
+          git checkout --detach "$BASE_SHA"
+
+          rm -rf tests/fixtures
+          mkdir -p tests/fixtures
+          for name in \
+            runtime_state_v1.sqlite3.gz.b64 \
+            runtime_state_v2.sqlite3.gz.b64 \
+            runtime_state_v3.sqlite3.gz.b64 \
+            runtime_state_v4.sqlite3.gz.b64
+          do
+            git show "$FIXTURE_SHA:tests/fixtures/$name" > "tests/fixtures/$name"
+          done
+          git show "$FIXTURE_SHA:tests/fixtures/manifest.json" \
+            > /tmp/original-released-schema-manifest.json
+
+          python - <<'PY'
+          from __future__ import annotations
+
+          import base64
+          import gzip
+          import hashlib
+          import json
+          import re
+          import sqlite3
+          from pathlib import Path
+
+          fixture_dir = Path("tests/fixtures")
+          original = json.loads(
+              Path("/tmp/original-released-schema-manifest.json").read_text(
+                  encoding="utf-8"
+              )
+          )
+          original_entries = {
+              str(item.get("name")): item
+              for item in original.get("fixtures", [])
+              if isinstance(item, dict) and item.get("name")
+          }
+          fixtures = []
+          for path in sorted(fixture_dir.glob("runtime_state_v*.sqlite3.gz.b64")):
+              match = re.fullmatch(
+                  r"runtime_state_v(?P<version>[1-9][0-9]*)\.sqlite3\.gz\.b64",
+                  path.name,
+              )
+              if not match:
+                  raise SystemExit(f"unexpected fixture name: {path.name}")
+              encoded = b"".join(path.read_bytes().split())
+              raw = gzip.decompress(base64.b64decode(encoded, validate=True))
+              connection = sqlite3.connect(":memory:")
+              disk = fixture_dir / ".fixture-inspect.sqlite3"
+              try:
+                  disk.write_bytes(raw)
+                  source = sqlite3.connect(disk)
+                  try:
+                      schema_version = int(
+                          source.execute("PRAGMA user_version").fetchone()[0]
+                      )
+                      event_count = int(
+                          source.execute(
+                              "SELECT COUNT(*) FROM camera_events"
+                          ).fetchone()[0]
+                      )
+                      history = [
+                          {
+                              "version": int(row[0]),
+                              "name": str(row[1]),
+                              "checksum": str(row[2]),
+                          }
+                          for row in source.execute(
+                              "SELECT version, name, checksum "
+                              "FROM schema_migrations ORDER BY version"
+                          ).fetchall()
+                      ]
+                  finally:
+                      source.close()
+              finally:
+                  connection.close()
+                  disk.unlink(missing_ok=True)
+              expected_version = int(match.group("version"))
+              if schema_version != expected_version:
+                  raise SystemExit(
+                      f"{path.name}: user_version={schema_version}, "
+                      f"expected={expected_version}"
+                  )
+              if event_count < 1:
+                  raise SystemExit(f"{path.name}: fixture has no event evidence")
+              fixtures.append(
+                  {
+                      "name": path.name,
+                      "schema_version": schema_version,
+                      "raw_sha256": hashlib.sha256(raw).hexdigest(),
+                      "raw_size": len(raw),
+                      "event_count": event_count,
+                      "migration_history": history,
+                      "source_fixture_commit": (
+                          "9850bae81d1b8a0f3d545726a9c48961163a0bfd"
+                      ),
+                      "original_provenance": original_entries.get(path.name, {}),
+                  }
+              )
+
+          manifest = {
+              "schema": "face-attendance-released-schema-fixtures/v1",
+              "description": (
+                  "Frozen SQLite database images from released runtime schema "
+                  "versions. They are decoded and migrated; they are never "
+                  "reconstructed from current migration statements."
+              ),
+              "fixture_source_branch": "agent/p1-phase1-finalization",
+              "fixture_source_commit": (
+                  "9850bae81d1b8a0f3d545726a9c48961163a0bfd"
+              ),
+              "contains_real_biometrics": False,
+              "contains_secrets": False,
+              "fixtures": fixtures,
+          }
+          (fixture_dir / "manifest.json").write_text(
+              json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+              encoding="utf-8",
+          )
+          PY
+
+          cat > tests/fixtures/README.md <<'EOF'
+          # Frozen released runtime-state fixtures
+
+          These files are compressed, base64-encoded SQLite database images for
+          every released `runtime_state.sqlite3` schema before Phase 2 begins.
+
+          They are intentionally frozen database bytes. Tests decode each file,
+          verify the complete SHA-256 digest and size from `manifest.json`, open
+          the historical database, and migrate it with the current production
+          migration runner. The suite never rebuilds an old schema by executing
+          today's migration statements.
+
+          The fixtures contain synthetic operational evidence only. They contain
+          no real employee biometric material, credentials, secrets, or customer
+          data. The original fixture provenance is retained in the normalized
+          manifest.
+
+          When a new runtime schema is released, add one database image produced
+          by that released revision before changing later migrations. Never edit
+          an existing fixture in place; add a new version and review its digest.
+          EOF
+          sed -i 's/^          //' tests/fixtures/README.md
+
+          cat > test_runtime_schema_fixtures.py <<'PY'
+          from __future__ import annotations
+
+          import base64
+          import gzip
+          import hashlib
+          import json
+          import re
+          import sqlite3
+          import tempfile
+          import unittest
+          from pathlib import Path
+
+          from runtime_state import (
+              RUNTIME_SCHEMA_VERSION,
+              RuntimeState,
+              verify_runtime_backup,
+          )
+
+
+          FIXTURE_DIR = Path(__file__).resolve().parent / "tests" / "fixtures"
+          MANIFEST_PATH = FIXTURE_DIR / "manifest.json"
+          FIXTURE_NAME_RE = re.compile(
+              r"^runtime_state_v(?P<version>[1-9][0-9]*)\.sqlite3\.gz\.b64$"
+          )
+          PRESERVED_EVENT_FIELDS = (
+              "event_id",
+              "camera_id",
+              "log_type",
+              "source_sha256",
+              "source_name",
+              "source_mtime",
+              "source_size",
+              "status",
+          )
+
+
+          def _decode_fixture(path: Path) -> bytes:
+              encoded = b"".join(path.read_bytes().split())
+              return gzip.decompress(base64.b64decode(encoded, validate=True))
+
+
+          def _table_exists(connection: sqlite3.Connection, table: str) -> bool:
+              return (
+                  connection.execute(
+                      "SELECT 1 FROM sqlite_master "
+                      "WHERE type='table' AND name=?",
+                      (table,),
+                  ).fetchone()
+                  is not None
+              )
+
+
+          def _first_event(path: Path) -> dict:
+              connection = sqlite3.connect(path)
+              connection.row_factory = sqlite3.Row
+              try:
+                  columns = {
+                      row[1]
+                      for row in connection.execute(
+                          "PRAGMA table_info(camera_events)"
+                      ).fetchall()
+                  }
+                  selected = [
+                      field for field in PRESERVED_EVENT_FIELDS if field in columns
+                  ]
+                  row = connection.execute(
+                      f"SELECT {', '.join(selected)} FROM camera_events "
+                      "ORDER BY created_unix, event_id LIMIT 1"
+                  ).fetchone()
+                  if row is None:
+                      raise AssertionError("released fixture has no camera event")
+                  return dict(row)
+              finally:
+                  connection.close()
+
+
+          class ReleasedSchemaFixtureTests(unittest.TestCase):
+              @classmethod
+              def setUpClass(cls):
+                  cls.manifest = json.loads(
+                      MANIFEST_PATH.read_text(encoding="utf-8")
+                  )
+                  cls.fixtures = cls.manifest.get("fixtures", [])
+
+              def test_every_frozen_released_schema_migrates_and_remains_readable(self):
+                  self.assertEqual(
+                      self.manifest.get("schema"),
+                      "face-attendance-released-schema-fixtures/v1",
+                  )
+                  self.assertFalse(self.manifest.get("contains_real_biometrics"))
+                  self.assertFalse(self.manifest.get("contains_secrets"))
+                  self.assertEqual(RUNTIME_SCHEMA_VERSION, 5)
+                  self.assertEqual(
+                      [item["schema_version"] for item in self.fixtures],
+                      [1, 2, 3, 4],
+                  )
+
+                  for fixture in self.fixtures:
+                      with self.subTest(schema=fixture["schema_version"]):
+                          name = fixture["name"]
+                          match = FIXTURE_NAME_RE.fullmatch(name)
+                          self.assertIsNotNone(match, name)
+                          self.assertEqual(
+                              int(match.group("version")),
+                              int(fixture["schema_version"]),
+                          )
+                          raw = _decode_fixture(FIXTURE_DIR / name)
+                          self.assertEqual(
+                              hashlib.sha256(raw).hexdigest(),
+                              fixture["raw_sha256"],
+                          )
+                          self.assertEqual(len(raw), fixture["raw_size"])
+                          self.assertGreaterEqual(fixture["event_count"], 1)
+                          self.assertTrue(fixture["original_provenance"])
+
+                          with tempfile.TemporaryDirectory() as temporary:
+                              root = Path(temporary)
+                              database = root / "runtime_state.sqlite3"
+                              database.write_bytes(raw)
+                              original_event = _first_event(database)
+
+                              connection = sqlite3.connect(database)
+                              try:
+                                  self.assertEqual(
+                                      connection.execute(
+                                          "PRAGMA user_version"
+                                      ).fetchone()[0],
+                                      fixture["schema_version"],
+                                  )
+                                  history = [
+                                      {
+                                          "version": int(row[0]),
+                                          "name": str(row[1]),
+                                          "checksum": str(row[2]),
+                                      }
+                                      for row in connection.execute(
+                                          "SELECT version, name, checksum "
+                                          "FROM schema_migrations ORDER BY version"
+                                      ).fetchall()
+                                  ]
+                              finally:
+                                  connection.close()
+                              self.assertEqual(
+                                  history,
+                                  fixture["migration_history"],
+                              )
+
+                              state = RuntimeState(
+                                  database,
+                                  backup_dir=root / "backups",
+                              )
+                              report = state.migration_status()
+                              self.assertTrue(report["ok"], report)
+                              self.assertEqual(
+                                  report["schema_version"],
+                                  RUNTIME_SCHEMA_VERSION,
+                              )
+                              self.assertEqual(report["pending_migrations"], [])
+                              self.assertIsNotNone(state.last_migration_backup)
+
+                              backup = verify_runtime_backup(
+                                  state.last_migration_backup["path"]
+                              )
+                              self.assertTrue(backup["ok"], backup)
+                              self.assertEqual(
+                                  backup["schema_version"],
+                                  fixture["schema_version"],
+                              )
+                              self.assertEqual(
+                                  backup["metadata"]["target_schema_version"],
+                                  RUNTIME_SCHEMA_VERSION,
+                              )
+
+                              migrated = state.get_event(
+                                  original_event["event_id"]
+                              )
+                              self.assertIsNotNone(migrated)
+                              for field, expected in original_event.items():
+                                  self.assertEqual(
+                                      migrated[field],
+                                      expected,
+                                      f"{name}: changed historical {field}",
+                                  )
+
+                              connection = sqlite3.connect(database)
+                              try:
+                                  self.assertTrue(
+                                      _table_exists(
+                                          connection,
+                                          "event_idempotency_tombstones",
+                                      )
+                                  )
+                              finally:
+                                  connection.close()
+
+              def test_migrated_schema_v4_event_prunes_to_tombstone_and_stays_blocked(self):
+                  fixture = next(
+                      item
+                      for item in self.fixtures
+                      if int(item["schema_version"]) == 4
+                  )
+                  raw = _decode_fixture(FIXTURE_DIR / fixture["name"])
+                  with tempfile.TemporaryDirectory() as temporary:
+                      root = Path(temporary)
+                      database = root / "runtime_state.sqlite3"
+                      database.write_bytes(raw)
+                      state = RuntimeState(
+                          database,
+                          backup_dir=root / "backups",
+                      )
+                      event = state.get_event(_first_event(database)["event_id"])
+                      self.assertIsNotNone(event)
+                      self.assertRegex(event["event_id"], r"^[0-9a-f]{64}$")
+                      self.assertRegex(event["capture_id"], r"^[0-9a-f]{64}$")
+                      self.assertRegex(event["source_sha256"], r"^[0-9a-f]{64}$")
+
+                      connection = sqlite3.connect(database)
+                      try:
+                          connection.execute("BEGIN IMMEDIATE")
+                          if _table_exists(connection, "attendance_policy_state"):
+                              connection.execute(
+                                  "DELETE FROM attendance_policy_state"
+                              )
+                          connection.execute(
+                              """
+                              UPDATE camera_events
+                              SET created_unix = 0,
+                                  updated_unix = 0,
+                                  status = 'processed_no_checkin',
+                                  lifecycle_state = 'processed',
+                                  reason_code = 'processed_no_checkin',
+                                  retention_state = 'not_retained',
+                                  final_disposition = 'processed_no_checkin',
+                                  processing_phase = 'terminal',
+                                  lease_owner = '',
+                                  lease_acquired_at = '',
+                                  lease_heartbeat_at = '',
+                                  lease_expires_unix = 0,
+                                  completed_at = '2026-01-01T00:00:00Z'
+                              WHERE event_id = ?
+                              """,
+                              (event["event_id"],),
+                          )
+                          connection.commit()
+                      finally:
+                          connection.close()
+
+                      self.assertEqual(state.prune_events(1), 1)
+                      self.assertIsNone(state.get_event(event["event_id"]))
+
+                      connection = sqlite3.connect(database)
+                      connection.row_factory = sqlite3.Row
+                      try:
+                          tombstone = connection.execute(
+                              "SELECT * FROM event_idempotency_tombstones "
+                              "WHERE event_id = ?",
+                              (event["event_id"],),
+                          ).fetchone()
+                          self.assertIsNotNone(tombstone)
+                          self.assertEqual(
+                              tombstone["source_sha256"],
+                              event["source_sha256"],
+                          )
+                      finally:
+                          connection.close()
+
+                      claim = state.record_event_receipt(
+                          event_id=event["event_id"],
+                          capture_id=event["capture_id"],
+                          camera_id=event["camera_id"],
+                          log_type=event["log_type"],
+                          source_sha256=event["source_sha256"],
+                          source_name=event["source_name"],
+                          source_mtime=float(event["source_mtime"] or 0),
+                          source_size=int(event["source_size"]),
+                          received_at="2026-08-14T00:00:00Z",
+                          effective_at="2026-08-14T00:00:00Z",
+                          branch=event.get("branch", ""),
+                          source_type=event.get("source_type", ""),
+                          source_principal=event.get("source_principal", ""),
+                          source_binding_id=event.get("source_binding_id", ""),
+                          policy=event["log_type"],
+                          source_time_provenance="released_fixture_replay",
+                          receipt_state="pending",
+                          receipt_verified=False,
+                          receipt_detail={"released_fixture_replay": True},
+                          policy_version=event.get("policy_version", "legacy"),
+                      )
+                      self.assertFalse(claim.accepted)
+                      self.assertEqual(claim.reason, "tombstone")
+                      self.assertEqual(claim.existing_status, "pruned")
+                      self.assertEqual(state.prune_events(1), 0)
+
+
+          if __name__ == "__main__":
+              unittest.main()
+          PY
+          sed -i 's/^          //' test_runtime_schema_fixtures.py
+
+          cat > docs/released-schema-fixtures.md <<'EOF'
+          # Released runtime-schema compatibility fixtures
+
+          Phase 1 item `P1-09` protects upgrades from changes that accidentally
+          make historical event rows unreadable. The compatibility suite uses
+          frozen SQLite database images for released runtime schema versions 1
+          through 4 and migrates each image through the production migration
+          runner to the current schema.
+
+          ## Why the fixtures are database bytes
+
+          A compatibility test that reconstructs an old database by executing
+          today's migration SQL can only prove that current code agrees with
+          itself. These fixtures instead preserve the actual SQLite bytes that
+          existed at each release boundary. The test verifies their complete
+          digest and byte size before opening them.
+
+          ## Stored material
+
+          The fixtures contain synthetic event, decision, transition, policy,
+          lease, and operator evidence. They contain no real employee biometric
+          material, credentials, secrets, or customer data. The manifest keeps
+          both normalized integrity metadata and the original provenance entry.
+
+          ## Acceptance flow
+
+          For every released schema, the suite:
+
+          1. decodes the compressed fixture and verifies SHA-256 and size;
+          2. verifies `PRAGMA user_version` and the checksum-bound migration history;
+          3. records a historical event row before migration;
+          4. opens the database with `RuntimeState`, creating the normal verified
+             pre-migration backup and metadata sidecar;
+          5. verifies the database reaches the current schema with no pending work;
+          6. confirms the original event identity and compatibility fields remain
+             readable and unchanged; and
+          7. verifies schema-v5 replay protection is present.
+
+          The schema-v4 fixture is also migrated, pruned through the normal
+          retention path, and replayed. The detailed row disappears, its minimal
+          tombstone remains, and the original camera/content identity is still
+          rejected before recognition or delivery.
+
+          ## Adding a future fixture
+
+          Create the database with the exact released application revision before
+          any later migration is authored. Use only synthetic data, stop all
+          writers, checkpoint WAL state, verify the database, compress and encode
+          the final bytes, and append a new manifest entry. Existing fixture bytes
+          and digests are immutable; never regenerate an older version from newer
+          source code.
+          EOF
+          sed -i 's/^          //' docs/released-schema-fixtures.md
+
+          python - <<'PY'
+          from pathlib import Path
+
+          plan = Path("docs/attendance-platform-plan.md")
+          text = plan.read_text(encoding="utf-8")
+          old = "- [ ] `P1-09` Keep old event rows readable through the retention window and test migration from a real copy of the current schema."
+          new = "- [x] `P1-09` Keep old event rows readable through the retention window and test migration from a real copy of the current schema."
+          if old not in text and new not in text:
+              raise SystemExit("P1-09 plan marker was not found")
+          plan.write_text(text.replace(old, new), encoding="utf-8")
+
+          readme = Path("README.md")
+          text = readme.read_text(encoding="utf-8")
+          marker = "- `docs/attendance-platform-plan.md` — phased plan for durable delivery, camera policy, operator workflows, enrollment, biometric assurance, and production validation."
+          addition = marker + "\n- `docs/released-schema-fixtures.md` — frozen SQLite compatibility fixtures and the rules for adding future released schemas."
+          if "docs/released-schema-fixtures.md" not in text:
+              if marker not in text:
+                  raise SystemExit("README documentation marker was not found")
+              text = text.replace(marker, addition)
+              readme.write_text(text, encoding="utf-8")
+
+          runtime_doc = Path("docs/runtime-state-migrations.md")
+          text = runtime_doc.read_text(encoding="utf-8")
+          section = """
+
+          ## Released-schema compatibility gate
+
+          `tests/fixtures/` contains frozen, digest-verified SQLite images for
+          released runtime schemas 1 through 4. `test_runtime_schema_fixtures.py`
+          migrates every image with the production runner, verifies the automatic
+          pre-migration backup and metadata sidecar, and confirms historical event
+          fields remain readable. The fixtures are database bytes from the release
+          boundary; the test does not recreate old schemas from current SQL.
+
+          A release that changes `runtime_state.sqlite3` must add its own frozen
+          fixture before a later migration is merged. See
+          `docs/released-schema-fixtures.md`.
+          """
+          if "## Released-schema compatibility gate" not in text:
+              runtime_doc.write_text(text.rstrip() + section + "\n", encoding="utf-8")
+
+          ledger_doc = Path("docs/versioned-event-ledger.md")
+          text = ledger_doc.read_text(encoding="utf-8")
+          section = """
+
+          ## Historical readability
+
+          Released schema versions are covered by frozen SQLite fixtures rather
+          than schemas reconstructed from current migration code. The compatibility
+          suite verifies each old event remains readable after migration and that
+          a migrated schema-v4 event still becomes a replay-blocking tombstone when
+          its detailed retention window expires. See
+          `docs/released-schema-fixtures.md`.
+          """
+          if "## Historical readability" not in text:
+              ledger_doc.write_text(text.rstrip() + section + "\n", encoding="utf-8")
+          PY
+
+      - name: Install test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install \
+            "flask>=3.0.3,<4" \
+            "gunicorn>=26.0.0,<27" \
+            "numpy>=1.26.4" \
+            "opencv-python-headless>=4.10.0,<5" \
+            "pyftpdlib[ssl]>=2.0.1,<3" \
+            "requests>=2.32.3,<3" \
+            "cryptography>=43,<48"
+      - name: Compile Python files
+        run: python -m py_compile *.py
+      - name: Run complete repository suite
+        run: |
+          python -m unittest -v \
+            test_embedding_gallery.py \
+            test_gallery_contract.py \
+            test_camera_sources.py \
+            test_ftp_receiver.py \
+            test_match_employee.py \
+            test_secure_sync.py \
+            test_gallery_release.py \
+            test_legacy_gallery_converter.py \
+            test_runtime_policy.py \
+            test_model_runtime.py \
+            test_runtime_state.py \
+            test_runtime_schema_fixtures.py \
+            test_web_security.py \
+            test_web_admin.py \
+            test_model_manifest.py \
+            test_pad.py \
+            test_production_readiness.py \
+            test_watch_service.py \
+            test_canonical_watcher.py \
+            test_install_linux.py
+      - name: Validate fixture and documentation contract
+        run: |
+          python -m json.tool config.example.json >/dev/null
+          python -m json.tool tests/fixtures/manifest.json >/dev/null
+          bash -n install_linux.sh
+          bash -n deploy/firewall/ufw-rules.example.sh
+          grep -F -- '- [x] `P1-09`' docs/attendance-platform-plan.md
+          test -s docs/released-schema-fixtures.md
+          test "$(find tests/fixtures -name 'runtime_state_v*.sqlite3.gz.b64' | wc -l)" -eq 4
+          git diff --check
+      - name: Publish clean stacked branch
+        run: |
+          set -euo pipefail
+          git add \
+            README.md \
+            docs/attendance-platform-plan.md \
+            docs/released-schema-fixtures.md \
+            docs/runtime-state-migrations.md \
+            docs/versioned-event-ledger.md \
+            test_runtime_schema_fixtures.py \
+            tests/fixtures/README.md \
+            tests/fixtures/manifest.json \
+            tests/fixtures/runtime_state_v1.sqlite3.gz.b64 \
+            tests/fixtures/runtime_state_v2.sqlite3.gz.b64 \
+            tests/fixtures/runtime_state_v3.sqlite3.gz.b64 \
+            tests/fixtures/runtime_state_v4.sqlite3.gz.b64
+          git diff --cached --check
+          git diff --cached "$BASE_SHA" --name-only | sort > /tmp/changed.txt
+          cat > /tmp/expected.txt <<'EOF'
+          README.md
+          docs/attendance-platform-plan.md
+          docs/released-schema-fixtures.md
+          docs/runtime-state-migrations.md
+          docs/versioned-event-ledger.md
+          test_runtime_schema_fixtures.py
+          tests/fixtures/README.md
+          tests/fixtures/manifest.json
+          tests/fixtures/runtime_state_v1.sqlite3.gz.b64
+          tests/fixtures/runtime_state_v2.sqlite3.gz.b64
+          tests/fixtures/runtime_state_v3.sqlite3.gz.b64
+          tests/fixtures/runtime_state_v4.sqlite3.gz.b64
+          EOF
+          sed -i 's/^          //' /tmp/expected.txt
+          sort -o /tmp/expected.txt /tmp/expected.txt
+          diff -u /tmp/expected.txt /tmp/changed.txt
+          tree=$(git write-tree)
+          export GIT_AUTHOR_NAME='github-actions[bot]'
+          export GIT_AUTHOR_EMAIL='41898282+github-actions[bot]@users.noreply.github.com'
+          export GIT_COMMITTER_NAME="$GIT_AUTHOR_NAME"
+          export GIT_COMMITTER_EMAIL="$GIT_AUTHOR_EMAIL"
+          commit=$(printf '%s\n' 'add frozen released-schema migration fixtures' \
+            | git commit-tree "$tree" -p "$BASE_SHA")
+          git push --force origin "$commit:refs/heads/$TARGET_BRANCH"
