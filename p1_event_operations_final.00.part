@@ -1,0 +1,305 @@
+import hashlib
+import json
+import math
+import os
+import shutil
+import sqlite3
+import time
+import unicodedata
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+
+from camera_sources import (
+    CameraSourceError,
+    load_camera_sources,
+    receipt_path,
+    verify_source_receipt,
+)
+from event_ledger import TERMINAL_EVENT_STATES
+from processing_recovery import (
+    _finite,
+    _identifier,
+    _json_text,
+    _text,
+    timestamp_from_unix,
+)
+from secret_store import (
+    ConfigLoadError,
+    SecretStoreError,
+    load_config_document,
+    resolve_secret_reference,
+)
+
+
+READ_ONLY_LIMIT_MAX = 200
+QUARANTINE_SCAN_LIMIT_DEFAULT = 5000
+QUARANTINE_SCAN_LIMIT_MAX = 100000
+OPERATOR_REASON_MIN_CHARS = 4
+OPERATOR_REASON_MAX_CHARS = 1000
+REPROCESSABLE_STATES = frozenset(
+    {"processed", "rejected", "failed", "dismissed", "quarantined"}
+)
+DISMISSIBLE_STATES = frozenset(
+    {
+        "received",
+        "processing",
+        "source_verified",
+        "validating",
+        "recognizing",
+        "processed",
+        "rejected",
+        "failed",
+        "quarantined",
+    }
+)
+
+_SECRET_KEYS = frozenset(
+    {
+        "authorization",
+        "cookie",
+        "password",
+        "private_key",
+        "secret",
+        "session",
+        "signature",
+        "token",
+        "api_key",
+        "api_secret",
+    }
+)
+_VECTOR_KEYS = frozenset(
+    {
+        "embedding",
+        "embeddings",
+        "vector",
+        "vectors",
+        "face_vector",
+        "template_vector",
+    }
+)
+
+
+class EventInspectionError(RuntimeError):
+    pass
+
+
+class EventOperationError(RuntimeError):
+    pass
+
+
+@dataclass(frozen=True)
+class QuarantineMove:
+    quarantine_image: Path
+    quarantine_receipt: Path
+    destination_image: Path
+    destination_receipt: Path
+
+
+def _normalized_key(value):
+    return str(value or "").strip().lower().replace("-", "_")
+
+
+def _safe_scalar(value):
+    if isinstance(value, str):
+        if len(value) > 4096:
+            return value[:4096] + "…"
+        return value
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    return value
+
+
+def redact_event_value(value, *, key=""):
+    """Return a JSON-safe copy with secrets and biometric vectors removed."""
+
+    normalized = _normalized_key(key)
+    if normalized == "biometric_vectors_exposed" and isinstance(value, bool):
+        return value
+    if any(marker in normalized for marker in _SECRET_KEYS):
+        return "<redacted>"
+    if any(marker in normalized for marker in _VECTOR_KEYS):
+        return "<omitted-biometric-vector>"
+    if isinstance(value, dict):
+        return {
+            str(item_key): redact_event_value(item_value, key=str(item_key))
+            for item_key, item_value in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [redact_event_value(item, key=key) for item in value]
+    return _safe_scalar(value)
+
+
+def _parse_json(value):
+    if not isinstance(value, str):
+        return value
+    try:
+        return json.loads(value)
+    except json.JSONDecodeError:
+        return {}
+
+
+def _assert_no_symlink_components(path, *, label):
+    path = Path(path).expanduser()
+    absolute = Path(os.path.abspath(path))
+    cursor = absolute
+    while True:
+        if cursor.exists() and cursor.is_symlink():
+            raise EventInspectionError(
+                f"{label} must not use a symbolic-link path: {cursor}"
+            )
+        if cursor == cursor.parent:
+            break
+        cursor = cursor.parent
+    return absolute.resolve(strict=False)
+
+
+def _readonly_connection(path):
+    path = _assert_no_symlink_components(path, label="runtime database")
+    if not path.is_file():
+        raise EventInspectionError(f"runtime database does not exist: {path}")
+    try:
+        connection = sqlite3.connect(
+            path.as_uri() + "?mode=ro",
+            uri=True,
+            timeout=5,
+        )
+    except sqlite3.DatabaseError as exc:
+        raise EventInspectionError(
+            f"could not open runtime database read-only: {exc}"
+        ) from exc
+    connection.row_factory = sqlite3.Row
+    connection.execute("PRAGMA query_only=ON")
+    connection.execute("PRAGMA foreign_keys=ON")
+    connection.execute("PRAGMA busy_timeout=5000")
+    return connection
+
+
+def _table_exists(connection, table):
+    return (
+        connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+            (table,),
+        ).fetchone()
+        is not None
+    )
+
+
+def _table_columns(connection, table):
+    if not _table_exists(connection, table):
+        return set()
+    return {
+        str(row["name"])
+        for row in connection.execute(
+            f'PRAGMA table_info("{table}")'
+        ).fetchall()
+    }
+
+
+def _timestamp_unix(value, field):
+    if value in (None, ""):
+        return None
+    if not isinstance(value, str):
+        raise EventInspectionError(f"{field} must be an RFC 3339 string")
+    text = value.strip()
+    if text != value:
+        raise EventInspectionError(
+            f"{field} must not contain surrounding whitespace"
+        )
+    candidate = text[:-1] + "+00:00" if text.endswith("Z") else text
+    try:
+        parsed = datetime.fromisoformat(candidate)
+    except ValueError as exc:
+        raise EventInspectionError(
+            f"{field} must be a valid RFC 3339 timestamp"
+        ) from exc
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise EventInspectionError(f"{field} must include a timezone")
+    return parsed.astimezone(timezone.utc).timestamp()
+
+
+class EventInspector:
+    """Read event state without migration, writes, or secret resolution."""
+
+    def __init__(self, database_path):
+        self.database_path = _assert_no_symlink_components(
+            database_path,
+            label="runtime database",
+        )
+
+    def _connect(self):
+        connection = _readonly_connection(self.database_path)
+        version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+        if version < 2:
+            connection.close()
+            raise EventInspectionError(
+                "event inspection requires runtime schema version 2 or newer; "
+                f"found {version}"
+            )
+        return connection, version
+
+    def list_events(
+        self,
+        *,
+        lifecycle_state="",
+        reason_code="",
+        camera_id="",
+        branch="",
+        direction="",
+        employee="",
+        from_time="",
+        to_time="",
+        limit=50,
+        offset=0,
+        order="newest",
+    ):
+        if (
+            isinstance(limit, bool)
+            or not isinstance(limit, int)
+            or not 1 <= limit <= READ_ONLY_LIMIT_MAX
+        ):
+            raise EventInspectionError(
+                f"limit must be an integer between 1 and {READ_ONLY_LIMIT_MAX}"
+            )
+        if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+            raise EventInspectionError("offset must be a non-negative integer")
+        if order not in {"newest", "oldest"}:
+            raise EventInspectionError("order must be newest or oldest")
+
+        connection, version = self._connect()
+        try:
+            columns = _table_columns(connection, "camera_events")
+            state_column = (
+                "lifecycle_state" if "lifecycle_state" in columns else "status"
+            )
+            time_column = (
+                "received_unix" if "received_unix" in columns else "created_unix"
+            )
+            where = []
+            params = []
+
+            def add_equal(column, value):
+                if value not in (None, ""):
+                    where.append(f"e.{column} = ?")
+                    params.append(str(value))
+
+            add_equal(state_column, lifecycle_state)
+            if "reason_code" in columns:
+                add_equal("reason_code", reason_code)
+            elif reason_code:
+                raise EventInspectionError(
+                    "reason filtering requires runtime schema version 2"
+                )
+            add_equal("camera_id", camera_id)
+            if "branch" in columns:
+                add_equal("branch", branch)
+            elif branch:
+                raise EventInspectionError(
+                    "branch filtering requires runtime schema version 2"
+                )
+            add_equal("log_type", direction)
+            if employee:
+                where.append(
+                    "EXISTS (SELECT 1 FROM recognition_decisions d "
+                    "WHERE d.event_id = e.event_id AND d.best_employee = ?)"
+                )
