@@ -1,0 +1,230 @@
+    return text
+
+
+def _timestamp(value, field, *, required=True):
+    text = _text(value, field, required=required, max_chars=64)
+    if not text:
+        return ""
+    candidate = text[:-1] + "+00:00" if text.endswith("Z") else text
+    try:
+        parsed = datetime.fromisoformat(candidate)
+    except ValueError as exc:
+        raise EventLedgerValidationError(
+            f"{field} must be an RFC 3339 timestamp"
+        ) from exc
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise EventLedgerValidationError(f"{field} must include a timezone")
+    return parsed.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _finite(value, field, *, minimum=None, maximum=None):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise EventLedgerValidationError(f"{field} must be numeric")
+    result = float(value)
+    if not math.isfinite(result):
+        raise EventLedgerValidationError(f"{field} must be finite")
+    if minimum is not None and result < float(minimum):
+        raise EventLedgerValidationError(f"{field} is below {minimum}")
+    if maximum is not None and result > float(maximum):
+        raise EventLedgerValidationError(f"{field} exceeds {maximum}")
+    return result
+
+
+def _integer(value, field, *, minimum=0, maximum=(1 << 31) - 1):
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise EventLedgerValidationError(f"{field} must be an integer")
+    if value < int(minimum) or value > int(maximum):
+        raise EventLedgerValidationError(
+            f"{field} must be between {int(minimum)} and {int(maximum)}"
+        )
+    return value
+
+
+def _enum(value, field, allowed):
+    text = _text(value, field, required=True, max_chars=64)
+    if text not in allowed:
+        raise EventLedgerValidationError(
+            f"{field} must be one of: {', '.join(sorted(allowed))}"
+        )
+    return text
+
+
+def _json_text(value, field, *, max_bytes=32768):
+    if value is None:
+        value = {}
+    if not isinstance(value, dict):
+        raise EventLedgerValidationError(f"{field} must be a JSON object")
+    try:
+        encoded = json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+    except (TypeError, ValueError) as exc:
+        raise EventLedgerValidationError(f"{field} is not JSON-safe") from exc
+    if len(encoded.encode("utf-8")) > int(max_bytes):
+        raise EventLedgerValidationError(
+            f"{field} exceeds {int(max_bytes)} UTF-8 bytes"
+        )
+    return encoded
+
+
+def make_capture_id(camera_id, source_sha256, source_name, source_size, source_mtime):
+    value = "\0".join(
+        (
+            str(camera_id),
+            str(source_sha256),
+            str(source_name),
+            str(int(source_size)),
+            f"{float(source_mtime):.6f}",
+        )
+    )
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def make_recognition_decision_id(event_id, face_index, decision_version=1):
+    event_id = _identifier(event_id, "event_id")
+    face_index = _integer(face_index, "face_index", minimum=1)
+    decision_version = _integer(
+        decision_version, "decision_version", minimum=1, maximum=1_000_000
+    )
+    value = "\0".join((event_id, str(face_index), str(decision_version)))
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _parse_json_column(row, key):
+    value = row.get(key)
+    if not isinstance(value, str):
+        return value
+    try:
+        return json.loads(value)
+    except json.JSONDecodeError:
+        return {}
+
+
+class EventLedgerMixin:
+    _EVENT_UPDATE_FIELDS = frozenset(
+        {
+            "transport_received_at",
+            "source_at",
+            "source_time_provenance",
+            "effective_at",
+            "branch",
+            "source_type",
+            "source_principal",
+            "source_remote_ip",
+            "source_binding_id",
+            "policy",
+            "receipt_state",
+            "receipt_verified",
+            "receipt_json",
+            "gallery_version",
+            "gallery_generated_at",
+            "gallery_model",
+            "gallery_model_version",
+            "recognition_model",
+            "recognition_model_version",
+            "preprocessing_version",
+            "pad_provider",
+            "pad_model",
+            "policy_version",
+            "retention_state",
+            "final_disposition",
+        }
+    )
+
+    @staticmethod
+    def _event_update_values(values):
+        if not isinstance(values, dict):
+            raise EventLedgerValidationError("event_updates must be a JSON object")
+        unknown = sorted(set(values) - EventLedgerMixin._EVENT_UPDATE_FIELDS)
+        if unknown:
+            raise EventLedgerValidationError(
+                "unsupported event update fields: " + ", ".join(unknown)
+            )
+        output = {}
+        for key, value in values.items():
+            if key in {
+                "transport_received_at",
+                "source_at",
+                "effective_at",
+                "gallery_generated_at",
+            }:
+                output[key] = _timestamp(value, key, required=False)
+            elif key == "receipt_verified":
+                if not isinstance(value, bool):
+                    raise EventLedgerValidationError(
+                        "receipt_verified must be a boolean"
+                    )
+                output[key] = int(value)
+            elif key == "receipt_state":
+                output[key] = _enum(value, key, RECEIPT_STATES)
+            elif key == "retention_state":
+                output[key] = _enum(value, key, RETENTION_STATES)
+            elif key == "receipt_json":
+                output[key] = _json_text(value, key)
+            else:
+                output[key] = _text(value, key, max_chars=4096)
+        return output
+
+    def record_event_receipt(
+        self,
+        *,
+        event_id,
+        capture_id,
+        camera_id,
+        log_type,
+        source_sha256,
+        source_name,
+        source_mtime,
+        source_size,
+        received_at,
+        effective_at,
+        branch="",
+        source_type="",
+        source_principal="",
+        source_remote_ip="",
+        source_binding_id="",
+        policy="",
+        source_at="",
+        source_time_provenance="",
+        transport_received_at="",
+        receipt_state="pending",
+        receipt_verified=False,
+        receipt_detail=None,
+        policy_version="",
+        reason_code="receipt_recorded",
+    ):
+        event_id = _identifier(event_id, "event_id")
+        capture_id = _identifier(capture_id, "capture_id")
+        camera_id = _text(camera_id, "camera_id", required=True, max_chars=128)
+        log_type = _text(log_type, "log_type", required=True, max_chars=16)
+        if log_type not in {"IN", "OUT"}:
+            raise EventLedgerValidationError("log_type must be IN or OUT")
+        source_name = _text(source_name, "source_name", required=True, max_chars=1024)
+        source_size = _integer(source_size, "source_size", minimum=0)
+        source_mtime = _finite(source_mtime, "source_mtime", minimum=0)
+        receipt_state = _enum(receipt_state, "receipt_state", RECEIPT_STATES)
+        source_sha256 = _text(
+            source_sha256, "source_sha256", required=True, max_chars=128
+        ).lower()
+        if receipt_state != "legacy" and not HEX64_RE.fullmatch(source_sha256):
+            raise EventLedgerValidationError(
+                "source_sha256 must be a lowercase 64-character SHA-256 digest"
+            )
+        received_at = _timestamp(received_at, "received_at")
+        effective_at = _timestamp(effective_at, "effective_at")
+        source_at = _timestamp(source_at, "source_at", required=False)
+        transport_received_at = _timestamp(
+            transport_received_at, "transport_received_at", required=False
+        )
+        reason_code = _enum(reason_code, "reason_code", EVENT_REASON_CODES)
+        if not isinstance(receipt_verified, bool):
+            raise EventLedgerValidationError("receipt_verified must be a boolean")
+        received_unix = datetime.fromisoformat(
+            received_at.replace("Z", "+00:00")
+        ).timestamp()
+        receipt_json = _json_text(receipt_detail, "receipt_detail")
+        policy = _text(policy or log_type, "policy", required=True, max_chars=32)
