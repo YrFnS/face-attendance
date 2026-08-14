@@ -46,7 +46,7 @@ def fetch_fragments():
         payload = api_json(f"git/blobs/{sha}")
         if payload.get("encoding") != "base64":
             raise SystemExit(f"unexpected blob encoding for {path}")
-        content = base64.b64decode(payload["content"], validate=True)
+        content = base64.b64decode(payload["content"])
         destination = ROOT / path
         destination.parent.mkdir(parents=True, exist_ok=True)
         destination.write_bytes(content)
