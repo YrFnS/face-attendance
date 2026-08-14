@@ -142,6 +142,7 @@ jobs:
           runtime_state.py
           test_event_admin.py
           test_runtime_state.py
+          test_secure_sync.py
           EOF
           sort -o /tmp/expected.txt /tmp/expected.txt
           diff -u /tmp/expected.txt /tmp/changed.txt
