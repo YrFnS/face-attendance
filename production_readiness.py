@@ -6,6 +6,9 @@ from urllib.parse import urlparse
 
 from auth_backends import auth_configuration_issues as auth_backend_configuration_issues
 from camera_sources import camera_source_configuration_issues
+from delivery_service import (
+    configuration_issues as delivery_worker_configuration_issues,
+)
 from gallery_credentials import gallery_credential_configuration_issues
 from model_manifest import (
     is_placeholder,
@@ -159,6 +162,10 @@ def check_production_readiness(
     for message in processing_recovery_configuration_issues(cfg):
         issues.append(
             ReadinessIssue("processing_recovery_configuration_invalid", message)
+        )
+    for message in delivery_worker_configuration_issues(cfg):
+        issues.append(
+            ReadinessIssue("delivery_worker_configuration_invalid", message)
         )
 
     for message in gallery_credential_configuration_issues(cfg):

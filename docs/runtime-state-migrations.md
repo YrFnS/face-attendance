@@ -160,7 +160,7 @@ Backups contain operational and potentially biometric-adjacent metadata. Apply t
 
 ## Current schema generations and frozen compatibility fixtures
 
-The current runtime schema is version 6:
+The current runtime schema is version 7:
 
 - version 1 adopts the original runtime-state tables;
 - version 2 adds normalized events, recognition decisions, transitions, and operator actions;
@@ -172,3 +172,6 @@ The current runtime schema is version 6:
 Migration 4 preserves existing rows and gives older events blank source/retention paths; an operator must supply `--media-path` before reprocessing one of those migrated events. Migration 5 also preserves historical primary keys, labels them as legacy schemes rather than recomputing them, and backfills one minimal tombstone for every retained event. Migration 6 backfills jobs only for accepted schema-5 decisions that already have a durable delivery ID; it does not fabricate delivery identity for older historical decisions.
 
 Frozen synthetic databases for released versions 1–4 live under `tests/fixtures/`. Their manifest records the source commit, released migration checksum, raw database digest, compressed digest, and size. Tests materialize those exact committed bytes and run the normal verified backup-before-migrate path to version 6. See `docs/event-identity-tombstones.md` for the identifier and retention contract and `docs/delivery-outbox.md` for schema 6.
+
+- version 7 adds the leased delivery worker submission boundary,
+  retry-delay evidence, pre-submit lease recovery, and post-submit uncertainty.

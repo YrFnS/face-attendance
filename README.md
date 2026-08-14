@@ -310,3 +310,13 @@ Audited reprocess, quarantine-resolution, and dismissal commands require an acto
 ### Event identity and replay retention
 
 Runtime schema version 5 stores domain-separated capture, event, recognition-decision, and future ERPNext delivery IDs. A minimal camera/content tombstone is written with every receipt and survives detailed event pruning, so an old upload does not become eligible again merely because its verbose history expired. Frozen synthetic databases for released schema versions 1–4 exercise the real backup-before-migrate path. See `docs/event-identity-tombstones.md`.
+
+## Durable delivery worker (P2-03)
+
+Accepted recognition decisions can now be drained by `delivery_service.py` using
+renewable SQLite leases, bounded exponential backoff, jitter, retry budgets, and
+a fail-closed submission boundary. See `docs/delivery-worker.md`.
+
+Worker mode remains non-production until ERPNext-side atomic delivery-ID
+idempotency is implemented in P2-04. The default synchronous compatibility path
+is unchanged.

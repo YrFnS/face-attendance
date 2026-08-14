@@ -11,6 +11,7 @@ from pathlib import Path
 import cv2
 
 import face_attendance as attendance
+from delivery_service import delivery_capacity_status, delivery_mode
 from camera_sources import (
     CameraSourceError,
     load_camera_sources,
@@ -1038,6 +1039,9 @@ def process_path(
                 lease_seconds=lease_seconds,
             )
 
+        selected_delivery_mode = delivery_mode(cfg)
+        queued_decisions = 0
+
         def persist_decision(decision):
             if dry_run or not claim or not claim.accepted:
                 return None
@@ -1065,6 +1069,7 @@ def process_path(
             )
 
         def deliver_candidate(*, employee, log_type, image_path, dry_run, decision):
+            nonlocal queued_decisions
             if dry_run:
                 attendance.log(f"dry run: would create {employee} {log_type}")
                 return True
@@ -1073,6 +1078,21 @@ def process_path(
                 int(decision["face_index"]),
                 processing_attempt,
             )
+            if selected_delivery_mode == "worker":
+                capacity = delivery_capacity_status(state, cfg)
+                if not capacity["ok"]:
+                    persist_decision(
+                        {
+                            **decision,
+                            "accepted": False,
+                            "reason_code": "processing_failed",
+                        }
+                    )
+                    attendance.log(
+                        f"delivery queue capacity rejected decision={decision_id}: "
+                        + "; ".join(capacity["reasons"])
+                    )
+                    return False
             reservation = state.reserve_attendance_policy(
                 employee=employee,
                 direction=log_type,
@@ -1101,6 +1121,13 @@ def process_path(
                 stored_decision_id = persist_decision(decision)
                 if stored_decision_id != decision_id:
                     raise RuntimeError("recognition decision identity mismatch")
+                if selected_delivery_mode == "worker":
+                    queued_decisions += 1
+                    attendance.log(
+                        f"delivery queued decision={decision_id} "
+                        f"employee={employee} direction={log_type}"
+                    )
+                    return False
                 delivery_transport = getattr(
                     attendance,
                     "erpnext_transport_name",
@@ -1247,12 +1274,17 @@ def process_path(
                 )
         else:
             retention = RetentionOutcome("not_retained", "")
+        final_status = "checkin_created" if created else "processed_no_checkin"
+        final_reason = "checkin_created" if created else "processed_no_checkin"
+        if queued_decisions:
+            final_status = "processed_no_checkin"
+            final_reason = "accepted_candidate"
         claim_finalized = finish_claim(
             state,
             claim,
             event_id,
-            status="checkin_created" if created else "processed_no_checkin",
-            reason_code="checkin_created" if created else "processed_no_checkin",
+            status=final_status,
+            reason_code=final_reason,
             event_updates=retention.event_updates(),
             lease_owner=lease_owner,
         )

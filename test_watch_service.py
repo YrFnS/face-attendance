@@ -805,5 +805,73 @@ class WatchServiceTests(unittest.TestCase):
         self.assertFalse(receipt_path(self.image_path).exists())
 
 
+    def test_worker_mode_queues_without_synchronous_erpnext(self):
+        self.cfg.update(
+            delivery_mode="worker",
+            delivery_worker_enabled=True,
+            attach_checkin_crop=False,
+            delivery_queue_max_active_jobs=100,
+            delivery_queue_min_free_bytes=0,
+        )
+
+        def process_image(
+            _image, _source, bound_app, _known, _cfg, _dry_run,
+            attendance_callback=None, **_kwargs
+        ):
+            bound_app.get(np.zeros((1, 1, 3), dtype=np.uint8))
+            return attendance_callback(
+                employee="HR-1",
+                log_type="IN",
+                image_path=None,
+                dry_run=False,
+                decision={
+                    "face_index": 1,
+                    "face_count": 1,
+                    "bbox": [1, 2, 21, 30],
+                    "face_width": 20.0,
+                    "face_height": 28.0,
+                    "detection_score": 0.99,
+                    "best_employee": "HR-1",
+                    "best_score": 0.91,
+                    "runner_up_score": 0.50,
+                    "score_margin": 0.41,
+                    "candidate_log_type": "IN",
+                    "accepted": True,
+                    "reason_code": "accepted_candidate",
+                    "retention_state": "not_retained",
+                },
+            )
+
+        attendance.process_image = process_image
+        attendance.create_checkin = lambda *_args, **_kwargs: self.fail(
+            "worker mode must not call ERPNext from the watcher"
+        )
+        result = watch_service.process_path(
+            self.image_path,
+            FakeApp([FakeFace()]),
+            [],
+            StaticGallery([{"employee": "HR-1"}]),
+            self.cfg,
+            self.state,
+            PassingPAD(),
+            sources=self.sources,
+            worker_id="queue-watcher",
+        )
+        self.assertFalse(result)
+        event = self.state.get_event(self.event_id())
+        self.assertEqual(event["lifecycle_state"], "processed")
+        self.assertEqual(event["reason_code"], "accepted_candidate")
+        jobs = self.state.list_delivery_jobs(state="pending", limit=10)
+        self.assertEqual(len(jobs), 1)
+        self.assertEqual(jobs[0]["employee"], "HR-1")
+        connection = sqlite3.connect(self.state.path)
+        try:
+            policy = connection.execute(
+                "SELECT reservation_state FROM attendance_policy_state"
+            ).fetchone()
+        finally:
+            connection.close()
+        self.assertEqual(policy[0], "pending")
+
 if __name__ == "__main__":
     unittest.main()

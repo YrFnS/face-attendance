@@ -1,8 +1,8 @@
 """Durable ERPNext delivery outbox state.
 
 Schema version 6 creates one delivery job in the same SQLite transaction that
-persists an accepted recognition decision.  This module does not run a delivery
-worker yet; P2-03 owns retry scheduling and worker orchestration.
+persists an accepted recognition decision. Schema version 7 adds the leased
+single-node worker boundary, retry scheduling, and crash recovery.
 """
 
 from __future__ import annotations
@@ -340,6 +340,46 @@ DELIVERY_OUTBOX_REQUIRED_TRIGGERS = frozenset(
 )
 
 
+DELIVERY_WORKER_SCHEMA_STATEMENTS = (
+    "ALTER TABLE delivery_jobs ADD COLUMN submission_started_at TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE delivery_jobs ADD COLUMN retry_delay_seconds REAL NOT NULL DEFAULT 0 CHECK(retry_delay_seconds >= 0)",
+    """
+    CREATE INDEX delivery_jobs_submission_lease
+    ON delivery_jobs(state, submission_started_at, lease_expires_unix)
+    """,
+    """
+    CREATE TRIGGER delivery_jobs_submission_requires_active_lease
+    BEFORE UPDATE OF submission_started_at ON delivery_jobs
+    WHEN NEW.submission_started_at <> ''
+         AND (OLD.state <> 'leased' OR OLD.lease_owner = '')
+    BEGIN
+        SELECT RAISE(
+            ABORT,
+            'delivery submission requires an active delivery lease'
+        );
+    END
+    """,
+)
+
+DELIVERY_WORKER_REQUIRED_TABLE_COLUMNS = {
+    "delivery_jobs": {
+        "submission_started_at": ("TEXT", True, 0),
+        "retry_delay_seconds": ("REAL", True, 0),
+    }
+}
+
+DELIVERY_WORKER_REQUIRED_INDEXES = {
+    "delivery_jobs_submission_lease": (
+        False,
+        ("state", "submission_started_at", "lease_expires_unix"),
+    )
+}
+
+DELIVERY_WORKER_REQUIRED_TRIGGERS = frozenset(
+    {"delivery_jobs_submission_requires_active_lease"}
+)
+
+
 class DeliveryOutboxError(RuntimeError):
     pass
 
@@ -638,6 +678,8 @@ class DeliveryOutboxMixin:
                     lease_acquired_at = ?,
                     lease_heartbeat_at = ?,
                     lease_expires_unix = ?,
+                    submission_started_at = '',
+                    retry_delay_seconds = 0,
                     last_error_class = '',
                     last_error = '',
                     updated_at = ?
@@ -857,5 +899,699 @@ class DeliveryOutboxMixin:
         except Exception:
             connection.rollback()
             raise
+        finally:
+            connection.close()
+
+    @staticmethod
+    def _policy_release_for_decision_tx(connection, decision_id):
+        connection.execute(
+            """
+            UPDATE attendance_policy_state
+            SET reservation_event_id = '', reservation_decision_id = '',
+                reservation_effective_at = '', reservation_effective_unix = 0,
+                reservation_state = 'none', reservation_expires_unix = 0,
+                updated_at = ?
+            WHERE reservation_decision_id = ? AND reservation_state = 'pending'
+            """,
+            (utc_now(), decision_id),
+        )
+
+    @staticmethod
+    def _policy_uncertain_for_decision_tx(connection, decision_id):
+        connection.execute(
+            """
+            UPDATE attendance_policy_state
+            SET reservation_state = 'uncertain',
+                reservation_expires_unix = 0,
+                updated_at = ?
+            WHERE reservation_decision_id = ?
+              AND reservation_state IN ('pending', 'uncertain')
+            """,
+            (utc_now(), decision_id),
+        )
+
+    @staticmethod
+    def _policy_commit_for_decision_tx(connection, decision_id):
+        connection.execute(
+            """
+            UPDATE attendance_policy_state
+            SET committed_event_id = reservation_event_id,
+                committed_decision_id = reservation_decision_id,
+                committed_effective_at = reservation_effective_at,
+                committed_effective_unix = reservation_effective_unix,
+                reservation_event_id = '', reservation_decision_id = '',
+                reservation_effective_at = '', reservation_effective_unix = 0,
+                reservation_state = 'none', reservation_expires_unix = 0,
+                updated_at = ?
+            WHERE reservation_decision_id = ? AND reservation_state = 'pending'
+            """,
+            (utc_now(), decision_id),
+        )
+
+    @staticmethod
+    def _policy_extend_for_decision_tx(connection, decision_id, expires_unix):
+        connection.execute(
+            """
+            UPDATE attendance_policy_state
+            SET reservation_expires_unix = CASE
+                    WHEN reservation_expires_unix < ? THEN ?
+                    ELSE reservation_expires_unix
+                END,
+                updated_at = ?
+            WHERE reservation_decision_id = ? AND reservation_state = 'pending'
+            """,
+            (expires_unix, expires_unix, utc_now(), decision_id),
+        )
+
+    @staticmethod
+    def _clear_delivery_lease_values():
+        return {
+            "lease_owner": "",
+            "lease_acquired_at": "",
+            "lease_heartbeat_at": "",
+            "lease_expires_unix": 0.0,
+        }
+
+    @staticmethod
+    def _delivery_job_row_tx(connection, delivery_id):
+        return connection.execute(
+            "SELECT * FROM delivery_jobs WHERE delivery_id = ?",
+            (delivery_id,),
+        ).fetchone()
+
+    def _current_delivery_lease_tx(
+        self,
+        connection,
+        *,
+        delivery_id,
+        owner,
+        now,
+        require_submission=None,
+    ):
+        delivery_id = _identifier(delivery_id, "delivery_id")
+        owner = _text(owner, "delivery lease owner", required=True, max_chars=256)
+        now = _finite(now, "now")
+        row = self._delivery_job_row_tx(connection, delivery_id)
+        if row is None:
+            raise DeliveryJobStateError(f"delivery job does not exist: {delivery_id}")
+        if (
+            row["state"] != "leased"
+            or row["lease_owner"] != owner
+            or float(row["lease_expires_unix"] or 0) <= now
+        ):
+            raise DeliveryJobStateError(
+                "operation requires the current unexpired delivery lease"
+            )
+        started = bool(row["submission_started_at"])
+        if require_submission is True and not started:
+            raise DeliveryJobStateError(
+                "delivery submission has not started for the current lease"
+            )
+        if require_submission is False and started:
+            raise DeliveryJobStateError(
+                "delivery submission already started for the current lease"
+            )
+        return row
+
+    def _recover_expired_delivery_job_leases_tx(
+        self,
+        connection,
+        *,
+        max_attempts,
+        now,
+    ):
+        max_attempts = _strict_int(
+            max_attempts,
+            "delivery max attempts",
+            minimum=1,
+            maximum=100,
+        )
+        now = _finite(now, "now")
+        stamp = timestamp_from_unix(now)
+        rows = connection.execute(
+            """
+            SELECT * FROM delivery_jobs
+            WHERE state = 'leased' AND lease_expires_unix <= ?
+            ORDER BY lease_expires_unix, created_at, delivery_id
+            """,
+            (now,),
+        ).fetchall()
+        results = []
+        for row in rows:
+            if row["submission_started_at"]:
+                state = "uncertain"
+                error_class = "delivery_lease_expired_after_submission"
+                error = (
+                    "delivery worker lease expired after ERPNext submission began"
+                )
+                next_attempt = 0.0
+                self._policy_uncertain_for_decision_tx(
+                    connection, row["decision_id"]
+                )
+            elif int(row["attempt_count"]) >= max_attempts:
+                state = "permanent_failure"
+                error_class = "retry_budget_exhausted"
+                error = "delivery retry budget exhausted after lease expiry"
+                next_attempt = 0.0
+                self._policy_release_for_decision_tx(
+                    connection, row["decision_id"]
+                )
+            else:
+                state = "retry_wait"
+                error_class = "delivery_lease_expired_before_submission"
+                error = (
+                    "delivery worker lease expired before ERPNext submission"
+                )
+                next_attempt = now
+            connection.execute(
+                """
+                UPDATE delivery_jobs
+                SET state = ?, next_attempt_unix = ?,
+                    lease_owner = '', lease_acquired_at = '',
+                    lease_heartbeat_at = '', lease_expires_unix = 0,
+                    submission_started_at = '', retry_delay_seconds = 0,
+                    last_error_class = ?, last_error = ?, updated_at = ?
+                WHERE delivery_id = ?
+                """,
+                (
+                    state,
+                    next_attempt,
+                    error_class,
+                    error,
+                    stamp,
+                    row["delivery_id"],
+                ),
+            )
+            current = self._delivery_job_row_tx(connection, row["delivery_id"])
+            results.append(dict(current))
+        return results
+
+    def recover_expired_delivery_job_leases(self, *, max_attempts, now=None):
+        now = _finite(
+            now if now is not None else datetime.now(timezone.utc).timestamp(),
+            "now",
+        )
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            results = self._recover_expired_delivery_job_leases_tx(
+                connection,
+                max_attempts=max_attempts,
+                now=now,
+            )
+            connection.commit()
+            return results
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def claim_next_delivery_job(
+        self,
+        *,
+        owner,
+        lease_seconds,
+        transport,
+        max_attempts,
+        now=None,
+    ):
+        owner = _text(owner, "delivery lease owner", required=True, max_chars=256)
+        transport = _text(
+            transport,
+            "delivery transport",
+            required=True,
+            max_chars=64,
+        )
+        lease_seconds = _strict_int(
+            lease_seconds,
+            "delivery lease seconds",
+            minimum=30,
+            maximum=3600,
+        )
+        max_attempts = _strict_int(
+            max_attempts,
+            "delivery max attempts",
+            minimum=1,
+            maximum=100,
+        )
+        now = _finite(
+            now if now is not None else datetime.now(timezone.utc).timestamp(),
+            "now",
+        )
+        stamp = timestamp_from_unix(now)
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            self._recover_expired_delivery_job_leases_tx(
+                connection,
+                max_attempts=max_attempts,
+                now=now,
+            )
+            exhausted = connection.execute(
+                """
+                SELECT delivery_id, decision_id
+                FROM delivery_jobs
+                WHERE state IN ('pending', 'retry_wait')
+                  AND next_attempt_unix <= ?
+                  AND attempt_count >= ?
+                """,
+                (now, max_attempts),
+            ).fetchall()
+            for row in exhausted:
+                connection.execute(
+                    """
+                    UPDATE delivery_jobs
+                    SET state = 'permanent_failure', next_attempt_unix = 0,
+                        retry_delay_seconds = 0,
+                        last_error_class = 'retry_budget_exhausted',
+                        last_error = 'delivery retry budget exhausted',
+                        updated_at = ?
+                    WHERE delivery_id = ?
+                    """,
+                    (stamp, row["delivery_id"]),
+                )
+                self._policy_release_for_decision_tx(
+                    connection, row["decision_id"]
+                )
+            row = connection.execute(
+                """
+                SELECT * FROM delivery_jobs
+                WHERE state IN ('pending', 'retry_wait')
+                  AND next_attempt_unix <= ?
+                  AND attempt_count < ?
+                ORDER BY next_attempt_unix, created_at, delivery_id
+                LIMIT 1
+                """,
+                (now, max_attempts),
+            ).fetchone()
+            if row is None:
+                connection.commit()
+                return None
+            expires = now + lease_seconds
+            connection.execute(
+                """
+                UPDATE delivery_jobs
+                SET state = 'leased', transport = ?,
+                    attempt_count = attempt_count + 1,
+                    next_attempt_unix = 0,
+                    lease_owner = ?, lease_acquired_at = ?,
+                    lease_heartbeat_at = ?, lease_expires_unix = ?,
+                    submission_started_at = '', retry_delay_seconds = 0,
+                    last_error_class = '', last_error = '', updated_at = ?
+                WHERE delivery_id = ?
+                """,
+                (
+                    transport,
+                    owner,
+                    stamp,
+                    stamp,
+                    expires,
+                    stamp,
+                    row["delivery_id"],
+                ),
+            )
+            current = self._delivery_job_row_tx(connection, row["delivery_id"])
+            connection.commit()
+            return dict(current)
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def renew_delivery_job_lease(
+        self,
+        delivery_id,
+        *,
+        owner,
+        lease_seconds,
+        now=None,
+    ):
+        delivery_id = _identifier(delivery_id, "delivery_id")
+        owner = _text(owner, "delivery lease owner", required=True, max_chars=256)
+        lease_seconds = _strict_int(
+            lease_seconds,
+            "delivery lease seconds",
+            minimum=30,
+            maximum=3600,
+        )
+        now = _finite(
+            now if now is not None else datetime.now(timezone.utc).timestamp(),
+            "now",
+        )
+        stamp = timestamp_from_unix(now)
+        connection = self._connect()
+        try:
+            cursor = connection.execute(
+                """
+                UPDATE delivery_jobs
+                SET lease_heartbeat_at = ?, lease_expires_unix = ?,
+                    updated_at = ?
+                WHERE delivery_id = ? AND state = 'leased'
+                  AND lease_owner = ? AND lease_expires_unix > ?
+                """,
+                (
+                    stamp,
+                    now + lease_seconds,
+                    stamp,
+                    delivery_id,
+                    owner,
+                    now,
+                ),
+            )
+            connection.commit()
+            if cursor.rowcount != 1:
+                raise DeliveryJobStateError(
+                    "renewal requires the current delivery lease"
+                )
+            return self.get_delivery_job(delivery_id)
+        finally:
+            connection.close()
+
+    def mark_delivery_submission_started(
+        self,
+        delivery_id,
+        *,
+        owner,
+        now=None,
+    ):
+        now = _finite(
+            now if now is not None else datetime.now(timezone.utc).timestamp(),
+            "now",
+        )
+        stamp = timestamp_from_unix(now)
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row = self._current_delivery_lease_tx(
+                connection,
+                delivery_id=delivery_id,
+                owner=owner,
+                now=now,
+            )
+            if not row["submission_started_at"]:
+                connection.execute(
+                    """
+                    UPDATE delivery_jobs
+                    SET submission_started_at = ?, lease_heartbeat_at = ?,
+                        updated_at = ?
+                    WHERE delivery_id = ?
+                    """,
+                    (stamp, stamp, stamp, row["delivery_id"]),
+                )
+            current = self._delivery_job_row_tx(connection, row["delivery_id"])
+            connection.commit()
+            return dict(current)
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def mark_delivery_job_retry_by_lease(
+        self,
+        delivery_id,
+        *,
+        owner,
+        error_class,
+        error,
+        delay_seconds,
+        max_attempts,
+        safe_after_submission=False,
+        now=None,
+    ):
+        error_class = _text(
+            error_class,
+            "delivery error class",
+            required=True,
+            max_chars=128,
+        )
+        if not isinstance(safe_after_submission, bool):
+            raise DeliveryOutboxValidationError(
+                "safe_after_submission must be a boolean"
+            )
+        delay_seconds = _finite(delay_seconds, "delivery retry delay")
+        if delay_seconds > 86400:
+            raise DeliveryOutboxValidationError(
+                "delivery retry delay must not exceed 86400 seconds"
+            )
+        max_attempts = _strict_int(
+            max_attempts,
+            "delivery max attempts",
+            minimum=1,
+            maximum=100,
+        )
+        now = _finite(
+            now if now is not None else datetime.now(timezone.utc).timestamp(),
+            "now",
+        )
+        stamp = timestamp_from_unix(now)
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row = self._current_delivery_lease_tx(
+                connection,
+                delivery_id=delivery_id,
+                owner=owner,
+                now=now,
+            )
+            if row["submission_started_at"] and not safe_after_submission:
+                raise DeliveryJobStateError(
+                    "ambiguous post-submission failures cannot be retried"
+                )
+            if int(row["attempt_count"]) >= max_attempts:
+                state = "permanent_failure"
+                error_class = "retry_budget_exhausted"
+                next_attempt = 0.0
+                delay_seconds = 0.0
+                self._policy_release_for_decision_tx(
+                    connection, row["decision_id"]
+                )
+            else:
+                state = "retry_wait"
+                next_attempt = now + delay_seconds
+                self._policy_extend_for_decision_tx(
+                    connection,
+                    row["decision_id"],
+                    next_attempt + 300.0,
+                )
+            connection.execute(
+                """
+                UPDATE delivery_jobs
+                SET state = ?, next_attempt_unix = ?,
+                    lease_owner = '', lease_acquired_at = '',
+                    lease_heartbeat_at = '', lease_expires_unix = 0,
+                    submission_started_at = '', retry_delay_seconds = ?,
+                    last_error_class = ?, last_error = ?, updated_at = ?
+                WHERE delivery_id = ?
+                """,
+                (
+                    state,
+                    next_attempt,
+                    delay_seconds,
+                    error_class,
+                    _safe_error(error),
+                    stamp,
+                    row["delivery_id"],
+                ),
+            )
+            current = self._delivery_job_row_tx(connection, row["delivery_id"])
+            connection.commit()
+            return dict(current)
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def mark_delivery_job_permanent_failure_by_lease(
+        self,
+        delivery_id,
+        *,
+        owner,
+        error_class,
+        error="",
+        now=None,
+    ):
+        error_class = _text(
+            error_class,
+            "delivery error class",
+            required=True,
+            max_chars=128,
+        )
+        now = _finite(
+            now if now is not None else datetime.now(timezone.utc).timestamp(),
+            "now",
+        )
+        stamp = timestamp_from_unix(now)
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row = self._current_delivery_lease_tx(
+                connection,
+                delivery_id=delivery_id,
+                owner=owner,
+                now=now,
+            )
+            connection.execute(
+                """
+                UPDATE delivery_jobs
+                SET state = 'permanent_failure', next_attempt_unix = 0,
+                    lease_owner = '', lease_acquired_at = '',
+                    lease_heartbeat_at = '', lease_expires_unix = 0,
+                    retry_delay_seconds = 0,
+                    last_error_class = ?, last_error = ?, updated_at = ?
+                WHERE delivery_id = ?
+                """,
+                (
+                    error_class,
+                    _safe_error(error),
+                    stamp,
+                    row["delivery_id"],
+                ),
+            )
+            self._policy_release_for_decision_tx(connection, row["decision_id"])
+            current = self._delivery_job_row_tx(connection, row["delivery_id"])
+            connection.commit()
+            return dict(current)
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def mark_delivery_job_uncertain_by_lease(
+        self,
+        delivery_id,
+        *,
+        owner,
+        error_class,
+        error="",
+        now=None,
+    ):
+        error_class = _text(
+            error_class,
+            "delivery error class",
+            required=True,
+            max_chars=128,
+        )
+        now = _finite(
+            now if now is not None else datetime.now(timezone.utc).timestamp(),
+            "now",
+        )
+        stamp = timestamp_from_unix(now)
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row = self._current_delivery_lease_tx(
+                connection,
+                delivery_id=delivery_id,
+                owner=owner,
+                now=now,
+            )
+            connection.execute(
+                """
+                UPDATE delivery_jobs
+                SET state = 'uncertain', next_attempt_unix = 0,
+                    lease_owner = '', lease_acquired_at = '',
+                    lease_heartbeat_at = '', lease_expires_unix = 0,
+                    retry_delay_seconds = 0,
+                    last_error_class = ?, last_error = ?, updated_at = ?
+                WHERE delivery_id = ?
+                """,
+                (
+                    error_class,
+                    _safe_error(error),
+                    stamp,
+                    row["delivery_id"],
+                ),
+            )
+            self._policy_uncertain_for_decision_tx(
+                connection, row["decision_id"]
+            )
+            current = self._delivery_job_row_tx(connection, row["delivery_id"])
+            connection.commit()
+            return dict(current)
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def mark_delivery_job_delivered_by_lease(
+        self,
+        delivery_id,
+        *,
+        owner,
+        remote_docname,
+        transport,
+        now=None,
+    ):
+        remote_docname = validate_erp_docname(remote_docname)
+        transport = _text(
+            transport,
+            "delivery transport",
+            required=True,
+            max_chars=64,
+        )
+        now = _finite(
+            now if now is not None else datetime.now(timezone.utc).timestamp(),
+            "now",
+        )
+        stamp = timestamp_from_unix(now)
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row = self._current_delivery_lease_tx(
+                connection,
+                delivery_id=delivery_id,
+                owner=owner,
+                now=now,
+                require_submission=True,
+            )
+            connection.execute(
+                """
+                UPDATE delivery_jobs
+                SET state = 'delivered', transport = ?,
+                    next_attempt_unix = 0,
+                    lease_owner = '', lease_acquired_at = '',
+                    lease_heartbeat_at = '', lease_expires_unix = 0,
+                    retry_delay_seconds = 0,
+                    last_error_class = '', last_error = '',
+                    remote_docname = ?, updated_at = ?, delivered_at = ?
+                WHERE delivery_id = ?
+                """,
+                (
+                    transport,
+                    remote_docname,
+                    stamp,
+                    stamp,
+                    row["delivery_id"],
+                ),
+            )
+            self._policy_commit_for_decision_tx(
+                connection, row["decision_id"]
+            )
+            current = self._delivery_job_row_tx(connection, row["delivery_id"])
+            connection.commit()
+            return dict(current)
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def active_delivery_job_count(self):
+        connection = self._connect()
+        try:
+            row = connection.execute(
+                """
+                SELECT COUNT(*) AS count
+                FROM delivery_jobs
+                WHERE state IN ('pending', 'retry_wait', 'leased', 'uncertain')
+                """
+            ).fetchone()
+            return int(row["count"])
         finally:
             connection.close()

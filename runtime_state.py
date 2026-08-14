@@ -14,6 +14,10 @@ from delivery_outbox import (
     DELIVERY_OUTBOX_REQUIRED_TABLE_COLUMNS,
     DELIVERY_OUTBOX_REQUIRED_TRIGGERS,
     DELIVERY_OUTBOX_SCHEMA_STATEMENTS,
+    DELIVERY_WORKER_REQUIRED_INDEXES,
+    DELIVERY_WORKER_REQUIRED_TABLE_COLUMNS,
+    DELIVERY_WORKER_REQUIRED_TRIGGERS,
+    DELIVERY_WORKER_SCHEMA_STATEMENTS,
     DeliveryOutboxMixin,
 )
 from event_identity import (
@@ -46,7 +50,7 @@ from processing_recovery import (
 )
 
 
-RUNTIME_SCHEMA_VERSION = 6
+RUNTIME_SCHEMA_VERSION = 7
 MIGRATION_TABLE = "schema_migrations"
 DEFAULT_BACKUP_DIRECTORY = "runtime_state_backups"
 
@@ -203,6 +207,11 @@ MIGRATIONS = (
         6,
         "transactional_erpnext_delivery_outbox",
         DELIVERY_OUTBOX_SCHEMA_STATEMENTS,
+    ),
+    Migration(
+        7,
+        "leased_delivery_worker",
+        DELIVERY_WORKER_SCHEMA_STATEMENTS,
     ),
 )
 MIGRATION_BY_VERSION = {migration.version: migration for migration in MIGRATIONS}
@@ -400,6 +409,11 @@ def _required_schema_errors(connection, version=None):
             table_requirements.setdefault(table, {}).update(columns)
         index_requirements.update(DELIVERY_OUTBOX_REQUIRED_INDEXES)
         trigger_requirements.update(DELIVERY_OUTBOX_REQUIRED_TRIGGERS)
+    if version >= 7:
+        for table, columns in DELIVERY_WORKER_REQUIRED_TABLE_COLUMNS.items():
+            table_requirements.setdefault(table, {}).update(columns)
+        index_requirements.update(DELIVERY_WORKER_REQUIRED_INDEXES)
+        trigger_requirements.update(DELIVERY_WORKER_REQUIRED_TRIGGERS)
 
     errors = []
     for table, required in table_requirements.items():

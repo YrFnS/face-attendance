@@ -1,0 +1,22 @@
+[Unit]
+Description=Face Attendance Durable ERPNext Delivery Worker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/face-attendance
+ExecStart=/opt/face-attendance/.venv/bin/python -u /opt/face-attendance/delivery_service.py
+Restart=on-failure
+RestartSec=3
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+
+[Install]
+WantedBy=multi-user.target
