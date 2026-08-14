@@ -1,0 +1,26 @@
+name: Export P2-04 source
+
+on:
+  push:
+    branches:
+      - agent/p204-source-export
+
+permissions:
+  contents: read
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - name: Prepare source snapshot
+        run: |
+          rm -rf .git
+          tar -czf /tmp/face-attendance-p205-source.tar.gz .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: face-attendance-p205-source
+          path: /tmp/face-attendance-p205-source.tar.gz
+          retention-days: 1
+          if-no-files-found: error
