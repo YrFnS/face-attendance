@@ -17,6 +17,7 @@ from camera_sources import (
     source_by_username,
     write_source_receipt,
 )
+from event_operations import operator_staging_path
 from pad import PADGate, PADResult
 from runtime_state import RuntimeState, file_sha256, make_event_id
 
@@ -371,6 +372,12 @@ class WatchServiceTests(unittest.TestCase):
         event = self.state.get_event(self.event_id())
         self.assertEqual(event["status"], "rejected")
         self.assertEqual(event["reason_code"], "upload_too_large")
+        self.assertEqual(
+            event["source_path"], str(self.image_path.resolve(strict=False))
+        )
+        self.assertEqual(
+            event["retention_path"], str(self.image_path.resolve(strict=False))
+        )
         self.assertEqual(event["transitions"][0]["to_state"], "received")
         self.assertEqual(
             event["transitions"][-1]["reason_code"],
@@ -619,6 +626,133 @@ class WatchServiceTests(unittest.TestCase):
         event = self.state.get_event(event_id)
         self.assertEqual(event["lifecycle_state"], "failed")
         self.assertIn("source upload is unavailable", event["error"])
+
+    def test_startup_recovery_rolls_back_stage_created_before_operator_commit(self):
+        event_id = self.event_id()
+        digest, size = file_sha256(self.image_path)
+        received_at = "2026-08-14T00:00:00Z"
+        retained = self.root / "logs" / "quarantine" / "no_face" / "event.jpg"
+        retained.parent.mkdir(parents=True, exist_ok=True)
+        self.image_path.replace(retained)
+        receipt_path(self.image_path).replace(receipt_path(retained))
+        self.state.record_event_receipt(
+            event_id=event_id,
+            capture_id=watch_service.make_capture_id(
+                "camera-in", digest, retained.name, size, retained.stat().st_mtime
+            ),
+            camera_id="camera-in",
+            log_type="IN",
+            source_sha256=digest,
+            source_name=retained.name,
+            source_mtime=retained.stat().st_mtime,
+            source_size=size,
+            received_at=received_at,
+            effective_at=received_at,
+            source_path=str(self.image_path.resolve(strict=False)),
+            retention_path=str(retained.resolve(strict=False)),
+            branch="Baghdad",
+            source_type="holowits_ftp",
+            source_principal="camera_in",
+            source_binding_id=self.sources[0].binding_id,
+            policy="IN",
+            source_at=received_at,
+            source_time_provenance="test",
+            receipt_state="verified",
+            receipt_verified=True,
+            receipt_detail={"test": True},
+            policy_version="directional-v1",
+        )
+        self.state.transition_event(
+            event_id,
+            to_state="rejected",
+            reason_code="no_face",
+            event_updates={
+                "retention_state": "quarantined",
+                "retention_path": str(retained.resolve(strict=False)),
+            },
+            compatibility_status="rejected",
+        )
+        target = self.image_path.parent / f"reprocess-{event_id}-event.jpg"
+        stage = operator_staging_path(target)
+        retained.replace(stage)
+        receipt_path(retained).replace(receipt_path(stage))
+
+        watch_service.recover_startup_events(self.state, self.sources, self.cfg)
+
+        self.assertTrue(retained.is_file())
+        self.assertTrue(receipt_path(retained).is_file())
+        self.assertFalse(stage.exists())
+        event = self.state.get_event(event_id)
+        self.assertEqual(event["lifecycle_state"], "rejected")
+        self.assertEqual(event["retention_path"], str(retained.resolve(strict=False)))
+        self.assertEqual(
+            self.state.recent_audit()[0]["action"],
+            "operator_stage_rolled_back",
+        )
+
+    def test_startup_recovery_publishes_expired_operator_stage(self):
+        digest, size = file_sha256(self.image_path)
+        event_id = self.event_id()
+        received_at = "2026-08-14T00:00:00Z"
+        self.state.record_event_receipt(
+            event_id=event_id,
+            capture_id=watch_service.make_capture_id(
+                "camera-in", digest, self.image_path.name, size,
+                self.image_path.stat().st_mtime,
+            ),
+            camera_id="camera-in",
+            log_type="IN",
+            source_sha256=digest,
+            source_name=self.image_path.name,
+            source_mtime=self.image_path.stat().st_mtime,
+            source_size=size,
+            received_at=received_at,
+            effective_at=received_at,
+            source_path=str(self.image_path.resolve(strict=False)),
+            retention_path=str(self.image_path.resolve(strict=False)),
+            branch="Baghdad",
+            source_type="holowits_ftp",
+            source_principal="camera_in",
+            source_binding_id=self.sources[0].binding_id,
+            policy="IN",
+            source_at=received_at,
+            source_time_provenance="test",
+            receipt_state="verified",
+            receipt_verified=True,
+            receipt_detail={"test": True},
+            policy_version="directional-v1",
+        )
+        self.state.transition_event(
+            event_id,
+            to_state="rejected",
+            reason_code="no_face",
+            event_updates={
+                "retention_state": "retained",
+                "retention_path": str(self.image_path.resolve(strict=False)),
+            },
+            compatibility_status="rejected",
+        )
+        target = self.image_path.parent / "reprocess-event.jpg"
+        stage = operator_staging_path(target)
+        self.image_path.replace(stage)
+        receipt_path(self.image_path).replace(receipt_path(stage))
+        result = self.state.request_event_reprocess(
+            event_id,
+            actor="operator@example.com",
+            reason="Reviewed the event and approved an interrupted publication test",
+            media_path=str(target),
+            publish_lease_seconds=30,
+            now=time.time() - 300,
+        )
+        self.assertTrue(result["ok"])
+        watch_service.recover_startup_events(self.state, self.sources, self.cfg)
+        self.assertTrue(target.is_file())
+        self.assertTrue(receipt_path(target).is_file())
+        self.assertFalse(stage.exists())
+        event = self.state.get_event(event_id)
+        self.assertEqual(event["lifecycle_state"], "processing")
+        self.assertEqual(event["retention_path"], str(target))
+        self.assertGreaterEqual(event["recovery_count"], 1)
 
 if __name__ == "__main__":
     unittest.main()

@@ -147,6 +147,8 @@ class RecoveryOutcome:
     lifecycle_state: str
     processing_attempt: int
     delivery_decision_id: str = ""
+    source_path: str = ""
+    retention_path: str = ""
 
 
 @dataclass(frozen=True)
@@ -916,6 +918,8 @@ class ProcessingRecoveryMixin:
                         row["lifecycle_state"],
                         int(row["processing_attempt"]),
                         row["delivery_decision_id"],
+                        row["source_path"] if "source_path" in row.keys() else "",
+                        row["retention_path"] if "retention_path" in row.keys() else "",
                     )
                 )
             connection.commit()

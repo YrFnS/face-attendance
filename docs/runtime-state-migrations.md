@@ -157,3 +157,14 @@ Do not start the newer application against a deliberately restored older schema:
 - **Restore fails after the safety backup is created:** preserve both backups and investigate before attempting another replacement.
 
 Backups contain operational and potentially biometric-adjacent metadata. Apply the approved encryption, access, retention, and expiry policy before production use.
+
+## Current schema additions
+
+The current runtime schema is version 4:
+
+- version 1 adopts the original runtime-state tables;
+- version 2 adds the versioned event ledger and immutable recognition evidence;
+- version 3 adds processing leases, startup recovery, and transactional attendance policy state;
+- version 4 adds source/retention path summaries and audited event operator metadata used by `event_admin.py`.
+
+Migration 4 does not change or remove existing event, decision, transition, policy, or audit rows. Existing version-3 events receive blank source/retention paths and remain readable; an operator must supply `--media-path` before reprocessing one of those older events.

@@ -586,6 +586,7 @@ class EventLedgerMixin:
             "pad_model",
             "policy_version",
             "retention_state",
+            "retention_path",
             "final_disposition",
         }
     )
@@ -635,6 +636,8 @@ class EventLedgerMixin:
         source_size,
         received_at,
         effective_at,
+        source_path="",
+        retention_path="",
         branch="",
         source_type="",
         source_principal="",
@@ -657,6 +660,12 @@ class EventLedgerMixin:
         if log_type not in {"IN", "OUT"}:
             raise EventLedgerValidationError("log_type must be IN or OUT")
         source_name = _text(source_name, "source_name", required=True, max_chars=1024)
+        source_path = _text(source_path, "source_path", max_chars=4096)
+        retention_path = _text(
+            retention_path or source_path,
+            "retention_path",
+            max_chars=4096,
+        )
         source_size = _integer(source_size, "source_size", minimum=0)
         source_mtime = _finite(source_mtime, "source_mtime", minimum=0)
         receipt_state = _enum(receipt_state, "receipt_state", RECEIPT_STATES)
@@ -707,7 +716,8 @@ class EventLedgerMixin:
                 """
                 INSERT INTO camera_events (
                     event_id, camera_id, log_type, source_sha256, source_name,
-                    source_mtime, source_size, status, created_unix, updated_unix,
+                    source_path, retention_path, source_mtime, source_size,
+                    status, created_unix, updated_unix,
                     completed_at, error, capture_id, received_at, received_unix,
                     transport_received_at, source_at, source_time_provenance,
                     effective_at, branch, source_type, source_principal,
@@ -715,7 +725,7 @@ class EventLedgerMixin:
                     receipt_verified, receipt_json, lifecycle_state, state_version,
                     reason_code, policy_version, retention_state
                 ) VALUES (
-                    ?, ?, ?, ?, ?, ?, ?, 'received', ?, ?, NULL, '', ?, ?, ?,
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, 'received', ?, ?, NULL, '', ?, ?, ?,
                     ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'received', 1, ?, ?, 'pending'
                 )
                 """,
@@ -725,6 +735,8 @@ class EventLedgerMixin:
                     log_type,
                     source_sha256,
                     source_name,
+                    source_path,
+                    retention_path,
                     source_mtime,
                     source_size,
                     received_unix,

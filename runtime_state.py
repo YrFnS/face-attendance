@@ -17,6 +17,13 @@ from event_ledger import (
     LEDGER_SCHEMA_STATEMENTS,
     make_capture_id,
 )
+from event_operations import (
+    EventOperationsMixin,
+    OPERATION_REQUIRED_INDEXES,
+    OPERATION_REQUIRED_TABLE_COLUMNS,
+    OPERATION_REQUIRED_TRIGGERS,
+    OPERATION_SCHEMA_STATEMENTS,
+)
 from processing_recovery import (
     ProcessingRecoveryMixin,
     RECOVERY_REQUIRED_INDEXES,
@@ -25,7 +32,7 @@ from processing_recovery import (
 )
 
 
-RUNTIME_SCHEMA_VERSION = 3
+RUNTIME_SCHEMA_VERSION = 4
 MIGRATION_TABLE = "schema_migrations"
 DEFAULT_BACKUP_DIRECTORY = "runtime_state_backups"
 
@@ -177,6 +184,7 @@ MIGRATIONS = (
     Migration(1, "baseline_runtime_state", BASELINE_SCHEMA_STATEMENTS),
     Migration(2, "versioned_event_ledger", LEDGER_SCHEMA_STATEMENTS),
     Migration(3, "processing_leases_and_policy_state", RECOVERY_SCHEMA_STATEMENTS),
+    Migration(4, "audited_event_operations", OPERATION_SCHEMA_STATEMENTS),
 )
 MIGRATION_BY_VERSION = {migration.version: migration for migration in MIGRATIONS}
 
@@ -358,6 +366,11 @@ def _required_schema_errors(connection, version=None):
         for table, columns in RECOVERY_REQUIRED_TABLE_COLUMNS.items():
             table_requirements.setdefault(table, {}).update(columns)
         index_requirements.update(RECOVERY_REQUIRED_INDEXES)
+    if version >= 4:
+        for table, columns in OPERATION_REQUIRED_TABLE_COLUMNS.items():
+            table_requirements.setdefault(table, {}).update(columns)
+        index_requirements.update(OPERATION_REQUIRED_INDEXES)
+        trigger_requirements.update(OPERATION_REQUIRED_TRIGGERS)
 
     errors = []
     for table, required in table_requirements.items():
@@ -806,7 +819,7 @@ def restore_runtime_backup(
             pass
 
 
-class RuntimeState(ProcessingRecoveryMixin, EventLedgerMixin):
+class RuntimeState(EventOperationsMixin, ProcessingRecoveryMixin, EventLedgerMixin):
     def __init__(self, path, backup_dir=None):
         self.path = Path(path)
         self.backup_dir = _backup_directory(self.path, backup_dir)

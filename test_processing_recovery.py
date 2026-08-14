@@ -64,8 +64,8 @@ class ProcessingRecoveryTests(unittest.TestCase):
 
     def test_schema_v3_has_processing_and_policy_state(self):
         report = self.state.migration_status()
-        self.assertEqual(RUNTIME_SCHEMA_VERSION, 3)
-        self.assertEqual(report["schema_version"], 3)
+        self.assertGreaterEqual(RUNTIME_SCHEMA_VERSION, 3)
+        self.assertEqual(report["schema_version"], RUNTIME_SCHEMA_VERSION)
         connection = sqlite3.connect(self.database)
         try:
             event_columns = {

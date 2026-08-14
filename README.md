@@ -293,3 +293,14 @@ The following contain local state or biometric data and are ignored by Git:
 - `cooldown_state.json`
 
 Do not commit employee photos, embeddings, camera captures, legacy pickle backups, logs, API tokens, or passwords.
+
+### Inspect and resolve attendance events
+
+After migrating `runtime_state.sqlite3` to the current schema, use the dedicated event CLI:
+
+```bash
+python event_admin.py list --database runtime_state.sqlite3
+python event_admin.py explain EVENT_ID --database runtime_state.sqlite3
+```
+
+Audited reprocess, quarantine-resolution, and dismissal commands require an actor, a human reason, and explicit confirmation. They never retry or cancel ERPNext delivery. See `docs/event-operations.md` for the complete safety and recovery workflow.

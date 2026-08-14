@@ -4,6 +4,7 @@ import shutil
 import socket
 import time
 import uuid
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -23,6 +24,10 @@ from event_ledger import (
     timestamp_from_unix,
     utc_now,
 )
+from event_operations import (
+    event_id_from_operator_staging,
+    operator_staging_path,
+)
 from processing_recovery import ProcessingLeaseError
 from pad import PADConfigError, PADGate, PADResult
 from production_readiness import check_production_readiness, format_report
@@ -34,6 +39,18 @@ ROOT = Path(__file__).resolve().parent
 
 class DeliveryAttemptUncertain(RuntimeError):
     pass
+
+
+@dataclass(frozen=True)
+class RetentionOutcome:
+    state: str
+    path: str = ""
+
+    def event_updates(self):
+        return {
+            "retention_state": self.state,
+            "retention_path": self.path,
+        }
 
 
 def watcher_worker_id():
@@ -49,19 +66,157 @@ def policy_reservation_seconds(cfg):
     return int(cfg.get("attendance_policy_reservation_seconds", 300))
 
 
+def _path_has_symlink_component(path):
+    cursor = Path(path)
+    while True:
+        if cursor.exists() and cursor.is_symlink():
+            return True
+        if cursor == cursor.parent:
+            return False
+        cursor = cursor.parent
+
+
+def restore_orphan_operator_stages(state, sources):
+    """Roll back media staged before an operator DB action was committed.
+
+    Reprocess staging names include the complete event ID. A process death
+    after the filesystem move but before the operator transaction commits
+    therefore leaves enough information to verify and return the evidence to
+    the event's recorded retention path. Nonterminal events are left for the
+    normal operator-publication recovery path below.
+    """
+
+    restored = []
+    for source in sources:
+        if not source.upload_dir.is_dir():
+            continue
+        for stage in source.upload_dir.glob(".*.operator.incoming"):
+            event_id = event_id_from_operator_staging(stage)
+            if not event_id or not stage.is_file() or stage.is_symlink():
+                continue
+            event = state.event_details(event_id, include_history=False)
+            if event is None or event.get("lifecycle_state") not in {
+                "processed",
+                "checkin_created",
+                "rejected",
+                "failed",
+                "uncertain",
+                "dismissed",
+            }:
+                continue
+            destination_text = str(event.get("retention_path") or "")
+            if not destination_text:
+                continue
+            destination = Path(destination_text).expanduser().resolve(strict=False)
+            if _path_has_symlink_component(destination):
+                attendance.log(
+                    f"operator stage rollback refused event={event_id}: "
+                    "recorded retention path uses a symbolic link"
+                )
+                continue
+            try:
+                digest, size = file_sha256(stage)
+            except (OSError, ValueError):
+                continue
+            if (
+                digest != str(event.get("source_sha256") or "").lower()
+                or size != int(event.get("source_size") or 0)
+            ):
+                attendance.log(
+                    f"operator stage rollback refused event={event_id}: "
+                    "content does not match immutable receipt"
+                )
+                continue
+            stage_receipt = receipt_path(stage)
+            destination_receipt = receipt_path(destination)
+            image_already_present = destination.exists()
+            if image_already_present:
+                try:
+                    existing_digest, existing_size = file_sha256(destination)
+                except (OSError, ValueError):
+                    continue
+                if (existing_digest, existing_size) != (digest, size):
+                    attendance.log(
+                        f"operator stage rollback refused event={event_id}: "
+                        "recorded retention path contains different content"
+                    )
+                    continue
+            if stage_receipt.is_file() and destination_receipt.exists():
+                try:
+                    staged_receipt = file_sha256(stage_receipt)
+                    existing_receipt = file_sha256(destination_receipt)
+                except (OSError, ValueError):
+                    continue
+                if staged_receipt != existing_receipt:
+                    attendance.log(
+                        f"operator stage rollback refused event={event_id}: "
+                        "recorded retention receipt contains different content"
+                    )
+                    continue
+            if image_already_present:
+                stage.unlink()
+            else:
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                _move_path(stage, destination)
+            if stage_receipt.is_file() and not destination_receipt.exists():
+                _move_path(stage_receipt, destination_receipt)
+            elif stage_receipt.exists() and destination_receipt.exists():
+                stage_receipt.unlink()
+            try:
+                state.audit(
+                    actor="system",
+                    action="operator_stage_rolled_back",
+                    remote_addr="local-watcher",
+                    detail={
+                        "event_id": event_id,
+                        "media": destination.name,
+                    },
+                )
+            except Exception:
+                pass
+            attendance.log(
+                f"operator stage rolled back event={event_id} path={destination}"
+            )
+            restored.append(event_id)
+    return restored
+
+
 def recover_startup_events(state, sources, cfg):
     if not bool(cfg.get("event_startup_recovery_enabled", True)):
         return []
+    restore_orphan_operator_stages(state, sources)
     outcomes = state.recover_expired_event_leases()
     by_camera = {source.camera_id: source for source in sources}
     for outcome in outcomes:
         source = by_camera.get(outcome.camera_id)
-        candidate = (
-            source.upload_dir / Path(outcome.source_name).name if source else None
-        )
+        recorded_path = outcome.retention_path or outcome.source_path
+        candidate = Path(recorded_path) if recorded_path else None
+        if candidate is None and source is not None:
+            candidate = source.upload_dir / Path(outcome.source_name).name
+        if outcome.outcome == "retry" and candidate is not None and not candidate.is_file():
+            try:
+                stage = operator_staging_path(candidate)
+            except ValueError:
+                stage = None
+            if stage is not None and stage.is_file():
+                candidate.parent.mkdir(parents=True, exist_ok=True)
+                _move_path(stage, candidate)
+                stage_receipt = receipt_path(stage)
+                if stage_receipt.is_file():
+                    _move_path(stage_receipt, receipt_path(candidate))
         if outcome.outcome == "uncertain":
             if candidate is not None and candidate.is_file():
-                reject_file(candidate, "delivery_uncertain", cfg)
+                retention = reject_file(candidate, "delivery_uncertain", cfg)
+                state.transition_event(
+                    outcome.event_id,
+                    to_state="uncertain",
+                    reason_code="generic_failed",
+                    actor_type="system",
+                    detail={"kind": "startup_uncertain_media_retention"},
+                    event_updates=retention.event_updates(),
+                    compatibility_status="uncertain",
+                    error="delivery outcome remains ambiguous after startup recovery",
+                )
             attendance.log(
                 f"startup recovery marked event uncertain event={outcome.event_id} "
                 f"decision={outcome.delivery_decision_id or '-'}"
@@ -168,29 +323,36 @@ def quarantine(path, reason, cfg, *, dry_run=False):
     return destination
 
 
-def remove_source(path, cfg):
-    if not bool(cfg.get("delete_camera_uploads_after_processing", True)):
-        return
+def remove_source(path, cfg, *, force=False):
+    if not force and not bool(cfg.get("delete_camera_uploads_after_processing", True)):
+        return False
+    removed = False
     for candidate in (Path(path), receipt_path(path)):
         try:
             candidate.unlink()
+            removed = True
         except FileNotFoundError:
             pass
+    return removed
 
 
 def reject_file(path, reason, cfg, *, dry_run=False):
     if dry_run:
         attendance.log(f"dry run: would reject ftp:{Path(path).name} reason={reason}")
-        return "not_retained"
+        return RetentionOutcome("not_retained", "")
     moved = quarantine(path, reason, cfg, dry_run=dry_run)
     if moved:
         attendance.log(f"ftp:{Path(path).name}: quarantined reason={reason} path={moved}")
-        return "quarantined"
+        return RetentionOutcome("quarantined", str(Path(moved).resolve()))
     attendance.log(f"ftp:{Path(path).name}: rejected reason={reason}")
     if bool(cfg.get("delete_rejected_camera_uploads", False)):
-        remove_source(path, cfg)
-        return "deleted"
-    return "retained"
+        remove_source(path, cfg, force=True)
+        return RetentionOutcome("deleted", "")
+    retained = Path(path)
+    return RetentionOutcome(
+        "retained",
+        str(retained.resolve(strict=False)) if retained.exists() else "",
+    )
 
 
 def _finish_reason(status, error, reason_code):
@@ -513,6 +675,8 @@ def process_path(
                 source_size=source_size,
                 received_at=received_at,
                 effective_at=received_at,
+                source_path=str(path.resolve(strict=False)),
+                retention_path=str(path.resolve(strict=False)),
                 branch=camera_source.branch,
                 source_type=camera_source.source_type,
                 source_principal=camera_source.ftp_username,
@@ -580,7 +744,7 @@ def process_path(
                 status="rejected",
                 error="upload_too_large",
                 reason_code="upload_too_large",
-                event_updates={"retention_state": retention},
+                event_updates=retention.event_updates(),
                 lease_owner=lease_owner,
             )
             return False
@@ -607,7 +771,7 @@ def process_path(
                 reason_code="source_binding_invalid",
                 event_updates={
                     "receipt_state": "invalid",
-                    "retention_state": retention,
+                    **retention.event_updates(),
                 },
                 lease_owner=lease_owner,
             )
@@ -672,7 +836,7 @@ def process_path(
                 status="rejected",
                 error=time_error,
                 reason_code=time_error,
-                event_updates={"retention_state": retention},
+                event_updates=retention.event_updates(),
                 lease_owner=lease_owner,
             )
             return False
@@ -687,7 +851,7 @@ def process_path(
                 status="rejected",
                 error="unreadable_image",
                 reason_code="unreadable_image",
-                event_updates={"retention_state": retention},
+                event_updates=retention.event_updates(),
                 lease_owner=lease_owner,
             )
             return False
@@ -702,7 +866,7 @@ def process_path(
                 status="rejected",
                 error="image_too_large",
                 reason_code="image_too_large",
-                event_updates={"retention_state": retention},
+                event_updates=retention.event_updates(),
                 lease_owner=lease_owner,
             )
             return False
@@ -730,7 +894,7 @@ def process_path(
                 status="rejected",
                 error="no_face",
                 reason_code="no_face",
-                event_updates={"retention_state": retention},
+                event_updates=retention.event_updates(),
                 lease_owner=lease_owner,
             )
             return False
@@ -775,7 +939,7 @@ def process_path(
                 status="rejected",
                 error=f"pad:{pad_event_error}"[:2000],
                 reason_code=reason_code,
-                event_updates={"retention_state": retention},
+                event_updates=retention.event_updates(),
                 lease_owner=lease_owner,
             )
             return False
@@ -824,7 +988,7 @@ def process_path(
                 status="rejected",
                 error=f"pad:{reasons}"[:2000],
                 reason_code="pad_rejected",
-                event_updates={"retention_state": retention},
+                event_updates=retention.event_updates(),
                 lease_owner=lease_owner,
             )
             return False
@@ -998,7 +1162,7 @@ def process_path(
                 status="failed",
                 error=str(exc),
                 reason_code="processing_failed",
-                event_updates={"retention_state": retention},
+                event_updates=retention.event_updates(),
                 lease_owner=lease_owner,
             )
             attendance.log(
@@ -1010,18 +1174,20 @@ def process_path(
         if not dry_run:
             if bool(cfg.get("delete_camera_uploads_after_processing", True)):
                 remove_source(path, cfg)
-                retention = "deleted"
+                retention = RetentionOutcome("deleted", "")
             else:
-                retention = "retained"
+                retention = RetentionOutcome(
+                    "retained", str(path.resolve(strict=False))
+                )
         else:
-            retention = "not_retained"
+            retention = RetentionOutcome("not_retained", "")
         claim_finalized = finish_claim(
             state,
             claim,
             event_id,
             status="checkin_created" if created else "processed_no_checkin",
             reason_code="checkin_created" if created else "processed_no_checkin",
-            event_updates={"retention_state": retention},
+            event_updates=retention.event_updates(),
             lease_owner=lease_owner,
         )
         return bool(created)
@@ -1036,7 +1202,7 @@ def process_path(
             status="uncertain",
             error=str(exc),
             reason_code="generic_failed",
-            event_updates={"retention_state": retention},
+            event_updates=retention.event_updates(),
             detail={"kind": "delivery_ambiguous"},
             lease_owner=lease_owner,
         )
@@ -1060,7 +1226,7 @@ def process_path(
                 status="failed",
                 error=f"invalid_upload:{exc}",
                 reason_code="invalid_upload",
-                event_updates={"retention_state": retention},
+                event_updates=retention.event_updates(),
                 lease_owner=lease_owner,
             )
         attendance.log(f"ftp:{path.name}: rejected before processing: {exc}")
