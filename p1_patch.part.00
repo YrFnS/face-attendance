@@ -1,0 +1,230 @@
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parent
+
+
+def read(path):
+    return (ROOT / path).read_text(encoding="utf-8")
+
+
+def write(path, content):
+    (ROOT / path).write_text(content, encoding="utf-8")
+
+
+def replace_once(path, old, new):
+    source = read(path)
+    count = source.count(old)
+    if count != 1:
+        raise SystemExit(f"expected one match in {path}, found {count}: {old[:120]!r}")
+    write(path, source.replace(old, new, 1))
+
+
+def replace_between(path, start_marker, end_marker, replacement):
+    source = read(path)
+    start = source.index(start_marker)
+    end = source.index(end_marker, start)
+    write(path, source[:start] + replacement + source[end:])
+
+
+def patch_runtime_state():
+    replace_once(
+        "runtime_state.py",
+        "from pathlib import Path\n\n\nRUNTIME_SCHEMA_VERSION = 1",
+        '''from pathlib import Path
+
+from event_ledger import (
+    EventLedgerMixin,
+    LEDGER_REQUIRED_INDEXES,
+    LEDGER_REQUIRED_TABLE_COLUMNS,
+    LEDGER_REQUIRED_TRIGGERS,
+    LEDGER_SCHEMA_STATEMENTS,
+    make_capture_id,
+)
+
+
+RUNTIME_SCHEMA_VERSION = 2''',
+    )
+    replace_once(
+        "runtime_state.py",
+        '''MIGRATIONS = (
+    Migration(1, "baseline_runtime_state", BASELINE_SCHEMA_STATEMENTS),
+)
+''',
+        '''MIGRATIONS = (
+    Migration(1, "baseline_runtime_state", BASELINE_SCHEMA_STATEMENTS),
+    Migration(2, "versioned_event_ledger", LEDGER_SCHEMA_STATEMENTS),
+)
+''',
+    )
+    required_function = '''def _required_schema_errors(connection, version=None):
+    version = RUNTIME_SCHEMA_VERSION if version is None else int(version)
+    table_requirements = {
+        table: dict(columns) for table, columns in REQUIRED_TABLE_COLUMNS.items()
+    }
+    index_requirements = dict(REQUIRED_INDEXES)
+    trigger_requirements = set()
+    if version >= 2:
+        for table, columns in LEDGER_REQUIRED_TABLE_COLUMNS.items():
+            table_requirements.setdefault(table, {}).update(columns)
+        index_requirements.update(LEDGER_REQUIRED_INDEXES)
+        trigger_requirements.update(LEDGER_REQUIRED_TRIGGERS)
+
+    errors = []
+    for table, required in table_requirements.items():
+        if not _table_exists(connection, table):
+            errors.append(f"required table is missing: {table}")
+            continue
+        rows = connection.execute(f'PRAGMA table_info("{table}")').fetchall()
+        columns = {row["name"]: row for row in rows}
+        missing = sorted(set(required) - set(columns))
+        if missing:
+            errors.append(
+                f"table {table} is missing required columns: {', '.join(missing)}"
+            )
+        for name, (expected_type, expected_not_null, expected_pk) in required.items():
+            row = columns.get(name)
+            if row is None:
+                continue
+            actual_type = str(row["type"] or "").strip().upper()
+            if actual_type != expected_type:
+                errors.append(
+                    f"table {table} column {name} has type "
+                    f"{actual_type or '<empty>'}; expected {expected_type}"
+                )
+            if bool(row["notnull"]) is not bool(expected_not_null):
+                errors.append(f"table {table} column {name} NOT NULL mismatch")
+            if int(row["pk"] or 0) != int(expected_pk):
+                errors.append(
+                    f"table {table} column {name} primary-key position mismatch"
+                )
+
+    index_rows = connection.execute(
+        "SELECT name, tbl_name FROM sqlite_master WHERE type = 'index'"
+    ).fetchall()
+    indexes = {row["name"]: row for row in index_rows}
+    for index_name, (expected_unique, expected_columns) in index_requirements.items():
+        row = indexes.get(index_name)
+        if row is None:
+            errors.append(f"required indexes are missing: {index_name}")
+            continue
+        table = row["tbl_name"]
+        listed = {
+            item["name"]: bool(item["unique"])
+            for item in connection.execute(
+                f'PRAGMA index_list("{table}")'
+            ).fetchall()
+        }
+        if listed.get(index_name) is not bool(expected_unique):
+            errors.append(f"index {index_name} uniqueness mismatch")
+        actual_columns = tuple(
+            item["name"]
+            for item in connection.execute(
+                f'PRAGMA index_info("{index_name}")'
+            ).fetchall()
+        )
+        if actual_columns != expected_columns:
+            errors.append(
+                f"index {index_name} columns {actual_columns!r}; "
+                f"expected {expected_columns!r}"
+            )
+
+    if trigger_requirements:
+        triggers = {
+            row["name"]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'trigger'"
+            ).fetchall()
+        }
+        missing_triggers = sorted(trigger_requirements - triggers)
+        if missing_triggers:
+            errors.append(
+                "required triggers are missing: " + ", ".join(missing_triggers)
+            )
+    return errors
+
+
+'''
+    replace_between(
+        "runtime_state.py",
+        "def _required_schema_errors(connection):\n",
+        "def _integrity_errors(connection):\n",
+        required_function,
+    )
+    replace_once(
+        "runtime_state.py",
+        "schema_errors = _required_schema_errors(connection) if current else []",
+        "schema_errors = _required_schema_errors(connection, version=current) if current else []",
+    )
+    replace_once(
+        "runtime_state.py",
+        "            schema_errors = _required_schema_errors(connection)\n",
+        "            schema_errors = _required_schema_errors(\n                connection, version=migration.version\n            )\n",
+    )
+    replace_once(
+        "runtime_state.py",
+        "class RuntimeState:\n",
+        "class RuntimeState(EventLedgerMixin):\n",
+    )
+    compatibility_block = '''    def claim_event(
+        self,
+        *,
+        event_id,
+        camera_id,
+        log_type,
+        source_sha256,
+        source_name,
+        source_mtime,
+        source_size,
+    ):
+        received_at = utc_now()
+        claim = self.record_event_receipt(
+            event_id=event_id,
+            capture_id=make_capture_id(
+                camera_id,
+                source_sha256,
+                source_name,
+                source_size,
+                source_mtime,
+            ),
+            camera_id=camera_id,
+            log_type=log_type,
+            source_sha256=source_sha256,
+            source_name=source_name,
+            source_mtime=source_mtime,
+            source_size=int(source_size),
+            received_at=received_at,
+            effective_at=received_at,
+            policy=log_type,
+            source_time_provenance="legacy",
+            receipt_state="legacy",
+            receipt_verified=False,
+            receipt_detail={"compatibility_path": True},
+            policy_version="legacy",
+        )
+        if claim.accepted:
+            self.transition_event(
+                event_id,
+                to_state="processing",
+                reason_code="processing_started",
+                actor_type="system",
+                compatibility_status="processing",
+            )
+        return claim
+
+    def finish_event(self, event_id, status="processed", error=""):
+        mapping = {
+            "checkin_created": ("checkin_created", "checkin_created"),
+            "processed": ("processed", "processed_no_checkin"),
+            "processed_no_checkin": ("processed", "processed_no_checkin"),
+            "rejected": ("rejected", "generic_rejected"),
+            "failed": ("failed", "generic_failed"),
+            "uncertain": ("uncertain", "generic_failed"),
+        }
+        lifecycle, reason = mapping.get(
+            status,
+            ("failed", "generic_failed"),
+        )
+        return self.transition_event(
+            event_id,
+            to_state=lifecycle,
