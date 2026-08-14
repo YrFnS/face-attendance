@@ -2,6 +2,7 @@ import base64
 import binascii
 import hashlib
 import hmac
+import ipaddress
 import secrets
 from datetime import timedelta
 from functools import wraps
@@ -152,18 +153,23 @@ def verify_password(password, encoded):
         return False
 
 
+def session_secret_issues(cfg):
+    session_secret = str(cfg.get("web_session_secret") or "").strip()
+    if len(session_secret) < 32 or is_placeholder(session_secret):
+        return (
+            "web_session_secret must be a persistent non-placeholder value of at least 32 characters",
+        )
+    return ()
+
+
 def auth_configuration_issues(cfg):
     issues = []
     username = str(cfg.get("web_admin_username") or "").strip()
     password_hash = str(cfg.get("web_admin_password_hash") or "").strip()
-    session_secret = str(cfg.get("web_session_secret") or "").strip()
     if not username:
         issues.append("web_admin_username is not configured")
     issues.extend(password_hash_issues(password_hash))
-    if len(session_secret) < 32 or is_placeholder(session_secret):
-        issues.append(
-            "web_session_secret must be a persistent non-placeholder value of at least 32 characters"
-        )
+    issues.extend(session_secret_issues(cfg))
     return tuple(issues)
 
 
@@ -172,7 +178,12 @@ def auth_configured(cfg):
 
 
 def configure_app(app, cfg):
-    configured = auth_configured(cfg)
+    mode = str(cfg.get("web_auth_mode") or "local").strip().lower()
+    configured = (
+        not session_secret_issues(cfg)
+        if mode == "adapter"
+        else auth_configured(cfg)
+    )
     secret = str(cfg.get("web_session_secret") or "").strip()
     if not configured:
         secret = secrets.token_urlsafe(48)
@@ -256,8 +267,114 @@ def safe_next_url(value, fallback="/"):
     return value
 
 
-def remote_address():
-    return str(request.remote_addr or "unknown")
+def _normalize_ip(value):
+    value = str(value or "").strip()
+    if not value:
+        return None
+    if value.startswith("[") and value.endswith("]"):
+        value = value[1:-1]
+    try:
+        address = ipaddress.ip_address(value)
+    except ValueError:
+        return None
+    if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped:
+        address = address.ipv4_mapped
+    return address
+
+
+def _trusted_proxy_networks(cfg):
+    value = cfg.get("web_trusted_proxy_networks", [])
+    if not isinstance(value, list):
+        raise ValueError("web_trusted_proxy_networks must be a JSON array")
+    if len(value) > 32:
+        raise ValueError("web_trusted_proxy_networks exceeds 32 entries")
+    networks = []
+    for index, item in enumerate(value):
+        try:
+            network = ipaddress.ip_network(str(item), strict=True)
+        except ValueError as exc:
+            raise ValueError(
+                f"web_trusted_proxy_networks[{index}] is not a canonical CIDR"
+            ) from exc
+        if network.prefixlen == 0:
+            raise ValueError(
+                f"web_trusted_proxy_networks[{index}] must not trust the entire internet"
+            )
+        networks.append(network)
+    return tuple(networks)
+
+
+def proxy_configuration_issues(cfg):
+    issues = []
+    enabled = cfg.get("web_trust_proxy_headers", False)
+    if not isinstance(enabled, bool):
+        return ("web_trust_proxy_headers must be a boolean",)
+    if (
+        bool(cfg.get("production_mode", False))
+        and bool(cfg.get("https_reverse_proxy_acknowledged", False))
+        and not enabled
+    ):
+        issues.append(
+            "web_trust_proxy_headers must be true behind the production reverse proxy so throttling uses the verified client address"
+        )
+    if not enabled:
+        return tuple(issues)
+    try:
+        networks = _trusted_proxy_networks(cfg)
+        if not networks:
+            issues.append("web_trusted_proxy_networks must contain the reverse proxy CIDR")
+    except ValueError as exc:
+        issues.append(str(exc))
+    header = str(
+        cfg.get("web_forwarded_for_header") or "X-Forwarded-For"
+    ).strip()
+    if header.lower() != "x-forwarded-for":
+        issues.append("web_forwarded_for_header must be X-Forwarded-For")
+    hops = cfg.get("web_max_forwarded_hops", 8)
+    if isinstance(hops, bool) or not isinstance(hops, int) or not 1 <= hops <= 32:
+        issues.append("web_max_forwarded_hops must be an integer from 1 through 32")
+    return tuple(issues)
+
+
+def peer_address():
+    address = _normalize_ip(request.remote_addr)
+    return address.compressed if address is not None else "unknown"
+
+
+def remote_address(cfg=None):
+    peer = _normalize_ip(request.remote_addr)
+    if peer is None:
+        return "unknown"
+    if not cfg or not bool(cfg.get("web_trust_proxy_headers", False)):
+        return peer.compressed
+    if proxy_configuration_issues(cfg):
+        return peer.compressed
+    networks = _trusted_proxy_networks(cfg)
+    if not any(peer in network for network in networks):
+        return peer.compressed
+    header_name = str(
+        cfg.get("web_forwarded_for_header") or "X-Forwarded-For"
+    ).strip()
+    header = str(request.headers.get(header_name) or "")
+    if not header or len(header) > 2048:
+        return peer.compressed
+    parts = [part.strip() for part in header.split(",")]
+    max_hops = int(cfg.get("web_max_forwarded_hops", 8))
+    if not parts or len(parts) > max_hops:
+        return peer.compressed
+    forwarded = []
+    for part in parts:
+        address = _normalize_ip(part)
+        if address is None:
+            return peer.compressed
+        forwarded.append(address)
+
+    candidate = peer
+    for address in reversed(forwarded):
+        if not any(candidate in network for network in networks):
+            break
+        candidate = address
+    return candidate.compressed
 
 
 def add_security_headers(response, cfg):
