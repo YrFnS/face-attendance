@@ -22,28 +22,20 @@ jobs:
         with:
           python-version: "3.11"
           cache: pip
-      - name: Assemble final source tree
+      - name: Assemble final Phase 2 patch
         env:
-          BASE_SHA: a3011e16ea8816901b16b8a630588c83e50d8a23
-          ARCHIVE_SHA256: cb1885046cedd3a30f7761de3a91b8605a7eaac1e0491638ea06e9b09427cdb7
+          BASE_SHA: 0006ed95165fcde9a03f354821abe4297d05752b
+          PATCH_SHA256: 0da08bfe0df549092634cb7f36b91e9737c4b7a2346cb34caaca4300ed3b6a5c
         run: |
-          cat phase2.publish/part* > /tmp/phase2-source.tgz.b64
-          base64 -d /tmp/phase2-source.tgz.b64 > /tmp/phase2-source.tgz
-          echo "$ARCHIVE_SHA256  /tmp/phase2-source.tgz" | sha256sum -c -
-          mkdir -p /tmp/phase2-source
-          tar -xzf /tmp/phase2-source.tgz -C /tmp/phase2-source
-          cp .github/workflows/tests.yml /tmp/base-tests.yml
+          cat phase2.publish/part* > /tmp/phase2.patch.gz.b64
+          base64 -d /tmp/phase2.patch.gz.b64 | gzip -d > /tmp/phase2.patch
+          echo "$PATCH_SHA256  /tmp/phase2.patch" | sha256sum -c -
           git reset --hard "$BASE_SHA"
-          rsync -a --delete --exclude='.git' /tmp/phase2-source/ ./
-          cp /tmp/base-tests.yml .github/workflows/tests.yml
-          rm -rf phase2.publish
-          rm -f .github/workflows/publish-phase2-live-acceptance.yml
+          git apply --index /tmp/phase2.patch
           find . -type d -name __pycache__ -prune -exec rm -rf {} +
           find . -name '*.pyc' -delete
           git add -A
           git diff --cached --check
-          test ! -e phase2.publish
-          test ! -e .github/workflows/publish-phase2-live-acceptance.yml
       - name: Install test dependencies
         run: |
           python -m pip install --upgrade pip
@@ -72,13 +64,18 @@ jobs:
           bash -n deploy/firewall/ufw-rules.example.sh
           test -s docs/live-production-acceptance.md
           test -s frappe_apps/face_attendance_idempotency/face_attendance_idempotency/acceptance.py
-          for item in $(seq -w 1 11); do
-            grep -F -- "- [x] `P2-$item`" docs/attendance-platform-plan.md >/dev/null
-          done
+          python - <<'PY'
+          from pathlib import Path
+          text = Path('docs/attendance-platform-plan.md').read_text(encoding='utf-8')
+          for number in range(1, 12):
+              marker = f'- [x] `P2-{number:02d}`'
+              if marker not in text:
+                  raise SystemExit(f'missing plan marker: {marker}')
+          PY
           git diff --cached --check
       - name: Publish clean Phase 2 branch
         env:
-          BASE_SHA: a3011e16ea8816901b16b8a630588c83e50d8a23
+          BASE_SHA: 0006ed95165fcde9a03f354821abe4297d05752b
           TARGET_BRANCH: agent/p2-phase2-complete
         run: |
           tree=$(git write-tree)
