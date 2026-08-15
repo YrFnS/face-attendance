@@ -1,4 +1,4 @@
-name: Diagnose Phase 2 publication payload
+name: Diagnose Phase 2 branch inventory
 
 on:
   push:
@@ -11,101 +11,74 @@ permissions:
   contents: read
 
 jobs:
-  diagnose:
+  inventory:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7.0.1
         with:
           fetch-depth: 0
-      - name: Extract every historical payload chunk
+      - name: Inspect every remote P2 branch
         shell: bash
-        env:
-          PATCH_SHA256: 0da08bfe0df549092634cb7f36b91e9737c4b7a2346cb34caaca4300ed3b6a5c
         run: |
           set -euo pipefail
-          out=/tmp/phase2-chunk-history
-          mkdir -p "$out/blobs" "$out/commits"
+          out=/tmp/phase2-branch-inventory
+          mkdir -p "$out/candidates"
+          git fetch --force origin '+refs/heads/*:refs/remotes/origin/*'
 
-          git log --all --date=iso-strict --pretty='format:%H %ad %s' -- phase2.publish \
-            > "$out/payload-history.txt"
-          git log --all --raw --no-abbrev --pretty='format:commit %H %s' -- phase2.publish \
-            > "$out/payload-raw-history.txt"
+          printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+            branch commit tree files p2_checked attachment idempotency acceptance reconciliation \
+            > "$out/branches.tsv"
 
-          while read -r commit; do
-            [ -n "$commit" ] || continue
-            commit_dir="$out/commits/$commit"
-            mkdir -p "$commit_dir"
-            git ls-tree -r "$commit" phase2.publish > "$commit_dir/tree.txt" || true
+          while read -r ref; do
+            branch=${ref#refs/remotes/origin/}
+            case "$branch" in
+              agent/p2*|agent/p204*) ;;
+              *) continue ;;
+            esac
+            commit=$(git rev-parse "$ref")
+            tree=$(git rev-parse "$ref^{tree}")
+            files=$(git ls-tree -r --name-only "$ref" | wc -l | tr -d ' ')
 
-            complete=1
-            : > "$commit_dir/payload.b64"
-            for number in 00 01 02 03 04 05 06 07 08; do
-              path="phase2.publish/part$number"
-              entry=$(git ls-tree "$commit" "$path" || true)
-              if [ -z "$entry" ]; then
-                complete=0
-                echo "missing $path" >> "$commit_dir/status.txt"
-                continue
-              fi
-              blob=$(printf '%s\n' "$entry" | awk '{print $3}')
-              mkdir -p "$out/blobs/part$number"
-              if [ ! -f "$out/blobs/part$number/$blob" ]; then
-                git cat-file blob "$blob" > "$out/blobs/part$number/$blob"
-              fi
-              printf 'part%s %s %s bytes\n' "$number" "$blob" \
-                "$(git cat-file -s "$blob")" >> "$commit_dir/parts.txt"
-              git cat-file blob "$blob" >> "$commit_dir/payload.b64"
-            done
-
-            if [ "$complete" -eq 1 ]; then
-              python - "$commit_dir" "$PATCH_SHA256" <<'PY'
-          import base64
-          import gzip
-          import hashlib
-          import sys
-          from pathlib import Path
-
-          directory = Path(sys.argv[1])
-          expected = sys.argv[2]
-          payload = (directory / "payload.b64").read_bytes()
-          status = []
-          status.append(f"payload_bytes={len(payload)}")
-          try:
-              compressed = base64.b64decode(payload, validate=True)
-              status.append("base64=ok")
-              (directory / "payload.patch.gz").write_bytes(compressed)
-          except Exception as exc:
-              status.append(f"base64=error:{type(exc).__name__}:{exc}")
-              (directory / "status.txt").write_text("\n".join(status) + "\n")
-              raise SystemExit(0)
-          try:
-              patch = gzip.decompress(compressed)
-              status.append("gzip=ok")
-              (directory / "payload.patch").write_bytes(patch)
-          except Exception as exc:
-              status.append(f"gzip=error:{type(exc).__name__}:{exc}")
-              (directory / "status.txt").write_text("\n".join(status) + "\n")
-              raise SystemExit(0)
-          digest = hashlib.sha256(patch).hexdigest()
-          status.append(f"patch_bytes={len(patch)}")
-          status.append(f"sha256={digest}")
-          status.append(f"expected={expected}")
-          status.append(f"match={str(digest == expected).lower()}")
-          (directory / "status.txt").write_text("\n".join(status) + "\n")
-          PY
+            p2_checked=0
+            if git cat-file -e "$ref:docs/attendance-platform-plan.md" 2>/dev/null; then
+              p2_checked=$(git show "$ref:docs/attendance-platform-plan.md" \
+                | grep -Ec '^- \[x\] `P2-(0[1-9]|1[01])`' || true)
             fi
-          done < <(git log --all --format='%H' -- phase2.publish | awk '!seen[$0]++')
 
-          find "$out/blobs" -type f -printf '%P %s bytes\n' | sort \
-            > "$out/blob-inventory.txt"
-          find "$out/commits" -name status.txt -print -exec sh -c \
-            'echo "--- $1"; cat "$1"' sh {} \; \
-            > "$out/commit-statuses.txt"
-      - name: Upload chunk history
+            attachment=0
+            git cat-file -e "$ref:attachment_outbox.py" 2>/dev/null && attachment=1 || true
+            idempotency=0
+            git cat-file -e "$ref:erpnext_idempotency.py" 2>/dev/null && idempotency=1 || true
+            acceptance=0
+            git cat-file -e "$ref:staging_acceptance.py" 2>/dev/null && acceptance=1 || true
+            reconciliation=0
+            if git ls-tree -r --name-only "$ref" \
+                | grep -Eq 'reconcil|dead.?letter|delivery_admin|acceptance\.py'; then
+              reconciliation=1
+            fi
+
+            printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+              "$branch" "$commit" "$tree" "$files" "$p2_checked" \
+              "$attachment" "$idempotency" "$acceptance" "$reconciliation" \
+              >> "$out/branches.tsv"
+
+            if [ "$p2_checked" -ge 4 ] || [ "$acceptance" -eq 1 ] || \
+               { [ "$attachment" -eq 1 ] && [ "$idempotency" -eq 1 ]; }; then
+              safe=$(printf '%s' "$branch" | tr '/' '_')
+              git archive --format=tar.gz -o "$out/candidates/$safe.tar.gz" "$ref"
+              git ls-tree -r --name-only "$ref" > "$out/candidates/$safe.files.txt"
+              git diff --name-status 0006ed95165fcde9a03f354821abe4297d05752b "$ref" \
+                > "$out/candidates/$safe.vs-private-crop.txt" || true
+            fi
+          done < <(git for-each-ref --format='%(refname)' refs/remotes/origin | sort)
+
+          column -t -s $'\t' "$out/branches.tsv" > "$out/branches.txt"
+          cat "$out/branches.txt"
+      - name: Upload branch inventory
         uses: actions/upload-artifact@v4
         with:
-          name: phase2-chunk-history
-          path: /tmp/phase2-chunk-history/
+          name: phase2-branch-inventory
+          path: /tmp/phase2-branch-inventory/
           if-no-files-found: error
           retention-days: 1
