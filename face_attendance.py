@@ -1,11 +1,10 @@
 import argparse
 import json
 import os
-import pickle
 import shlex
 import subprocess
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 import cv2
@@ -24,6 +23,31 @@ from embedding_gallery import (
     sync_gallery,
     write_gallery_atomic,
 )
+from data_contract import (
+    employee_directory,
+    employee_filename_token,
+    employee_id_from_storage_component,
+    filename_token,
+    safe_log_message,
+    validate_employee_id,
+    validate_erp_docname,
+    validate_log_type,
+)
+from erpnext_adapter import (
+    EmployeeCheckinRequest,
+    build_erpnext_adapter,
+    erp_event_time as adapter_erp_event_time,
+    select_erpnext_transport,
+)
+from model_runtime import ModelRuntimeError, create_face_analysis
+from secret_store import ConfigLoadError, load_runtime_config
+from runtime_policy import (
+    effective_gallery_options,
+    enforce_gallery_freshness,
+    inspect_gallery,
+    load_runtime_gallery,
+)
+from watcher_entrypoints import require_legacy_dry_run
 
 
 ROOT = Path(__file__).resolve().parent
@@ -33,13 +57,11 @@ EMBEDDINGS = ROOT / "embedding_gallery.json"
 LEGACY_EMBEDDINGS = ROOT / "embeddings.pkl"
 SYNC_STATUS = ROOT / "embedding_sync_status.json"
 LOGS = ROOT / "logs"
-COOLDOWN_STATE = ROOT / "cooldown_state.json"
-COOLDOWN_LOCK = ROOT / "cooldown_state.lock"
 
 
 def log(message):
     LOGS.mkdir(exist_ok=True)
-    line = f"{datetime.now():%Y-%m-%d %H:%M:%S} {message}"
+    line = f"{datetime.now():%Y-%m-%d %H:%M:%S} " + safe_log_message(message)
     with (LOGS / "watch.log").open("a", encoding="utf-8") as file:
         file.write(line + "\n")
     try:
@@ -50,23 +72,31 @@ def log(message):
 
 def load_config():
     try:
-        return json.loads(CONFIG.read_text(encoding="utf-8"))
-    except FileNotFoundError as exc:
-        raise SystemExit(f"Missing config file: {CONFIG}") from exc
-    except json.JSONDecodeError as exc:
-        raise SystemExit(f"Invalid JSON in {CONFIG}: {exc}") from exc
+        return load_runtime_config(CONFIG)
+    except ConfigLoadError as exc:
+        raise SystemExit(str(exc)) from exc
 
 
-def face_app(det_size=None):
-    cfg = load_config()
+
+
+def face_app(
+    det_size=None,
+    *,
+    cfg=None,
+    verified_model_directory=None,
+):
+    cfg = cfg or load_config()
     det_size = int(det_size or cfg.get("det_size", 640))
-    app = FaceAnalysis(
-        name=cfg.get("model", "buffalo_l"),
-        allowed_modules=cfg.get("allowed_modules", ["detection", "recognition"]),
-        providers=["CPUExecutionProvider"],
-    )
-    app.prepare(ctx_id=-1, det_size=(det_size, det_size))
-    return app
+    try:
+        return create_face_analysis(
+            FaceAnalysis,
+            cfg,
+            ROOT,
+            det_size=det_size,
+            verified_model_directory=verified_model_directory,
+        )
+    except (ModelRuntimeError, ValueError) as exc:
+        raise SystemExit(f"Face model runtime validation failed: {exc}") from exc
 
 
 def scaled_frame(frame, cfg):
@@ -110,7 +140,8 @@ def save_rejected(crop, reason, cfg, employee=None, score=None):
     folder = LOGS / "unknown"
     folder.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-    employee_part = employee or "unknown"
+    reason = filename_token(reason, "rejection reason")
+    employee_part = employee_filename_token(employee) if employee else "unknown"
     score_part = "" if score is None else f"_{score:.3f}"
     path = folder / f"{stamp}_{reason}_{employee_part}{score_part}.jpg"
     cv2.imwrite(str(path), crop)
@@ -127,7 +158,8 @@ def save_checkin_image(crop, employee, score, cfg):
     folder = LOGS / ("tmp" if temporary else "checkins")
     folder.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-    path = folder / f"{stamp}_{employee}_{score:.3f}.jpg"
+    employee = validate_employee_id(employee)
+    path = folder / f"{stamp}_{employee_filename_token(employee)}_{score:.3f}.jpg"
     if not cv2.imwrite(str(path), crop):
         log(f"could not save checkin crop: {path}")
         return None, False
@@ -137,13 +169,16 @@ def save_checkin_image(crop, employee, score, cfg):
 def build_embeddings():
     cfg = load_config()
     FACES.mkdir(exist_ok=True)
-    app = face_app(cfg.get("build_det_size", 640))
+    app = face_app(cfg.get("build_det_size", 640), cfg=cfg)
     employees = []
     min_score = float(cfg.get("build_min_detection_score", 0.6))
 
     for employee_dir in sorted(FACES.iterdir()):
+        if employee_dir.is_symlink():
+            raise SystemExit("Enrollment directory must not be a symbolic link")
         if not employee_dir.is_dir():
             continue
+        employee_id = employee_id_from_storage_component(employee_dir.name)
         vectors = []
         for image_path in sorted(employee_dir.glob("*")):
             image = cv2.imread(str(image_path))
@@ -165,7 +200,7 @@ def build_embeddings():
         if vectors:
             employees.append(
                 {
-                    "employee": employee_dir.name,
+                    "employee": employee_id,
                     "embedding": norm(np.mean(vectors, axis=0)),
                     "embeddings": vectors,
                 }
@@ -184,17 +219,7 @@ def build_embeddings():
     _, metadata = write_gallery_atomic(
         EMBEDDINGS,
         payload,
-        expected_model=cfg.get("model", "buffalo_l"),
-        expected_model_version=cfg.get("model_version"),
-        expected_branch=cfg.get("branch_name", ""),
-        require_model_match=True,
-        require_model_version_match=bool(
-            cfg.get("require_model_version_match", False)
-        ),
-        allow_empty=False,
-        max_embeddings_per_employee=int(
-            cfg.get("max_embeddings_per_employee", 50)
-        ),
+        **effective_gallery_options(cfg),
     )
     print(
         f"saved {EMBEDDINGS}: {metadata['employee_count']} employee(s), "
@@ -206,8 +231,9 @@ def enroll_from_camera(employee, photos, delay):
     cfg = load_config()
     if not bool(cfg.get("local_enrollment_enabled", False)):
         raise SystemExit("Local image enrollment is disabled in config.json")
-    app = face_app()
-    out_dir = FACES / employee
+    employee = validate_employee_id(employee)
+    app = face_app(cfg=cfg)
+    out_dir = employee_directory(FACES, employee)
     out_dir.mkdir(parents=True, exist_ok=True)
     cap = cv2.VideoCapture(cfg["camera_url"], cv2.CAP_FFMPEG)
     if not cap.isOpened():
@@ -242,50 +268,22 @@ def enroll_from_camera(employee, photos, delay):
 
 
 def migrate_legacy_embeddings(cfg):
+    del cfg
     if EMBEDDINGS.exists() or not LEGACY_EMBEDDINGS.exists():
         return False
-    try:
-        legacy = pickle.loads(LEGACY_EMBEDDINGS.read_bytes())
-        payload = build_gallery_payload(
-            legacy,
-            model=cfg.get("model", "buffalo_l"),
-            model_version=cfg.get("model_version", ""),
-            branch=cfg.get("branch_name", ""),
-            gallery_version=f"legacy-migration-{int(time.time())}",
-        )
-        write_gallery_atomic(
-            EMBEDDINGS,
-            payload,
-            expected_model=cfg.get("model", "buffalo_l"),
-            expected_model_version=cfg.get("model_version"),
-            expected_branch=cfg.get("branch_name", ""),
-            require_model_match=True,
-            require_model_version_match=bool(
-                cfg.get("require_model_version_match", False)
-            ),
-            allow_empty=False,
-        )
-        log(f"migrated local {LEGACY_EMBEDDINGS.name} to {EMBEDDINGS.name}")
-        return True
-    except Exception as exc:
-        raise GalleryError(f"could not migrate legacy embeddings: {exc}") from exc
+    raise GalleryError(
+        "automatic embeddings.pkl migration is disabled because pickle "
+        "deserialization can execute code. Stop attendance services, verify "
+        "the file SHA-256 from a trusted record, and run "
+        "'python legacy_gallery_converter.py --expected-sha256 <sha256> "
+        "--acknowledge-pickle-code-execution-risk'"
+    )
 
 
 def load_embeddings():
     cfg = load_config()
     migrate_legacy_embeddings(cfg)
-    reloader = GalleryReloader(
-        EMBEDDINGS,
-        expected_model=cfg.get("model", "buffalo_l"),
-        expected_model_version=cfg.get("model_version"),
-        expected_branch=cfg.get("branch_name", ""),
-        require_model_match=bool(cfg.get("require_model_match", True)),
-        require_model_version_match=bool(
-            cfg.get("require_model_version_match", False)
-        ),
-        allow_empty=bool(cfg.get("allow_empty_embedding_gallery", False)),
-    )
-    known, _, _ = reloader.reload(force=True)
+    known, _, _, _ = load_runtime_gallery(cfg, EMBEDDINGS)
     return known
 
 
@@ -296,14 +294,7 @@ class GalleryRuntime:
         self.rejected_signature = None
         self.reloader = GalleryReloader(
             EMBEDDINGS,
-            expected_model=cfg.get("model", "buffalo_l"),
-            expected_model_version=cfg.get("model_version"),
-            expected_branch=cfg.get("branch_name", ""),
-            require_model_match=bool(cfg.get("require_model_match", True)),
-            require_model_version_match=bool(
-                cfg.get("require_model_version_match", False)
-            ),
-            allow_empty=bool(cfg.get("allow_empty_embedding_gallery", False)),
+            **effective_gallery_options(cfg),
         )
 
     def sync_enabled(self):
@@ -333,29 +324,31 @@ class GalleryRuntime:
             log(f"embedding sync failed; keeping current gallery: {exc}")
 
     def check_freshness(self):
-        max_age = int(self.cfg.get("embedding_max_age_seconds", 86400))
-        status = gallery_status(EMBEDDINGS, max_age_seconds=max_age)
+        status = enforce_gallery_freshness(
+            self.cfg,
+            self.reloader.generated_at,
+            path=EMBEDDINGS,
+        )
         if status.get("stale"):
-            message = (
-                f"embedding gallery is stale: age={status['age_seconds']}s "
-                f"max={max_age}s"
+            log(
+                "embedding gallery is stale but permitted outside strict "
+                f"production: age={status['age_seconds']}s "
+                f"max={status['max_age_seconds']}s"
             )
-            if bool(self.cfg.get("reject_stale_embedding_gallery", False)):
-                raise GalleryError(message)
-            log(message)
+        return status
 
     def start(self):
         migrate_legacy_embeddings(self.cfg)
         self.maybe_sync(force=True)
         try:
             known, metadata, _ = self.reloader.reload(force=True)
+            self.check_freshness()
         except GalleryError as exc:
             raise SystemExit(
                 f"No valid embedding gallery is available: {exc}. "
                 "Run 'python sync_embeddings.py' or enable local enrollment and run "
                 "'python face_attendance.py build'."
             ) from exc
-        self.check_freshness()
         log(
             f"embedding gallery loaded: version={metadata.get('gallery_version')} "
             f"employees={metadata.get('employee_count')} "
@@ -367,6 +360,7 @@ class GalleryRuntime:
         self.maybe_sync()
         try:
             known, metadata, changed = self.reloader.reload()
+            self.check_freshness()
             self.rejected_signature = None
             if changed:
                 log(
@@ -379,46 +373,13 @@ class GalleryRuntime:
             if self.reloader.known:
                 rejected_signature = gallery_signature(EMBEDDINGS)
                 if rejected_signature != self.rejected_signature:
-                    log(f"embedding reload rejected; keeping previous gallery: {exc}")
+                    log(
+                        "embedding reload rejected; keeping previous gallery: "
+                        f"{exc}"
+                    )
                     self.rejected_signature = rejected_signature
                 return self.reloader.known
             raise
-
-
-def load_cooldown_state():
-    if not COOLDOWN_STATE.exists():
-        return {}
-    try:
-        return json.loads(COOLDOWN_STATE.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return {}
-
-
-def save_cooldown_state(last_seen):
-    COOLDOWN_STATE.write_text(
-        json.dumps(last_seen, indent=2, sort_keys=True), encoding="utf-8"
-    )
-
-
-def acquire_cooldown_lock(timeout=10):
-    start = time.time()
-    while True:
-        try:
-            return os.open(
-                str(COOLDOWN_LOCK), os.O_CREAT | os.O_EXCL | os.O_WRONLY
-            )
-        except FileExistsError:
-            if time.time() - start > timeout:
-                raise TimeoutError("cooldown lock timed out")
-            time.sleep(0.1)
-
-
-def release_cooldown_lock(lock_fd):
-    os.close(lock_fd)
-    try:
-        COOLDOWN_LOCK.unlink()
-    except FileNotFoundError:
-        pass
 
 
 def bench_execute(method, kwargs):
@@ -520,99 +481,157 @@ def api_headers(json_request=True):
     return headers
 
 
-def create_checkin_api(employee, log_type, image_path=None):
-    cfg = load_config()
-    doc = {
-        "employee": employee,
-        "log_type": log_type,
-        "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-    }
-    response = requests.post(
-        f"{cfg['frappe_url'].rstrip('/')}/api/resource/Employee%20Checkin",
-        headers=api_headers(),
-        json=doc,
-        timeout=30,
+def erp_event_time(value=None):
+    return adapter_erp_event_time(value)
+
+
+def erpnext_transport_name(cfg=None):
+    return select_erpnext_transport(cfg or load_config())
+
+
+def _checkin_request(
+    employee,
+    log_type,
+    event_time=None,
+    *,
+    delivery_id="",
+    event_id="",
+    decision_id="",
+    camera_id="",
+    branch="",
+    delivery_contract_version="",
+):
+    return EmployeeCheckinRequest.build(
+        employee,
+        log_type,
+        event_time,
+        delivery_id=delivery_id,
+        event_id=event_id,
+        decision_id=decision_id,
+        camera_id=camera_id,
+        branch=branch,
+        delivery_contract_version=delivery_contract_version,
     )
-    response.raise_for_status()
-    docname = response.json()["data"]["name"]
-    if image_path:
-        with open(image_path, "rb") as file:
-            upload = requests.post(
-                f"{cfg['frappe_url'].rstrip('/')}/api/method/upload_file",
-                headers=api_headers(json_request=False),
-                data={
-                    "doctype": "Employee Checkin",
-                    "docname": docname,
-                    "is_private": "1",
-                },
-                files={"file": (image_path.name, file, "image/jpeg")},
-                timeout=30,
-            )
-        upload.raise_for_status()
-        log(f"checkin attachment added: {docname} {image_path.name}")
-    log(f"checkin created: {employee} {log_type} {docname}")
 
 
-def create_checkin_bench(employee, log_type, image_path=None):
-    doc = {
-        "doctype": "Employee Checkin",
-        "employee": employee,
-        "log_type": log_type,
-        "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-    }
-    inserted = bench_execute("frappe.client.insert", {"doc": doc})
-    docname = inserted["name"]
+def create_checkin_api(
+    employee,
+    log_type,
+    image_path=None,
+    event_time=None,
+    **delivery_metadata,
+):
+    cfg = load_config()
+    adapter = build_erpnext_adapter(cfg, rest_session=requests)
+    request = _checkin_request(
+        employee, log_type, event_time, **delivery_metadata
+    )
+    result = adapter.create_employee_checkin(request)
+    log(
+        f"checkin created: {request.employee} {request.log_type} "
+        f"{result.docname} created={int(bool(result.created))}"
+    )
     if image_path:
         try:
-            attach_image("Employee Checkin", docname, image_path)
-            log(f"checkin attachment added: {docname} {image_path.name}")
-        except subprocess.CalledProcessError as exc:
-            log(f"checkin attachment failed: {docname} {exc}")
-    log(f"checkin created: {employee} {log_type} {docname}")
+            adapter.attach_private_file(result.docname, Path(image_path))
+            log(
+                f"checkin attachment added: {result.docname} "
+                f"{Path(image_path).name}"
+            )
+        except Exception as exc:
+            # Attachment failure never changes a confirmed check-in into a
+            # failed attendance delivery. The durable worker path records a
+            # separate attachment job; this compatibility path logs failure.
+            log(f"checkin attachment failed after delivery: {exc}")
+    return result.docname
 
 
-def create_checkin(employee, log_type, image_path=None):
+def create_checkin_bench(
+    employee,
+    log_type,
+    image_path=None,
+    event_time=None,
+    **delivery_metadata,
+):
     cfg = load_config()
-    if (
-        cfg.get("frappe_url")
-        and cfg.get("frappe_api_key")
-        and cfg.get("frappe_api_secret")
-    ):
-        return create_checkin_api(employee, log_type, image_path)
-    return create_checkin_bench(employee, log_type, image_path)
+    request = _checkin_request(
+        employee, log_type, event_time, **delivery_metadata
+    )
+
+    def attach(docname, path):
+        attach_image("Employee Checkin", docname, path)
+        log(f"checkin attachment added: {docname} {path.name}")
+
+    def attachment_failed(exc):
+        log(f"checkin attachment failed: {exc}")
+
+    adapter = build_erpnext_adapter(
+        cfg,
+        bench_execute=bench_execute,
+        bench_attach=attach,
+        bench_attachment_error_handler=attachment_failed,
+    )
+    result = adapter.create_employee_checkin(request)
+    log(
+        f"checkin created: {request.employee} {request.log_type} "
+        f"{result.docname} created={int(bool(result.created))}"
+    )
+    if image_path:
+        try:
+            adapter.attach_private_file(result.docname, Path(image_path))
+        except Exception as exc:
+            attachment_failed(exc)
+    return result.docname
+
+
+def create_checkin(
+    employee,
+    log_type,
+    image_path=None,
+    event_time=None,
+    **delivery_metadata,
+):
+    cfg = load_config()
+    transport = select_erpnext_transport(cfg)
+    if transport == "rest":
+        return create_checkin_api(
+            employee,
+            log_type,
+            image_path,
+            event_time,
+            **delivery_metadata,
+        )
+    return create_checkin_bench(
+        employee,
+        log_type,
+        image_path,
+        event_time,
+        **delivery_metadata,
+    )
 
 
 def create_checkin_with_cooldown(
     employee, cfg, image_path, dry_run=False, log_type=None
 ):
-    log_type = log_type or cfg["log_type"]
-    lock_fd = acquire_cooldown_lock()
-    try:
-        last_seen = load_cooldown_state()
-        now = time.time()
-        remaining = int(cfg["cooldown_seconds"]) - int(
-            now - last_seen.get(employee, 0)
-        )
-        if remaining > 0:
-            log(f"cooldown skip: {employee} {remaining}s remaining")
-            return False
-        if dry_run:
-            log(f"dry run: would create {employee} {log_type}")
-            return True
-        create_checkin(employee, log_type, image_path)
-        last_seen[employee] = now
-        save_cooldown_state(last_seen)
+    employee = validate_employee_id(employee)
+    log_type = validate_log_type(log_type or cfg["log_type"])
+    if dry_run:
+        log(f"dry run: would create {employee} {log_type}")
         return True
-    finally:
-        release_cooldown_lock(lock_fd)
+    raise RuntimeError(
+        "filesystem cooldown state has been removed; live attendance must use "
+        "the canonical watcher transactional policy callback"
+    )
 
 
 def log_type_for_path(cfg, path):
     if not path:
-        return cfg["log_type"]
+        return validate_log_type(cfg["log_type"])
     parts = {part.lower() for part in Path(path).parts}
     folder = "out" if "out" in parts else "in" if "in" in parts else ""
-    return cfg.get("folder_log_types", {}).get(folder, cfg["log_type"])
+    return validate_log_type(
+        cfg.get("folder_log_types", {}).get(folder, cfg["log_type"])
+    )
 
 
 def process_image(
@@ -623,12 +642,21 @@ def process_image(
     cfg,
     dry_run=False,
     attach_source=None,
+    decision_callback=None,
+    attendance_callback=None,
 ):
     detect_frame = scaled_frame(image, cfg)
     faces = app.get(detect_frame)
     if not faces:
         log(f"{source_name}: no faces")
         return False
+
+    selected_log_type = log_type_for_path(cfg, attach_source)
+
+    def emit_decision(payload):
+        if decision_callback is not None:
+            return decision_callback(dict(payload))
+        return None
 
     created = False
     seen_this_image = set()
@@ -642,7 +670,21 @@ def process_image(
 
         width, height = face_size(face)
         score, employee, margin = match_employee(known, face.embedding)
+        runner_up_score = score - margin
         prefix = f"{source_name} face={index}/{len(faces)}"
+        decision = {
+            "face_index": index,
+            "face_count": len(faces),
+            "bbox": [x1, y1, x2, y2],
+            "face_width": float(width),
+            "face_height": float(height),
+            "detection_score": float(face.det_score),
+            "best_employee": employee or "",
+            "best_score": float(score),
+            "runner_up_score": float(runner_up_score),
+            "score_margin": float(margin),
+            "candidate_log_type": selected_log_type,
+        }
         if (
             width < int(cfg["min_face_width"])
             or height < int(cfg["min_face_height"])
@@ -654,32 +696,78 @@ def process_image(
                 f"det={float(face.det_score):.3f} "
                 f"best={employee} score={score:.3f} margin={margin:.3f}"
             )
-            save_rejected(crop, "quality", cfg, employee, score)
+            retained = save_rejected(crop, "quality", cfg, employee, score)
+            emit_decision(
+                {
+                    **decision,
+                    "accepted": False,
+                    "reason_code": "quality_rejected",
+                    "retention_state": "retained" if retained else "not_retained",
+                }
+            )
             continue
 
         log(f"{prefix} match={employee} score={score:.3f} margin={margin:.3f}")
-        if (
-            not employee
-            or score < float(cfg["threshold"])
-            or margin < float(cfg.get("min_score_margin", 0.0))
-            or employee in seen_this_image
-        ):
-            save_rejected(crop, "unknown", cfg, employee, score)
+        if not employee:
+            reason_code = "unknown_employee"
+        elif score < float(cfg["threshold"]):
+            reason_code = "score_below_threshold"
+        elif margin < float(cfg.get("min_score_margin", 0.0)):
+            reason_code = "margin_below_threshold"
+        elif employee in seen_this_image:
+            reason_code = "duplicate_face"
+        else:
+            reason_code = ""
+        if reason_code:
+            retained = save_rejected(crop, "unknown", cfg, employee, score)
+            emit_decision(
+                {
+                    **decision,
+                    "accepted": False,
+                    "reason_code": reason_code,
+                    "retention_state": "retained" if retained else "not_retained",
+                }
+            )
             continue
 
+        employee = validate_employee_id(employee)
         seen_this_image.add(employee)
         image_path, temporary = save_checkin_image(crop, employee, score, cfg)
         attachment_path = (
             image_path if bool(cfg.get("attach_checkin_crop", True)) else None
         )
+        retention_state = (
+            "temporary"
+            if temporary and image_path
+            else "retained"
+            if image_path
+            else "not_retained"
+        )
+        candidate = {
+            **decision,
+            "best_employee": employee,
+            "accepted": True,
+            "reason_code": "accepted_candidate",
+            "retention_state": retention_state,
+        }
         try:
-            created_now = create_checkin_with_cooldown(
-                employee,
-                cfg,
-                attachment_path,
-                dry_run,
-                log_type_for_path(cfg, attach_source),
-            )
+            if attendance_callback is not None:
+                created_now = attendance_callback(
+                    employee=employee,
+                    log_type=selected_log_type,
+                    image_path=attachment_path,
+                    dry_run=dry_run,
+                    decision=dict(candidate),
+                )
+            else:
+                emit_decision(candidate)
+                created_now = create_checkin_with_cooldown(
+                    employee,
+                    cfg,
+                    attachment_path,
+                    dry_run,
+                    selected_log_type,
+                )
             created = created_now or created
         finally:
             if temporary and image_path:
@@ -711,6 +799,7 @@ def cleanup_old_audit_files(cfg):
 
 
 def watch(once=False, dry_run=False):
+    require_legacy_dry_run("watch", dry_run=dry_run)
     cfg = load_config()
     app = face_app()
     gallery = GalleryRuntime(cfg)
@@ -778,6 +867,7 @@ def wait_until_stable(path):
 
 
 def watch_folder(once=False, dry_run=False, scan_existing=False):
+    require_legacy_dry_run("watch-folder", dry_run=dry_run)
     cfg = load_config()
     folder = Path(cfg.get("camera_uploads_dir", ROOT / "camera_uploads"))
     folder.mkdir(parents=True, exist_ok=True)
@@ -856,10 +946,7 @@ def print_embedding_status():
     cfg = load_config()
     print(
         json.dumps(
-            gallery_status(
-                EMBEDDINGS,
-                max_age_seconds=cfg.get("embedding_max_age_seconds", 86400),
-            ),
+            inspect_gallery(cfg, EMBEDDINGS),
             ensure_ascii=False,
             indent=2,
         )
@@ -878,13 +965,27 @@ def main():
     enroll.add_argument("--photos", type=int, default=5)
     enroll.add_argument("--delay", type=float, default=1.5)
 
-    run = sub.add_parser("watch")
+    run = sub.add_parser(
+        "watch",
+        help="Legacy RTSP diagnostics only; live processing is refused.",
+    )
     run.add_argument("--once", action="store_true")
-    run.add_argument("--dry-run", action="store_true")
+    run.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Required safety flag for the legacy RTSP diagnostic path.",
+    )
 
-    folder = sub.add_parser("watch-folder")
+    folder = sub.add_parser(
+        "watch-folder",
+        help="Legacy folder diagnostics only; live processing is refused.",
+    )
     folder.add_argument("--once", action="store_true")
-    folder.add_argument("--dry-run", action="store_true")
+    folder.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Required safety flag for the legacy folder diagnostic path.",
+    )
     folder.add_argument("--scan-existing", action="store_true")
     args = parser.parse_args()
 

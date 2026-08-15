@@ -14,10 +14,28 @@ from embedding_gallery import (
     write_gallery_atomic,
     write_sync_status,
 )
+from gallery_credentials import (
+    GalleryCredentialError,
+    outbound_gallery_credential,
+)
+from gallery_release import (
+    record_acceptance,
+    release_policy_issues,
+    release_scope,
+    scope_state,
+    scoped_etag,
+    validate_installed_release,
+    validate_release,
+)
+from runtime_policy import (
+    effective_gallery_options,
+    enforce_gallery_freshness,
+)
 
 
 DEFAULT_ENDPOINT = "/api/faces/embeddings"
 PLACEHOLDER_TOKENS = {"", "CHANGE_ME", "REPLACE_ME", "CHANGEME"}
+REDIRECT_STATUSES = {301, 302, 303, 307, 308}
 
 
 def utc_now():
@@ -34,49 +52,130 @@ def _local_url(parsed):
     return parsed.hostname in {"localhost", "127.0.0.1", "::1"}
 
 
-def _request_headers(cfg, status, *, conditional=True):
-    token = _text(cfg.get("central_api_token"))
-    if token.upper() in PLACEHOLDER_TOKENS:
-        token = ""
-    if not token and not bool(cfg.get("allow_unauthenticated_embedding_sync", False)):
-        raise GalleryError(
-            "central_api_token must be configured with a non-placeholder value"
-        )
-    headers = {
-        "Accept": "application/json",
-        "User-Agent": "face-attendance-embedding-sync/2",
-    }
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
-    etag = _text(status.get("etag"))
-    if conditional and etag:
-        headers["If-None-Match"] = etag
-    return headers
+def _effective_port(parsed):
+    if parsed.port is not None:
+        return parsed.port
+    return 443 if parsed.scheme == "https" else 80
 
 
-def _validate_source(cfg):
-    central_url = _text(cfg.get("central_url"))
-    if not central_url:
-        raise GalleryError("central_url is not configured")
-    parsed = urlparse(central_url)
+def _origin(parsed):
+    return parsed.scheme, (parsed.hostname or "").lower(), _effective_port(parsed)
+
+
+def _validate_http_url(url, cfg, *, field):
+    parsed = urlparse(url)
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-        raise GalleryError("central_url must be an absolute HTTP(S) URL")
+        raise GalleryError(f"{field} must be an absolute HTTP(S) URL")
+    if parsed.username or parsed.password:
+        raise GalleryError(f"{field} must not contain embedded credentials")
     if (
         parsed.scheme != "https"
         and not _local_url(parsed)
         and not bool(cfg.get("allow_insecure_central_url", False))
     ):
         raise GalleryError(
-            "central_url must use HTTPS; allow insecure HTTP only on a trusted VPN/LAN"
+            f"{field} must use HTTPS; allow insecure HTTP only on a trusted VPN/LAN"
         )
+    return parsed
+
+
+def _request_headers(credential, release_state, *, conditional=True):
+    headers = {
+        "Accept": "application/json",
+        "User-Agent": "face-attendance-embedding-sync/4",
+        "Authorization": f"Bearer {credential.token}",
+        "X-Face-Attendance-Credential-ID": credential.credential_id,
+    }
+    etag = _text(release_state.get("etag"))
+    if conditional and etag:
+        headers["If-None-Match"] = etag
+    return headers
+
+
+
+
+def _validate_source(cfg):
+    central_url = _text(cfg.get("central_url"))
+    if not central_url:
+        raise GalleryError("central_url is not configured")
+    _validate_http_url(central_url, cfg, field="central_url")
     endpoint = _text(cfg.get("embedding_gallery_path")) or DEFAULT_ENDPOINT
-    return urljoin(central_url.rstrip("/") + "/", endpoint.lstrip("/"))
+    url = urljoin(central_url.rstrip("/") + "/", endpoint.lstrip("/"))
+    _validate_http_url(url, cfg, field="embedding gallery URL")
+    return url
+
+
+def _validate_redirect(current_url, location, cfg):
+    location = _text(location)
+    if not location:
+        raise GalleryError("embedding sync redirect is missing a Location header")
+    target_url = urljoin(current_url, location)
+    current = _validate_http_url(current_url, cfg, field="embedding gallery URL")
+    target = urlparse(target_url)
+    if target.scheme not in {"http", "https"} or not target.netloc:
+        raise GalleryError("embedding redirect URL must be an absolute HTTP(S) URL")
+    if target.username or target.password:
+        raise GalleryError("embedding redirect URL must not contain embedded credentials")
+    if current.scheme == "https" and target.scheme != "https":
+        raise GalleryError("embedding sync refused an HTTPS-to-HTTP redirect")
+    target = _validate_http_url(target_url, cfg, field="embedding redirect URL")
+    if _origin(current) != _origin(target):
+        raise GalleryError("embedding sync refused a cross-origin redirect")
+    return target_url
 
 
 def _timeouts(cfg):
     connect = max(0.25, float(cfg.get("embedding_connect_timeout_seconds", 5)))
     read = max(1.0, float(cfg.get("embedding_read_timeout_seconds", 30)))
     return connect, read
+
+
+def _request_with_validated_redirects(
+    session,
+    url,
+    *,
+    headers,
+    params,
+    timeout,
+    cfg,
+):
+    current_url = url
+    max_redirects = min(10, max(0, int(cfg.get("embedding_max_redirects", 3))))
+    redirects = 0
+
+    while True:
+        response = session.get(
+            current_url,
+            headers=headers,
+            params=params if redirects == 0 else None,
+            timeout=timeout,
+            stream=True,
+            allow_redirects=False,
+        )
+        if response.status_code in REDIRECT_STATUSES:
+            if redirects >= max_redirects:
+                response.close()
+                raise GalleryError(
+                    f"embedding sync exceeded maximum redirects ({max_redirects})"
+                )
+            try:
+                next_url = _validate_redirect(
+                    current_url, response.headers.get("Location"), cfg
+                )
+            except Exception:
+                response.close()
+                raise
+            response.close()
+            current_url = next_url
+            redirects += 1
+            continue
+        if 300 <= response.status_code < 400 and response.status_code != 304:
+            response.close()
+            raise GalleryError(
+                f"embedding sync received unsupported redirect status "
+                f"{response.status_code}"
+            )
+        return response, current_url
 
 
 def _read_limited_json(response, max_bytes):
@@ -100,10 +199,11 @@ def _read_limited_json(response, max_bytes):
 
     chunks = []
     total = 0
-    if hasattr(response, "iter_content"):
-        iterator = response.iter_content(chunk_size=64 * 1024)
-    else:
-        iterator = [getattr(response, "content", b"")]
+    iterator = (
+        response.iter_content(chunk_size=64 * 1024)
+        if hasattr(response, "iter_content")
+        else [getattr(response, "content", b"")]
+    )
     for chunk in iterator:
         if not chunk:
             continue
@@ -120,34 +220,23 @@ def _read_limited_json(response, max_bytes):
 
 
 def _gallery_options(cfg):
-    return {
-        "expected_model": cfg.get("model"),
-        "expected_model_version": cfg.get("model_version"),
-        "expected_branch": _text(cfg.get("branch_name")),
-        "require_model_match": bool(cfg.get("require_model_match", True)),
-        "require_model_version_match": bool(
-            cfg.get("require_model_version_match", False)
-        ),
-        "allow_empty": bool(cfg.get("allow_empty_embedding_gallery", False)),
-        "max_employees": int(cfg.get("max_gallery_employees", 10000)),
-        "max_embeddings_per_employee": int(
-            cfg.get("max_embeddings_per_employee", 50)
-        ),
-    }
+    return effective_gallery_options(cfg)
 
 
-def _local_metadata(gallery_path, cfg):
-    _, metadata, _ = load_gallery(gallery_path, **_gallery_options(cfg))
-    return metadata
+def _local_gallery(gallery_path, cfg):
+    _, metadata, sanitized = load_gallery(gallery_path, **_gallery_options(cfg))
+    return metadata, sanitized
 
 
 def _result_from_metadata(
     metadata,
+    release_info,
     *,
     url,
     attempted_at,
     changed,
     etag,
+    scope_id,
     not_modified=False,
 ):
     return {
@@ -157,25 +246,82 @@ def _result_from_metadata(
         "attempted_at": attempted_at,
         "last_success_at": utc_now(),
         "source_url": url,
+        "release_scope_id": scope_id,
         "branch": metadata.get("branch"),
         "gallery_version": metadata.get("gallery_version"),
         "checksum": metadata.get("checksum"),
         "etag": etag,
         "model": metadata.get("model"),
+        "model_version": metadata.get("model_version"),
         "dimension": metadata.get("dimension"),
         "employee_count": metadata.get("employee_count"),
         "embedding_count": metadata.get("embedding_count"),
+        "release_verified": bool(release_info.get("verified")),
+        "release_sequence": release_info.get("sequence"),
+        "release_publisher": release_info.get("publisher", ""),
+        "release_key_id": release_info.get("key_id", ""),
+        "release_generated_at": release_info.get("generated_at", ""),
         "error": "",
     }
 
 
+def _write_success_status(
+    status_path,
+    status,
+    scope_id,
+    descriptor,
+    release_info,
+    result,
+):
+    scopes = record_acceptance(
+        status,
+        scope_id,
+        descriptor,
+        release_info,
+        etag=result.get("etag"),
+        accepted_at=result.get("last_success_at"),
+        history_limit=int(result.get("history_limit") or 32),
+    )
+    clean = dict(result)
+    clean.pop("history_limit", None)
+    return write_sync_status(
+        status_path,
+        release_scopes=scopes,
+        **clean,
+    )
+
+
 def sync_gallery(cfg, gallery_path, status_path, session=requests, sleep=time.sleep):
     attempted_at = utc_now()
-    url = _validate_source(cfg)
+    gallery_options = _gallery_options(cfg)
+    release_issues = release_policy_issues(cfg)
+    if release_issues:
+        raise GalleryError(
+            "embedding release policy is invalid: "
+            + "; ".join(message for _, message in release_issues)
+        )
+    try:
+        credential = outbound_gallery_credential(cfg)
+    except GalleryCredentialError as exc:
+        raise GalleryError(f"central gallery credential is invalid: {exc}") from exc
+    requested_url = _validate_source(cfg)
+    resolved_url = requested_url
     gallery_path = Path(gallery_path)
     status = read_sync_status(status_path)
+    scope_id, descriptor = release_scope(requested_url, cfg)
+    previous_release = scope_state(status, scope_id)
     branch = _text(cfg.get("branch_name"))
-    params = {"branch": branch} if branch else None
+    model = _text(cfg.get("model"))
+    model_version = _text(cfg.get("model_version"))
+    params = {
+        key: value
+        for key, value in {
+            "branch": branch,
+            "model": model,
+            "model_version": model_version,
+        }.items()
+        if value
+    } or None
     retries = max(0, int(cfg.get("embedding_sync_retries", 2)))
     retry_base = max(0.1, float(cfg.get("embedding_retry_base_seconds", 1.0)))
     max_bytes = int(cfg.get("embedding_max_response_bytes", 50 * 1024 * 1024))
@@ -184,33 +330,69 @@ def sync_gallery(cfg, gallery_path, status_path, session=requests, sleep=time.sl
     try:
         for attempt in range(retries + 1):
             try:
-                response = session.get(
-                    url,
+                response, resolved_url = _request_with_validated_redirects(
+                    session,
+                    requested_url,
                     headers=_request_headers(
-                        cfg, status, conditional=gallery_path.exists()
+                        credential,
+                        previous_release,
+                        conditional=gallery_path.exists(),
                     ),
                     params=params,
                     timeout=_timeouts(cfg),
-                    stream=True,
+                    cfg=cfg,
                 )
                 if response.status_code == 304:
-                    metadata = _local_metadata(gallery_path, cfg)
-                    etag = _text(response.headers.get("ETag")) or _text(
-                        status.get("etag")
+                    if not previous_release:
+                        raise GalleryError(
+                            "embedding server returned 304 without matching scoped release state"
+                        )
+                    metadata, sanitized = _local_gallery(gallery_path, cfg)
+                    release_info = validate_installed_release(
+                        sanitized,
+                        cfg,
+                        status,
+                        source_url=requested_url,
+                    )
+                    freshness = enforce_gallery_freshness(
+                        cfg,
+                        metadata.get("generated_at"),
+                        path=gallery_path,
+                    )
+                    etag = _text(response.headers.get("ETag")) or scoped_etag(
+                        status, scope_id
                     )
                     result = _result_from_metadata(
                         metadata,
-                        url=url,
+                        release_info,
+                        url=resolved_url,
                         attempted_at=attempted_at,
                         changed=False,
                         etag=etag,
+                        scope_id=scope_id,
                         not_modified=True,
                     )
-                    write_sync_status(status_path, **result)
+                    result["credential_id"] = credential.credential_id
+                    result["credential_fingerprint"] = credential.fingerprint
+                    result["gallery_age_seconds"] = freshness["age_seconds"]
+                    result["gallery_stale"] = freshness["stale"]
+                    result["history_limit"] = int(
+                        cfg.get("embedding_release_history_limit", 32)
+                    )
+                    _write_success_status(
+                        status_path,
+                        status,
+                        scope_id,
+                        descriptor,
+                        release_info,
+                        result,
+                    )
+                    result.pop("history_limit", None)
                     return result
 
                 if response.status_code >= 500 and attempt < retries:
                     response.close()
+                    response = None
                     delay = retry_base * (2**attempt) + random.uniform(0, retry_base)
                     sleep(delay)
                     continue
@@ -221,30 +403,57 @@ def sync_gallery(cfg, gallery_path, status_path, session=requests, sleep=time.sl
                     payload = payload["data"]
 
                 sanitized, _, metadata = validate_gallery(
-                    payload, **_gallery_options(cfg)
+                    payload, **gallery_options
+                )
+                release_info = validate_release(
+                    sanitized,
+                    cfg,
+                    previous_release,
+                )
+                freshness = enforce_gallery_freshness(
+                    cfg,
+                    metadata.get("generated_at"),
+                    path=gallery_path,
                 )
                 try:
-                    current = _local_metadata(gallery_path, cfg)
-                    current_checksum = current.get("checksum")
+                    current_metadata, _ = _local_gallery(gallery_path, cfg)
+                    current_checksum = current_metadata.get("checksum")
                 except GalleryError:
                     current_checksum = None
 
                 changed = current_checksum != metadata.get("checksum")
                 if changed:
                     write_gallery_atomic(
-                        gallery_path, sanitized, **_gallery_options(cfg)
+                        gallery_path, sanitized, **gallery_options
                     )
                 etag = _text(response.headers.get("ETag"))
                 if not etag and metadata.get("checksum"):
                     etag = f'"{metadata["checksum"]}"'
                 result = _result_from_metadata(
                     metadata,
-                    url=url,
+                    release_info,
+                    url=resolved_url,
                     attempted_at=attempted_at,
                     changed=changed,
                     etag=etag,
+                    scope_id=scope_id,
                 )
-                write_sync_status(status_path, **result)
+                result["credential_id"] = credential.credential_id
+                result["credential_fingerprint"] = credential.fingerprint
+                result["gallery_age_seconds"] = freshness["age_seconds"]
+                result["gallery_stale"] = freshness["stale"]
+                result["history_limit"] = int(
+                    cfg.get("embedding_release_history_limit", 32)
+                )
+                _write_success_status(
+                    status_path,
+                    status,
+                    scope_id,
+                    descriptor,
+                    release_info,
+                    result,
+                )
+                result.pop("history_limit", None)
                 return result
             except requests.RequestException:
                 if attempt >= retries:
@@ -260,7 +469,8 @@ def sync_gallery(cfg, gallery_path, status_path, session=requests, sleep=time.sl
             status_path,
             ok=False,
             attempted_at=attempted_at,
-            source_url=url,
+            source_url=resolved_url,
+            release_scope_id=scope_id,
             error=str(exc),
         )
         if isinstance(exc, GalleryError):

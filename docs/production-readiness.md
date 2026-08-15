@@ -8,10 +8,14 @@ The application cannot grant a license for third-party model weights. Obtain the
 
 ```json
 {
+  "model": "buffalo_l",
+  "model_version": "APPROVED-MODEL-BUILD",
   "model_license_acknowledged": true,
   "model_license_reference": "CONTRACT-OR-APPROVAL-ID",
   "model_directory": "/home/service-user/.insightface/models/buffalo_l",
-  "model_manifest_path": "model_manifest.json"
+  "model_manifest_path": "model_manifest.json",
+  "model_manifest_require_complete": true,
+  "model_integrity_verify_on_start": true
 }
 ```
 
@@ -24,7 +28,7 @@ python model_manifest.py create --license-reference "CONTRACT-OR-APPROVAL-ID"
 python model_manifest.py verify
 ```
 
-The manifest records the exact model name, version, directory, file sizes, and SHA-256 hashes. The production watcher verifies it once at startup. A changed, missing, extra, or mismatched model file blocks production mode.
+The manifest records the exact model name, version, directory, file sizes, and SHA-256 hashes. The model directory must be `<insightface-root>/models/<model>`. The production watcher verifies the complete inventory at startup, passes the derived root into InsightFace, and confirms that the runtime loaded the exact verified directory. A changed, missing, extra, mismatched, or differently loaded model file blocks production mode.
 
 Creating a manifest is an integrity control, not proof that a license was obtained.
 
@@ -121,6 +125,8 @@ For a fast configuration-only check that skips hashing large model files:
 python production_readiness.py --strict --skip-model-hash
 ```
 
+The readiness command, `/readyz`, synchronization, and the canonical watcher all use the same effective production profile. A malformed admin hash that merely starts with `scrypt$`, a blank branch/model version, disabled compatibility matching, an empty or stale gallery, an incomplete manifest, or an insecure override remains a blocker.
+
 After every blocker is resolved:
 
 ```json
@@ -135,7 +141,7 @@ sudo systemctl start face-attendance-sync.service
 journalctl -u face-attendance-watch -n 200 --no-pager
 ```
 
-In production mode, a live watcher start is refused when license acknowledgement, model integrity, PAD, admin authentication, HTTPS acknowledgement, protected camera transport, camera IDs, or required HTTPS service URLs are invalid. Dry-run mode remains available for controlled setup and diagnostics.
+The systemd service and bundled Windows launchers must execute `watch_service.py`. The legacy watcher paths refuse non-dry-run execution. In production mode, a canonical live watcher start is refused when license acknowledgement, model integrity, PAD, admin authentication, HTTPS acknowledgement, protected camera transport, camera IDs, or required HTTPS service URLs are invalid. Dry-run mode remains available for controlled setup and diagnostics.
 
 ## 6. Controlled acceptance tests
 

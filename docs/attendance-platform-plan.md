@@ -257,11 +257,11 @@ Release A requires no Redis, Celery, PostgreSQL, or message broker. Introduce on
 - [ ] `H0-04` Enforce a strict production profile: nonblank branch and model version; required branch/model/version match; nonempty and nonstale gallery; complete model manifest and hashing; single-face PAD or per-face PAD binding; authenticated TLS service endpoints; no insecure/unauthenticated overrides.
 - [ ] `H0-05` Make `/readyz`, production startup, sync, and watcher validate the same effective branch/model/version/gallery/PAD policy. Validate the actual admin password-hash structure rather than only its prefix.
 - [ ] `H0-06` Ensure the manifest-verified model directory is the directory InsightFace actually loads, then prove a changed/unlisted runtime model blocks startup.
-- [ ] `H0-07` Constrain and encode employee IDs and all gallery string/numeric fields before filesystem, URL, log, or ERP use. Add path-traversal, length, character, dimension, and count tests.
-- [ ] `H0-08` Bind PAD evidence to each face that can create a check-in. In production require exactly one face unless every recognized face receives its own PAD result; pin/allowlist PAD provider and model versions.
-- [ ] `H0-09` Bind each upload credential and source route to one camera, direction/policy, branch, and allowed network. Use unique credentials and document stronger device authentication when supported; content hashing alone does not stop re-encoded replay.
-- [ ] `H0-10` Route every supported Linux and Windows launcher through `watch_service.py` or refuse live operation. Legacy RTSP and direct `watch-folder` modes remain dry-run/non-production until they enter the same ledger/PAD/readiness path.
-- [ ] `H0-11` Add scoped/rotatable gallery credentials, export audit/rate limits, trusted-proxy-aware login throttling, secret-manager/systemd credential support, and a roadmap/adapter point for organizational SSO/MFA.
+- [x] `H0-07` Constrain and encode employee IDs and all gallery string/numeric fields before filesystem, URL, log, or ERP use. Add path-traversal, length, character, dimension, and count tests.
+- [x] `H0-08` Bind PAD evidence to each face that can create a check-in. In production require exactly one face unless every recognized face receives its own PAD result; pin/allowlist PAD provider and model versions.
+- [x] `H0-09` Bind each upload credential and source route to one camera, direction/policy, branch, and allowed network. Use unique credentials and document stronger device authentication when supported; content hashing alone does not stop re-encoded replay.
+- [x] `H0-10` Route every supported Linux and Windows launcher through `watch_service.py` or refuse live operation. Legacy RTSP and direct `watch-folder` modes remain dry-run/non-production until they enter the same ledger/PAD/readiness path.
+- [x] `H0-11` Add scoped/rotatable gallery credentials, export audit/rate limits, trusted-proxy-aware login throttling, secret-manager/systemd credential support, and a roadmap/adapter point for organizational SSO/MFA.
 - [ ] `H0-12` Default source/crop/ERP attachment retention to the minimum justified by the DPIA; enumerate and test cleanup for quarantine, logs, enrollment media, reports, audit state, PAD copies, and backups.
 
 **Acceptance**
@@ -274,17 +274,17 @@ Release A requires no Redis, Celery, PostgreSQL, or message broker. Introduce on
 
 **Purpose:** Make every camera event durable, explainable, and recoverable before adding features.
 
-- [ ] `P1-01` Add an explicit schema-version table and transactional forward migrations for `runtime_state.sqlite3`.
-- [ ] `P1-02` Add backup-before-migrate, migration verification, and documented rollback/restore commands.
-- [ ] `P1-03` Expand `camera_events`; add `recognition_decisions`, append-only `event_transitions`, and append-only `operator_actions` using stable reason/status enums.
-- [ ] `P1-04` Persist a normalized receipt before time/size/decode rejection, then persist model, gallery, PAD, scores, margin, policy, immutable event times, and retention outcome for every decision.
-- [ ] `P1-05` Replace permanent `processing` claims with leases and explicit startup recovery: safely retry pre-delivery work; classify delivery ambiguity as `uncertain`.
-- [ ] `P1-06` Move cooldown and event-policy state into the transactional store. Scope cooldown deliberately by employee, direction, branch, and policy; eliminate crash-stranded lock files.
-- [ ] `P1-07` Add read-only CLI commands to list, inspect, and explain events without exposing secrets or biometric vectors.
-- [ ] `P1-08` Add audited event reprocess, quarantine-resolution, and dismissal commands with required reasons. Delivery retry/cancel begins only after Phase 2 creates delivery jobs.
-- [ ] `P1-09` Keep old event rows readable through the retention window and test migration from a real copy of the current schema.
-- [ ] `P1-10` Retain minimal content/capture idempotency tombstones after detailed event/media expiry so normal pruning cannot make an old upload eligible again.
-- [ ] `P1-11` Define and test distinct capture ID, content hash, recognition-decision ID, and delivery ID semantics.
+- [x] `P1-01` Add an explicit schema-version table and transactional forward migrations for `runtime_state.sqlite3`.
+- [x] `P1-02` Add backup-before-migrate, migration verification, and documented rollback/restore commands.
+- [x] `P1-03` Expand `camera_events`; add `recognition_decisions`, append-only `event_transitions`, and append-only `operator_actions` using stable reason/status enums.
+- [x] `P1-04` Persist a normalized receipt before time/size/decode rejection, then persist model, gallery, PAD, scores, margin, policy, immutable event times, and retention outcome for every decision.
+- [x] `P1-05` Replace permanent `processing` claims with leases and explicit startup recovery: safely retry pre-delivery work; classify delivery ambiguity as `uncertain`.
+- [x] `P1-06` Move cooldown and event-policy state into the transactional store. Scope cooldown deliberately by employee, direction, branch, and policy; eliminate crash-stranded lock files.
+- [x] `P1-07` Add read-only CLI commands to list, inspect, and explain events without exposing secrets or biometric vectors.
+- [x] `P1-08` Add audited event reprocess, quarantine-resolution, and dismissal commands with required reasons. Delivery retry/cancel begins only after Phase 2 creates delivery jobs.
+- [x] `P1-09` Keep old event rows readable through the retention window and test migration from a real copy of the current schema.
+- [x] `P1-10` Retain minimal content/capture idempotency tombstones after detailed event/media expiry so normal pruning cannot make an old upload eligible again.
+- [x] `P1-11` Define and test distinct capture ID, content hash, recognition-decision ID, and delivery ID semantics.
 
 **Acceptance**
 
@@ -299,11 +299,11 @@ Phase 1 is not independently enabled for live delivery. Deploy Phases 1 and 2 to
 
 **Purpose:** Decouple recognition from network delivery and make check-ins recoverable.
 
-- [ ] `P2-01` Introduce an ERPNext adapter interface; keep API and local-bench transports explicit and independently tested.
-- [ ] `P2-02` Create `delivery_jobs` in the same transaction that accepts a recognition decision.
-- [ ] `P2-03` Implement a single-node delivery worker with leases, bounded exponential backoff, jitter, and retry budgets.
-- [ ] `P2-04` Enforce an atomic ERPNext idempotency contract for both REST and local-bench adapters: a unique `face_attendance_delivery_id` per Employee Checkin with duplicate-conflict lookup or a whitelisted get-or-create endpoint keyed by that delivery ID. Keep `face_attendance_event_id` as non-unique capture trace metadata so multiple accepted faces in one capture can create independent check-ins. Client lookup-before-create alone is race-prone. Treat connection loss after submission as `uncertain` until reconciliation proves the result.
-- [ ] `P2-05` Separate Employee Checkin creation from private crop attachment. A failed attachment becomes its own retryable job, and any required private crop is protected from retention cleanup until that job reaches a terminal state.
+- [x] `P2-01` Introduce an ERPNext adapter interface; keep API and local-bench transports explicit and independently tested.
+- [x] `P2-02` Create `delivery_jobs` in the same transaction that accepts a recognition decision.
+- [x] `P2-03` Implement a single-node delivery worker with leases, bounded exponential backoff, jitter, and retry budgets.
+- [x] `P2-04` Enforce an atomic ERPNext idempotency contract for both REST and local-bench adapters: a unique `face_attendance_delivery_id` per Employee Checkin with duplicate-conflict lookup or a whitelisted get-or-create endpoint keyed by that delivery ID. Keep `face_attendance_event_id` as non-unique capture trace metadata so multiple accepted faces in one capture can create independent check-ins. Client lookup-before-create alone is race-prone. Retry an ambiguous post-submit outcome only when the job is immutably bound to the verified server contract; otherwise preserve it as `uncertain`.
+- [x] `P2-05` Separate Employee Checkin creation from private crop attachment. A failed attachment becomes its own retryable job, and any required private crop is protected from retention cleanup until that job reaches a terminal state.
 - [ ] `P2-06` Send the validated effective event time, camera ID, branch, immutable decision ID and version, unique delivery ID, and non-unique capture event ID to ERPNext where the agreed schema permits.
 - [ ] `P2-07` Classify errors as retryable, permanent, authentication, validation, conflict, rate-limit, or uncertain; never retry permanent errors forever.
 - [ ] `P2-08` Add scheduled and manual reconciliation against ERPNext, including missing, duplicate, mismatched, externally changed, and externally deleted records. Treat ERP-owned edits as visible owned exceptions; never silently overwrite or recreate them.

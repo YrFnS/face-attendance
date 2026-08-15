@@ -1,6 +1,7 @@
 import json
 import tempfile
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
 
@@ -19,9 +20,11 @@ def payload():
     return {
         "schema_version": 1,
         "gallery_version": "web-test",
-        "generated_at": "2026-07-29T00:00:00Z",
+        "generated_at": datetime.now(timezone.utc)
+        .isoformat()
+        .replace("+00:00", "Z"),
         "model": "buffalo_l",
-        "model_version": "",
+        "model_version": "v1",
         "dimension": 3,
         "normalized": True,
         "branch": "Baghdad",
@@ -42,8 +45,13 @@ class WebAdminTests(unittest.TestCase):
         self.config.write_text(json.dumps({
             "branch_name": "Baghdad",
             "model": "buffalo_l",
+            "model_version": "v1",
+            "require_model_match": True,
+            "require_model_version_match": True,
+            "reject_stale_embedding_gallery": True,
+            "embedding_max_age_seconds": 3600,
             "embedding_export_enabled": True,
-            "embedding_export_token": "secret",
+            "embedding_export_token": "secret-token-value",
             "local_enrollment_enabled": False,
             "web_admin_username": "admin",
             "web_admin_password_hash": hash_password("correct horse battery staple"),
@@ -101,9 +109,9 @@ class WebAdminTests(unittest.TestCase):
         self.assertEqual(self.client.get("/api/faces/embeddings?branch=Baghdad").status_code, 401)
 
     def test_export_returns_etag_and_304(self):
-        response = self.client.get("/api/faces/embeddings?branch=Baghdad", headers={"Authorization": "Bearer secret"})
+        response = self.client.get("/api/faces/embeddings?branch=Baghdad", headers={"Authorization": "Bearer secret-token-value"})
         self.assertEqual(response.status_code, 200)
-        cached = self.client.get("/api/faces/embeddings?branch=Baghdad", headers={"Authorization": "Bearer secret", "If-None-Match": response.headers["ETag"]})
+        cached = self.client.get("/api/faces/embeddings?branch=Baghdad", headers={"Authorization": "Bearer secret-token-value", "If-None-Match": response.headers["ETag"]})
         self.assertEqual(cached.status_code, 304)
 
     def test_upload_is_disabled_on_attendance_server(self):
@@ -114,6 +122,19 @@ class WebAdminTests(unittest.TestCase):
     def test_state_change_rejects_missing_csrf(self):
         self.login()
         self.assertEqual(self.client.post("/logout").status_code, 400)
+
+    def test_readyz_uses_strict_branch_policy(self):
+        invalid = payload()
+        invalid["branch"] = "Basra"
+        write_gallery_atomic(self.gallery, invalid)
+        response = self.client.get("/readyz")
+        self.assertEqual(response.status_code, 503)
+        self.assertTrue(
+            any(
+                "branch mismatch" in reason
+                for reason in response.get_json()["reasons"]
+            )
+        )
 
 
 if __name__ == "__main__":

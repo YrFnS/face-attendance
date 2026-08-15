@@ -3,29 +3,82 @@
   "camera_url": "rtsp://admin:CHANGE_ME@192.168.68.121:554/LiveMedia/ch1/Media1",
   "bench_dir": "/home/test/frappe-bench",
   "site": "test",
+  "erpnext_transport": "bench",
   "frappe_url": "",
   "frappe_api_key": "",
-  "frappe_api_secret": "",
+  "frappe_api_secret": "systemd://frappe_api_secret",
   "allow_insecure_frappe_url": false,
+  "erpnext_request_timeout_seconds": 30,
+  "erpnext_idempotency_required": false,
+  "erpnext_idempotency_contract_version": "face-attendance/erpnext-checkin-idempotency/v1",
+  "erpnext_idempotency_create_method": "face_attendance_idempotency.api.create_or_get_employee_checkin",
+  "erpnext_idempotency_probe_method": "face_attendance_idempotency.api.get_contract",
+  "erpnext_expected_site": "",
+  "erpnext_expected_idempotency_fingerprint": "",
+  "erpnext_idempotency_probe_cache_seconds": 300,
+  "delivery_mode": "synchronous",
+  "delivery_worker_enabled": false,
+  "delivery_worker_poll_seconds": 1.0,
+  "delivery_worker_batch_size": 10,
+  "delivery_worker_lease_seconds": 120,
+  "delivery_worker_heartbeat_seconds": 20.0,
+  "delivery_worker_max_attempts": 6,
+  "delivery_retry_base_seconds": 5.0,
+  "delivery_retry_max_seconds": 900.0,
+  "delivery_retry_jitter_fraction": 0.2,
+  "delivery_queue_max_active_jobs": 10000,
+  "delivery_queue_min_free_bytes": 1073741824,
+  "attachment_worker_enabled": false,
+  "attachment_worker_poll_seconds": 2.0,
+  "attachment_worker_batch_size": 10,
+  "attachment_worker_lease_seconds": 120,
+  "attachment_worker_heartbeat_seconds": 20.0,
+  "attachment_worker_max_attempts": 6,
+  "attachment_retry_base_seconds": 10.0,
+  "attachment_retry_max_seconds": 3600.0,
+  "attachment_retry_jitter_fraction": 0.2,
+  "attachment_queue_max_active_jobs": 10000,
+  "attachment_queue_min_free_bytes": 536870912,
+  "attachment_spool_dir": "/opt/face-attendance/attachment_spool",
+  "attachment_max_image_bytes": 10485760,
+  "attachment_orphan_grace_seconds": 3600,
+  "attachment_delete_spool_after_success": true,
   "log_type": "IN",
   "camera_uploads_dir": "/opt/face-attendance/camera_uploads",
-  "camera_ids": {
-    "in": "entrance-in",
-    "out": "entrance-out"
+  "camera_sources": {
+    "entrance-in": {
+      "source_type": "holowits_ftp",
+      "branch": "CHANGE_ME",
+      "policy": "IN",
+      "ftp_username": "camera_in",
+      "upload_dir": "camera_uploads/in",
+      "allowed_networks": [
+        "192.168.68.121/32"
+      ]
+    },
+    "entrance-out": {
+      "source_type": "holowits_ftp",
+      "branch": "CHANGE_ME",
+      "policy": "OUT",
+      "ftp_username": "camera_out",
+      "upload_dir": "camera_uploads/out",
+      "allowed_networks": [
+        "192.168.68.122/32"
+      ]
+    }
   },
+  "camera_source_receipt_required": true,
+  "camera_source_receipt_secret": "systemd://camera_source_receipt_secret",
+  "camera_source_receipt_future_tolerance_seconds": 300,
   "camera_network_isolated_acknowledged": false,
   "ftp_bind_host": "0.0.0.0",
-  "ftp_username": "camera",
-  "ftp_password": "CHANGE_ME",
   "ftp_users": {
     "camera_in": {
-      "password": "CHANGE_ME",
-      "dir": "camera_uploads/in",
+      "password": "systemd://ftp_camera_in_password",
       "permissions": "elw"
     },
     "camera_out": {
-      "password": "CHANGE_ME",
-      "dir": "camera_uploads/out",
+      "password": "systemd://ftp_camera_out_password",
       "permissions": "elw"
     }
   },
@@ -58,8 +111,8 @@
   "web_max_requests_jitter": 200,
   "web_log_level": "info",
   "web_admin_username": "admin",
-  "web_admin_password_hash": "",
-  "web_session_secret": "CHANGE_ME",
+  "web_admin_password_hash": "systemd://web_admin_password_hash",
+  "web_session_secret": "systemd://web_session_secret",
   "web_session_minutes": 30,
   "web_cookie_secure": true,
   "web_hsts_enabled": true,
@@ -69,7 +122,6 @@
   "web_lockout_seconds": 900,
   "web_audit_rows": 20,
   "central_url": "",
-  "central_api_token": "CHANGE_ME",
   "branch_name": "",
   "embedding_gallery_path": "/api/faces/embeddings",
   "embedding_sync_enabled": true,
@@ -79,25 +131,34 @@
   "embedding_read_timeout_seconds": 30,
   "embedding_sync_retries": 2,
   "embedding_retry_base_seconds": 1.0,
+  "embedding_max_redirects": 3,
   "embedding_max_response_bytes": 52428800,
+  "embedding_release_required": false,
+  "embedding_release_publisher": "",
+  "embedding_release_trusted_keys": {},
+  "embedding_release_future_tolerance_seconds": 300,
+  "embedding_release_history_limit": 32,
   "embedding_max_age_seconds": 86400,
-  "reject_stale_embedding_gallery": false,
+  "reject_stale_embedding_gallery": true,
   "require_model_match": true,
-  "require_model_version_match": false,
+  "require_model_version_match": true,
   "allow_empty_embedding_gallery": false,
   "allow_unauthenticated_embedding_sync": false,
   "allow_insecure_central_url": false,
   "max_gallery_employees": 10000,
   "max_embeddings_per_employee": 50,
+  "max_gallery_embeddings": 500000,
+  "max_embedding_dimension": 4096,
   "local_enrollment_enabled": false,
   "max_enrollment_files_per_request": 20,
   "max_enrollment_image_bytes": 10485760,
   "max_enrollment_image_pixels": 20000000,
   "embedding_build_timeout_seconds": 1800,
   "embedding_export_enabled": false,
-  "embedding_export_token": "CHANGE_ME",
   "model": "buffalo_l",
   "model_version": "",
+  "preprocessing_version": "insightface-preprocess-v1",
+  "attendance_policy_version": "directional-v1",
   "model_directory": "~/.insightface/models/buffalo_l",
   "model_license_acknowledged": false,
   "model_license_reference": "CHANGE_ME",
@@ -119,18 +180,26 @@
   "pad_required": false,
   "pad_fail_closed": true,
   "pad_require_single_face": true,
+  "pad_max_faces_per_event": 8,
   "pad_min_score": 0.8,
   "pad_crop_margin": 0.25,
   "pad_jpeg_quality": 92,
   "pad_max_image_bytes": 2097152,
   "pad_http_url": "",
-  "pad_http_token": "CHANGE_ME",
+  "pad_http_token": "systemd://pad_http_token",
+  "pad_expected_provider": "CHANGE_ME",
+  "pad_allowed_models": [],
+  "pad_require_binding_echo": true,
+  "pad_require_evidence_id": true,
   "pad_connect_timeout_seconds": 2,
   "pad_read_timeout_seconds": 5,
   "pad_max_response_bytes": 65536,
   "pad_allow_insecure_url": false,
   "pad_allow_unauthenticated_local": false,
   "runtime_state_db": "runtime_state.sqlite3",
+  "event_processing_lease_seconds": 180,
+  "event_startup_recovery_enabled": true,
+  "attendance_policy_reservation_seconds": 300,
   "max_camera_event_age_seconds": 600,
   "camera_event_future_tolerance_seconds": 60,
   "max_camera_upload_bytes": 20971520,
@@ -144,5 +213,64 @@
   "save_checkin_crops": true,
   "attach_checkin_crop": true,
   "delete_camera_uploads_after_processing": true,
-  "audit_retention_days": 7
+  "audit_retention_days": 7,
+  "web_auth_mode": "local",
+  "web_auth_adapter": "",
+  "web_auth_allowed_redirect_hosts": [],
+  "web_auth_callback_url": "",
+  "web_mfa_required": false,
+  "web_trust_proxy_headers": true,
+  "web_trusted_proxy_networks": [
+    "127.0.0.1/32",
+    "::1/128"
+  ],
+  "web_forwarded_for_header": "X-Forwarded-For",
+  "web_max_forwarded_hops": 8,
+  "production_external_secrets_required": true,
+  "central_api_credential_id": "baghdad-node-2026-q3",
+  "central_api_credentials": {
+    "baghdad-node-2026-q3": {
+      "token": "systemd://central_gallery_token_2026_q3",
+      "scopes": [
+        "gallery:read"
+      ],
+      "branches": [
+        "CHANGE_ME"
+      ],
+      "models": [
+        "buffalo_l"
+      ],
+      "model_versions": [
+        "CHANGE_ME"
+      ],
+      "not_before": "",
+      "expires_at": "",
+      "enabled": true
+    }
+  },
+  "embedding_export_credentials": {
+    "baghdad-node-2026-q3": {
+      "token": "systemd://gallery_export_token_2026_q3",
+      "scopes": [
+        "gallery:read"
+      ],
+      "branches": [
+        "CHANGE_ME"
+      ],
+      "models": [
+        "buffalo_l"
+      ],
+      "model_versions": [
+        "CHANGE_ME"
+      ],
+      "not_before": "",
+      "expires_at": "",
+      "enabled": true
+    }
+  },
+  "embedding_export_rate_limit_requests": 120,
+  "embedding_export_rate_limit_window_seconds": 60,
+  "embedding_export_ip_rate_limit_requests": 60,
+  "embedding_export_auth_failures": 10,
+  "embedding_export_auth_failure_window_seconds": 300
 }

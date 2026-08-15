@@ -4,19 +4,52 @@ import os
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
-from urllib.parse import urljoin, urlparse
 
 import numpy as np
-import requests
+
+from data_contract import (
+    GalleryError,
+    MAX_EMBEDDING_DIMENSION,
+    MAX_EMBEDDINGS_PER_EMPLOYEE,
+    MAX_GALLERY_EMPLOYEES,
+    MAX_RELEASE_SEQUENCE,
+    MAX_TOTAL_EMBEDDINGS,
+    canonical_timestamp,
+    strict_int,
+    strict_json_loads,
+    validate_base64url_text,
+    validate_checksum,
+    validate_display_text,
+    validate_employee_id,
+    validate_employee_name,
+    validate_embedding_vector,
+    validate_gallery_label,
+    validate_token,
+)
 
 
 SCHEMA_VERSION = 1
-DEFAULT_ENDPOINT = "/api/faces/embeddings"
-PLACEHOLDER_TOKENS = {"CHANGE_ME", "REPLACE_ME", "CHANGEME"}
-
-
-class GalleryError(ValueError):
-    """Raised when an embedding gallery is missing, unsafe, or incompatible."""
+_TOP_LEVEL_FIELDS = frozenset(
+    {
+        "schema_version",
+        "gallery_version",
+        "generated_at",
+        "model",
+        "model_version",
+        "dimension",
+        "normalized",
+        "branch",
+        "employees",
+        "release",
+        "checksum",
+    }
+)
+_EMPLOYEE_FIELDS = frozenset(
+    {"employee", "person", "employee_name", "embeddings", "embedding"}
+)
+_RELEASE_FIELDS = frozenset(
+    {"sequence", "publisher", "key_id", "algorithm", "signature"}
+)
 
 
 def utc_now():
@@ -24,9 +57,16 @@ def utc_now():
 
 
 def norm(vector):
-    array = np.asarray(vector, dtype=np.float32)
+    try:
+        array = np.asarray(vector, dtype=np.float32)
+    except (TypeError, ValueError) as exc:
+        raise GalleryError("embedding must contain numeric values") from exc
     if array.ndim != 1 or array.size == 0:
         raise GalleryError("embedding must be a non-empty one-dimensional vector")
+    if array.size > MAX_EMBEDDING_DIMENSION:
+        raise GalleryError(
+            f"embedding dimension exceeds hard maximum {MAX_EMBEDDING_DIMENSION}"
+        )
     if not np.all(np.isfinite(array)):
         raise GalleryError("embedding contains NaN or infinite values")
     length = float(np.linalg.norm(array))
@@ -48,11 +88,86 @@ def match_employee(known, embedding):
     return best_score, employee, best_score - second_score
 
 
-def _clean_text(value, field, required=False):
-    text = "" if value is None else str(value).strip()
-    if required and not text:
-        raise GalleryError(f"{field} is required")
-    return text
+def _unexpected_fields(value, allowed, field):
+    unexpected = sorted(set(value) - set(allowed))
+    if unexpected:
+        raise GalleryError(
+            f"{field} contains unsupported field(s): {', '.join(unexpected)}"
+        )
+
+
+def _limit(value, field, default, hard_maximum):
+    if value is None:
+        value = default
+    return strict_int(value, field, minimum=1, maximum=hard_maximum)
+
+
+def _employee_value(item, index):
+    has_employee = "employee" in item and item.get("employee") is not None
+    has_person = "person" in item and item.get("person") is not None
+    if has_employee and has_person:
+        employee = validate_employee_id(
+            item.get("employee"), f"employees[{index}].employee"
+        )
+        person = validate_employee_id(
+            item.get("person"), f"employees[{index}].person"
+        )
+        if employee != person:
+            raise GalleryError(
+                f"employees[{index}] has conflicting employee and person values"
+            )
+        return employee
+    value = item.get("employee") if has_employee else item.get("person")
+    return validate_employee_id(value, f"employees[{index}].employee")
+
+
+def _vectors_value(item, index, employee):
+    has_many = "embeddings" in item and item.get("embeddings") is not None
+    has_one = "embedding" in item and item.get("embedding") is not None
+    if has_many and has_one:
+        raise GalleryError(
+            f"employees[{index}] must not contain both embedding and embeddings"
+        )
+    vectors = item.get("embeddings") if has_many else None
+    if vectors is None and has_one:
+        vectors = [item.get("embedding")]
+    if not isinstance(vectors, list) or not vectors:
+        raise GalleryError(f"employee {employee} has no embeddings")
+    return vectors
+
+
+def _sanitize_release(value):
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise GalleryError("release must be a JSON object")
+    _unexpected_fields(value, _RELEASE_FIELDS, "release")
+    sequence = strict_int(
+        value.get("sequence"),
+        "release.sequence",
+        minimum=1,
+        maximum=MAX_RELEASE_SEQUENCE,
+    )
+    publisher = validate_token(
+        value.get("publisher"), "release.publisher", required=True
+    )
+    key_id = validate_token(value.get("key_id"), "release.key_id", required=True)
+    algorithm = validate_token(
+        value.get("algorithm"), "release.algorithm", required=True, max_chars=32
+    ).lower()
+    signature = validate_base64url_text(
+        value.get("signature"),
+        field="release.signature",
+        expected_decoded_bytes=64,
+        max_chars=128,
+    )
+    return {
+        "sequence": sequence,
+        "publisher": publisher,
+        "key_id": key_id,
+        "algorithm": algorithm,
+        "signature": signature,
+    }
 
 
 def _gallery_checksum(payload):
@@ -63,6 +178,7 @@ def _gallery_checksum(payload):
         ensure_ascii=False,
         sort_keys=True,
         separators=(",", ":"),
+        allow_nan=False,
     ).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
 
@@ -78,27 +194,36 @@ def validate_gallery(
     allow_empty=False,
     max_employees=10000,
     max_embeddings_per_employee=50,
+    max_dimension=MAX_EMBEDDING_DIMENSION,
+    max_total_embeddings=MAX_TOTAL_EMBEDDINGS,
 ):
     if not isinstance(payload, dict):
         raise GalleryError("embedding gallery must be a JSON object")
+    _unexpected_fields(payload, _TOP_LEVEL_FIELDS, "embedding gallery")
 
-    try:
-        schema_version = int(payload.get("schema_version"))
-    except (TypeError, ValueError) as exc:
-        raise GalleryError("schema_version must be an integer") from exc
+    schema_version = strict_int(
+        payload.get("schema_version"),
+        "schema_version",
+        minimum=1,
+        maximum=SCHEMA_VERSION,
+    )
     if schema_version != SCHEMA_VERSION:
         raise GalleryError(
             f"unsupported schema_version {schema_version}; expected {SCHEMA_VERSION}"
         )
 
-    model = _clean_text(payload.get("model"), "model", required=True)
-    expected_model = _clean_text(expected_model, "expected_model")
+    model = validate_token(payload.get("model"), "model", required=True)
+    expected_model = validate_token(
+        expected_model, "expected_model", required=False
+    )
     if require_model_match and expected_model and model != expected_model:
         raise GalleryError(f"model mismatch: received {model}, expected {expected_model}")
 
-    model_version = _clean_text(payload.get("model_version"), "model_version")
-    expected_model_version = _clean_text(
-        expected_model_version, "expected_model_version"
+    model_version = validate_token(
+        payload.get("model_version"), "model_version", required=False
+    )
+    expected_model_version = validate_token(
+        expected_model_version, "expected_model_version", required=False
     )
     if (
         require_model_version_match
@@ -110,27 +235,70 @@ def validate_gallery(
             f"received {model_version or '<missing>'}, expected {expected_model_version}"
         )
 
-    branch = _clean_text(payload.get("branch"), "branch")
-    expected_branch = _clean_text(expected_branch, "expected_branch")
+    branch = validate_gallery_label(
+        payload.get("branch"), "branch", required=False, max_chars=128
+    )
+    expected_branch = validate_gallery_label(
+        expected_branch, "expected_branch", required=False, max_chars=128
+    )
     if expected_branch and branch != expected_branch:
         raise GalleryError(
             f"branch mismatch: received {branch!r}, expected {expected_branch!r}"
         )
 
-    try:
-        dimension = int(payload.get("dimension"))
-    except (TypeError, ValueError) as exc:
-        raise GalleryError("dimension must be an integer") from exc
-    if dimension <= 0:
-        raise GalleryError("dimension must be greater than zero")
+    generated_at = canonical_timestamp(payload.get("generated_at"), "generated_at")
+    gallery_version = validate_token(
+        payload.get("gallery_version"),
+        "gallery_version",
+        required=False,
+        max_chars=128,
+    )
+    if not gallery_version:
+        gallery_version = generated_at
+
+    hard_dimension = _limit(
+        max_dimension,
+        "max_dimension",
+        MAX_EMBEDDING_DIMENSION,
+        MAX_EMBEDDING_DIMENSION,
+    )
+    dimension = strict_int(
+        payload.get("dimension"),
+        "dimension",
+        minimum=1,
+        maximum=hard_dimension,
+    )
+
+    normalized_value = payload.get("normalized")
+    if normalized_value is not None and not isinstance(normalized_value, bool):
+        raise GalleryError("normalized must be a boolean")
+
+    employee_limit = _limit(
+        max_employees,
+        "max_employees",
+        10000,
+        MAX_GALLERY_EMPLOYEES,
+    )
+    employee_embedding_limit = _limit(
+        max_embeddings_per_employee,
+        "max_embeddings_per_employee",
+        50,
+        MAX_EMBEDDINGS_PER_EMPLOYEE,
+    )
+    total_embedding_limit = _limit(
+        max_total_embeddings,
+        "max_total_embeddings",
+        MAX_TOTAL_EMBEDDINGS,
+        MAX_TOTAL_EMBEDDINGS,
+    )
 
     employees = payload.get("employees")
     if not isinstance(employees, list):
         raise GalleryError("employees must be a list")
     if not employees and not allow_empty:
         raise GalleryError("refusing to activate an empty embedding gallery")
-    if len(employees) > int(max_employees):
-        raise GalleryError(f"gallery exceeds max_employees={max_employees}")
+    if len(employees) > employee_limit:
+        raise GalleryError(f"gallery exceeds max_employees={employee_limit}")
 
     seen = set()
     sanitized_employees = []
@@ -140,42 +308,41 @@ def validate_gallery(
     for index, item in enumerate(employees):
         if not isinstance(item, dict):
             raise GalleryError(f"employees[{index}] must be an object")
-        employee = _clean_text(
-            item.get("employee") or item.get("person"),
-            f"employees[{index}].employee",
-            required=True,
-        )
+        _unexpected_fields(item, _EMPLOYEE_FIELDS, f"employees[{index}]")
+        employee = _employee_value(item, index)
         if employee in seen:
             raise GalleryError(f"duplicate employee in gallery: {employee}")
         seen.add(employee)
 
-        vectors = item.get("embeddings")
-        if vectors is None and item.get("embedding") is not None:
-            vectors = [item["embedding"]]
-        if not isinstance(vectors, list) or not vectors:
-            raise GalleryError(f"employee {employee} has no embeddings")
-        if len(vectors) > int(max_embeddings_per_employee):
+        vectors = _vectors_value(item, index, employee)
+        if len(vectors) > employee_embedding_limit:
             raise GalleryError(
                 f"employee {employee} exceeds max_embeddings_per_employee="
-                f"{max_embeddings_per_employee}"
+                f"{employee_embedding_limit}"
+            )
+        embedding_count += len(vectors)
+        if embedding_count > total_embedding_limit:
+            raise GalleryError(
+                f"gallery exceeds max_total_embeddings={total_embedding_limit}"
             )
 
         normalized = []
         for vector_index, vector in enumerate(vectors):
+            field = f"employees[{index}].embeddings[{vector_index}]"
+            clean_values = validate_embedding_vector(
+                vector, field=field, dimension=dimension
+            )
             try:
-                clean_vector = norm(vector)
+                clean_vector = norm(clean_values)
             except GalleryError as exc:
                 raise GalleryError(
                     f"invalid embedding for {employee} at index {vector_index}: {exc}"
                 ) from exc
-            if clean_vector.size != dimension:
-                raise GalleryError(
-                    f"embedding dimension mismatch for {employee}: "
-                    f"received {clean_vector.size}, expected {dimension}"
-                )
             normalized.append(clean_vector)
 
-        employee_name = _clean_text(item.get("employee_name"), "employee_name")
+        employee_name = validate_employee_name(
+            item.get("employee_name"), f"employees[{index}].employee_name"
+        )
         sanitized_item = {
             "employee": employee,
             "embeddings": [vector.tolist() for vector in normalized],
@@ -191,14 +358,11 @@ def validate_gallery(
                 "embeddings": normalized,
             }
         )
-        embedding_count += len(normalized)
 
     sanitized = {
         "schema_version": SCHEMA_VERSION,
-        "gallery_version": _clean_text(payload.get("gallery_version"), "gallery_version")
-        or utc_now(),
-        "generated_at": _clean_text(payload.get("generated_at"), "generated_at")
-        or utc_now(),
+        "gallery_version": gallery_version,
+        "generated_at": generated_at,
         "model": model,
         "model_version": model_version,
         "dimension": dimension,
@@ -206,14 +370,45 @@ def validate_gallery(
         "branch": branch,
         "employees": sanitized_employees,
     }
-    sanitized["checksum"] = _gallery_checksum(sanitized)
+    release = _sanitize_release(payload.get("release"))
+    if release is not None:
+        sanitized["release"] = release
+    calculated_checksum = _gallery_checksum(sanitized)
+    if "checksum" in payload and payload.get("checksum") is not None:
+        supplied_checksum = validate_checksum(payload.get("checksum"), "checksum")
+        if supplied_checksum != calculated_checksum:
+            raise GalleryError("embedding gallery checksum does not match its content")
+    sanitized["checksum"] = calculated_checksum
 
     metadata = {
         key: value for key, value in sanitized.items() if key != "employees"
     }
     metadata["employee_count"] = len(sanitized_employees)
     metadata["embedding_count"] = embedding_count
+    if release is not None:
+        metadata.update(
+            release_sequence=release["sequence"],
+            release_publisher=release["publisher"],
+            release_key_id=release["key_id"],
+            release_algorithm=release["algorithm"],
+        )
     return sanitized, known, metadata
+
+
+def _local_vector(vector, *, field):
+    if isinstance(vector, np.ndarray):
+        vector = vector.tolist()
+    elif isinstance(vector, tuple):
+        vector = list(vector)
+    if not isinstance(vector, list):
+        raise GalleryError(f"{field} must be a one-dimensional vector")
+    dimension = len(vector)
+    if dimension <= 0 or dimension > MAX_EMBEDDING_DIMENSION:
+        raise GalleryError(
+            f"{field} dimension must be between 1 and {MAX_EMBEDDING_DIMENSION}"
+        )
+    clean = validate_embedding_vector(vector, field=field, dimension=dimension)
+    return norm(clean)
 
 
 def build_gallery_payload(
@@ -224,25 +419,64 @@ def build_gallery_payload(
     model_version="",
     gallery_version=None,
 ):
+    if not isinstance(employees, (list, tuple)):
+        raise GalleryError("employees must be a list or tuple")
+    model = validate_token(model, "model", required=True)
+    model_version = validate_token(
+        model_version, "model_version", required=False
+    )
+    branch = validate_gallery_label(branch, "branch", required=False, max_chars=128)
+    if gallery_version is not None:
+        gallery_version = validate_token(
+            gallery_version, "gallery_version", required=True, max_chars=128
+        )
+
     employee_rows = []
     dimension = None
-    for item in employees:
-        vectors = item.get("embeddings") or [item.get("embedding")]
-        normalized = [norm(vector) for vector in vectors if vector is not None]
+    for index, item in enumerate(employees):
+        if not isinstance(item, dict):
+            raise GalleryError(f"employees[{index}] must be an object")
+        employee = validate_employee_id(
+            item.get("employee") or item.get("person"),
+            f"employees[{index}].employee",
+        )
+        employee_name = validate_employee_name(
+            item.get("employee_name"), f"employees[{index}].employee_name"
+        )
+        vectors = item.get("embeddings")
+        if vectors is None and item.get("embedding") is not None:
+            vectors = [item.get("embedding")]
+        if not isinstance(vectors, (list, tuple)) or not vectors:
+            continue
+        normalized = [
+            _local_vector(
+                vector,
+                field=f"employees[{index}].embeddings[{vector_index}]",
+            )
+            for vector_index, vector in enumerate(vectors)
+            if vector is not None
+        ]
         if not normalized:
             continue
+        current_dimension = int(normalized[0].size)
         if dimension is None:
-            dimension = int(normalized[0].size)
-        employee_rows.append(
-            {
-                "employee": item["employee"],
-                "employee_name": item.get("employee_name", ""),
-                "embeddings": [vector.tolist() for vector in normalized],
-            }
-        )
+            dimension = current_dimension
+        if current_dimension != dimension or any(
+            int(vector.size) != dimension for vector in normalized
+        ):
+            raise GalleryError(
+                f"embedding dimension mismatch for employee {employee}"
+            )
+        row = {
+            "employee": employee,
+            "embeddings": [vector.tolist() for vector in normalized],
+        }
+        if employee_name:
+            row["employee_name"] = employee_name
+        employee_rows.append(row)
     if dimension is None:
         raise GalleryError("cannot build a gallery without embeddings")
-    return {
+    payload = {
         "schema_version": SCHEMA_VERSION,
         "gallery_version": gallery_version or utc_now(),
         "generated_at": utc_now(),
@@ -253,6 +487,7 @@ def build_gallery_payload(
         "branch": branch,
         "employees": employee_rows,
     }
+    return validate_gallery(payload)[0]
 
 
 def _atomic_write_text(path, text, mode=0o600):
@@ -289,6 +524,8 @@ def write_gallery_atomic(
     allow_empty=False,
     max_employees=10000,
     max_embeddings_per_employee=50,
+    max_dimension=MAX_EMBEDDING_DIMENSION,
+    max_total_embeddings=MAX_TOTAL_EMBEDDINGS,
 ):
     sanitized, known, metadata = validate_gallery(
         payload,
@@ -300,10 +537,15 @@ def write_gallery_atomic(
         allow_empty=allow_empty,
         max_employees=max_employees,
         max_embeddings_per_employee=max_embeddings_per_employee,
+        max_dimension=max_dimension,
+        max_total_embeddings=max_total_embeddings,
     )
     _atomic_write_text(
         path,
-        json.dumps(sanitized, ensure_ascii=False, indent=2) + "\n",
+        json.dumps(
+            sanitized, ensure_ascii=False, indent=2, allow_nan=False
+        )
+        + "\n",
     )
     return known, metadata
 
@@ -319,13 +561,18 @@ def load_gallery(
     allow_empty=False,
     max_employees=10000,
     max_embeddings_per_employee=50,
+    max_dimension=MAX_EMBEDDING_DIMENSION,
+    max_total_embeddings=MAX_TOTAL_EMBEDDINGS,
 ):
     path = Path(path)
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload = strict_json_loads(
+            path.read_text(encoding="utf-8"),
+            field="embedding gallery",
+        )
     except FileNotFoundError as exc:
         raise GalleryError(f"embedding gallery not found: {path}") from exc
-    except (OSError, json.JSONDecodeError) as exc:
+    except (OSError, GalleryError) as exc:
         raise GalleryError(f"could not read embedding gallery {path}: {exc}") from exc
     sanitized, known, metadata = validate_gallery(
         payload,
@@ -337,6 +584,8 @@ def load_gallery(
         allow_empty=allow_empty,
         max_employees=max_employees,
         max_embeddings_per_employee=max_embeddings_per_employee,
+        max_dimension=max_dimension,
+        max_total_embeddings=max_total_embeddings,
     )
     return known, metadata, sanitized
 
@@ -347,30 +596,6 @@ def gallery_signature(path):
     except FileNotFoundError:
         return None
     return stat.st_mtime_ns, stat.st_size
-
-
-def gallery_status(path, *, max_age_seconds=None):
-    path = Path(path)
-    if not path.exists():
-        return {"available": False, "path": str(path), "error": "gallery not found"}
-    try:
-        _, metadata, _ = load_gallery(path, require_model_match=False)
-        stat = path.stat()
-        age_seconds = max(0, int(datetime.now().timestamp() - stat.st_mtime))
-        max_age = int(max_age_seconds or 0)
-        return {
-            "available": True,
-            "path": str(path),
-            "updated_at": datetime.fromtimestamp(
-                stat.st_mtime, timezone.utc
-            ).isoformat().replace("+00:00", "Z"),
-            "age_seconds": age_seconds,
-            "stale": bool(max_age and age_seconds > max_age),
-            **metadata,
-        }
-    except (GalleryError, OSError) as exc:
-        return {"available": False, "path": str(path), "error": str(exc)}
-
 
 def read_sync_status(path):
     try:
@@ -385,148 +610,103 @@ def write_sync_status(path, **values):
     current.update(values)
     _atomic_write_text(
         path,
-        json.dumps(current, ensure_ascii=False, indent=2) + "\n",
+        json.dumps(
+            current, ensure_ascii=False, indent=2, allow_nan=False
+        )
+        + "\n",
     )
     return current
 
 
-def _is_local_url(parsed):
-    return parsed.hostname in {"localhost", "127.0.0.1", "::1"}
-
-
-def _request_headers(cfg):
-    token = _clean_text(cfg.get("central_api_token"), "central_api_token")
-    allow_unauthenticated = bool(cfg.get("allow_unauthenticated_embedding_sync", False))
-    if token.upper() in PLACEHOLDER_TOKENS:
-        token = ""
-    if not token and not allow_unauthenticated:
-        raise GalleryError(
-            "central_api_token must be configured with a non-placeholder value"
-        )
-    headers = {"Accept": "application/json"}
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
-    return headers
-
-
-def sync_gallery(cfg, gallery_path, status_path, session=requests):
-    attempted_at = utc_now()
-    central_url = _clean_text(cfg.get("central_url"), "central_url", required=True)
-    parsed = urlparse(central_url)
-    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-        raise GalleryError("central_url must be an absolute HTTP(S) URL")
-    if (
-        parsed.scheme != "https"
-        and not _is_local_url(parsed)
-        and not bool(cfg.get("allow_insecure_central_url", False))
-    ):
-        raise GalleryError(
-            "central_url must use HTTPS; set allow_insecure_central_url only on a trusted VPN/LAN"
-        )
-
-    endpoint = _clean_text(cfg.get("embedding_gallery_path"), "embedding_gallery_path")
-    endpoint = endpoint or DEFAULT_ENDPOINT
-    url = urljoin(central_url.rstrip("/") + "/", endpoint.lstrip("/"))
-    timeout = float(cfg.get("embedding_request_timeout_seconds", 30))
-    branch = _clean_text(cfg.get("branch_name"), "branch_name")
-    params = {"branch": branch} if branch else None
-
+def _runtime_release_context(path):
+    path = Path(path)
+    config_path = path.parent / "config.json"
+    if not config_path.is_file():
+        return None
     try:
-        response = session.get(
-            url,
-            headers=_request_headers(cfg),
-            params=params,
-            timeout=timeout,
-        )
-        response.raise_for_status()
-        payload = response.json()
-        if isinstance(payload, dict) and isinstance(payload.get("data"), dict):
-            payload = payload["data"]
+        cfg = json.loads(config_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(cfg, dict):
+        return None
+    status = read_sync_status(path.parent / "embedding_sync_status.json")
+    return cfg, status
 
-        sanitized, _, metadata = validate_gallery(
-            payload,
-            expected_model=cfg.get("model"),
-            expected_model_version=cfg.get("model_version"),
-            expected_branch=branch,
-            require_model_match=bool(cfg.get("require_model_match", True)),
-            require_model_version_match=bool(
-                cfg.get("require_model_version_match", False)
-            ),
-            allow_empty=bool(cfg.get("allow_empty_embedding_gallery", False)),
-            max_employees=int(cfg.get("max_gallery_employees", 10000)),
-            max_embeddings_per_employee=int(
-                cfg.get("max_embeddings_per_employee", 50)
-            ),
-        )
 
-        current_checksum = None
-        try:
-            _, current_metadata, _ = load_gallery(
-                gallery_path,
-                expected_model=cfg.get("model"),
-                expected_model_version=cfg.get("model_version"),
-                expected_branch=branch,
-                require_model_match=bool(cfg.get("require_model_match", True)),
-                require_model_version_match=bool(
-                    cfg.get("require_model_version_match", False)
-                ),
-                allow_empty=bool(cfg.get("allow_empty_embedding_gallery", False)),
+def _validate_runtime_release(path, sanitized):
+    context = _runtime_release_context(path)
+    if context is None:
+        return None
+    cfg, status = context
+    from gallery_release import configured_source_url, validate_installed_release
+
+    return validate_installed_release(
+        sanitized,
+        cfg,
+        status,
+        source_url=configured_source_url(cfg),
+    )
+
+
+def gallery_status(path, *, max_age_seconds=None):
+    path = Path(path)
+    if not path.exists():
+        return {"available": False, "path": str(path), "error": "gallery not found"}
+    try:
+        _, metadata, sanitized = load_gallery(path, require_model_match=False)
+        release = _validate_runtime_release(path, sanitized)
+        context = _runtime_release_context(path)
+        if context is not None:
+            cfg, _ = context
+            cfg = dict(cfg)
+            if max_age_seconds is not None:
+                cfg["embedding_max_age_seconds"] = int(max_age_seconds)
+            from runtime_policy import gallery_freshness_status
+
+            freshness = gallery_freshness_status(
+                cfg,
+                metadata.get("generated_at"),
+                path=path,
             )
-            current_checksum = current_metadata.get("checksum")
-        except GalleryError:
-            pass
-
-        changed = current_checksum != metadata.get("checksum")
-        if changed:
-            write_gallery_atomic(
-                gallery_path,
-                sanitized,
-                expected_model=cfg.get("model"),
-                expected_model_version=cfg.get("model_version"),
-                expected_branch=branch,
-                require_model_match=bool(cfg.get("require_model_match", True)),
-                require_model_version_match=bool(
-                    cfg.get("require_model_version_match", False)
-                ),
-                allow_empty=bool(cfg.get("allow_empty_embedding_gallery", False)),
-                max_employees=int(cfg.get("max_gallery_employees", 10000)),
-                max_embeddings_per_employee=int(
-                    cfg.get("max_embeddings_per_employee", 50)
-                ),
+        else:
+            stat = path.stat()
+            age_seconds = max(
+                0, int(datetime.now().timestamp() - stat.st_mtime)
             )
-
+            max_age = int(max_age_seconds or 0)
+            freshness = {
+                "path": str(path),
+                "updated_at": datetime.fromtimestamp(
+                    stat.st_mtime, timezone.utc
+                ).isoformat().replace("+00:00", "Z"),
+                "age_seconds": age_seconds,
+                "stale": bool(max_age and age_seconds > max_age),
+                "policy_valid": True,
+                "error": "",
+            }
         result = {
-            "ok": True,
-            "changed": changed,
-            "attempted_at": attempted_at,
-            "last_success_at": utc_now(),
-            "source_url": url,
-            "branch": metadata.get("branch"),
-            "gallery_version": metadata.get("gallery_version"),
-            "checksum": metadata.get("checksum"),
-            "model": metadata.get("model"),
-            "dimension": metadata.get("dimension"),
-            "employee_count": metadata.get("employee_count"),
-            "embedding_count": metadata.get("embedding_count"),
-            "error": "",
+            "available": True,
+            **freshness,
+            **metadata,
         }
-        write_sync_status(status_path, **result)
+        if release is not None:
+            result["release_validation"] = release
         return result
-    except Exception as exc:
-        write_sync_status(
-            status_path,
-            ok=False,
-            attempted_at=attempted_at,
-            source_url=url,
-            error=str(exc),
-        )
-        if isinstance(exc, GalleryError):
-            raise
-        if isinstance(exc, requests.RequestException):
-            raise GalleryError(f"embedding sync request failed: {exc}") from exc
-        if isinstance(exc, (ValueError, TypeError)):
-            raise GalleryError(f"embedding sync response is invalid: {exc}") from exc
-        raise
+    except (GalleryError, OSError) as exc:
+        return {"available": False, "path": str(path), "error": str(exc)}
+
+
+def sync_gallery(cfg, gallery_path, status_path, session=None, sleep=None):
+    """Compatibility wrapper for callers that have not moved to secure_sync yet."""
+
+    from secure_sync import sync_gallery as secure_sync_gallery
+
+    kwargs = {}
+    if session is not None:
+        kwargs["session"] = session
+    if sleep is not None:
+        kwargs["sleep"] = sleep
+    return secure_sync_gallery(cfg, gallery_path, status_path, **kwargs)
 
 
 class GalleryReloader:
@@ -540,6 +720,10 @@ class GalleryReloader:
         require_model_match=True,
         require_model_version_match=False,
         allow_empty=False,
+        max_employees=10000,
+        max_embeddings_per_employee=50,
+        max_dimension=MAX_EMBEDDING_DIMENSION,
+        max_total_embeddings=MAX_TOTAL_EMBEDDINGS,
     ):
         self.path = Path(path)
         self.expected_model = expected_model
@@ -548,15 +732,21 @@ class GalleryReloader:
         self.require_model_match = require_model_match
         self.require_model_version_match = require_model_version_match
         self.allow_empty = allow_empty
+        self.max_employees = int(max_employees)
+        self.max_embeddings_per_employee = int(max_embeddings_per_employee)
+        self.max_dimension = int(max_dimension)
+        self.max_total_embeddings = int(max_total_embeddings)
         self.signature = None
         self.known = []
         self.metadata = {}
+        self.generated_at = ""
+        self.updated_unix = 0.0
 
     def reload(self, force=False):
         signature = gallery_signature(self.path)
         if not force and signature == self.signature and self.known:
             return self.known, self.metadata, False
-        known, metadata, _ = load_gallery(
+        known, metadata, sanitized = load_gallery(
             self.path,
             expected_model=self.expected_model,
             expected_model_version=self.expected_model_version,
@@ -564,7 +754,19 @@ class GalleryReloader:
             require_model_match=self.require_model_match,
             require_model_version_match=self.require_model_version_match,
             allow_empty=self.allow_empty,
+            max_employees=self.max_employees,
+            max_embeddings_per_employee=self.max_embeddings_per_employee,
+            max_dimension=self.max_dimension,
+            max_total_embeddings=self.max_total_embeddings,
         )
+        release = _validate_runtime_release(self.path, sanitized)
+        if release is not None:
+            metadata = dict(metadata)
+            metadata["release_validation"] = release
+        from gallery_release import parse_generated_at
+
+        self.generated_at = str(metadata.get("generated_at") or "")
+        self.updated_unix = parse_generated_at(self.generated_at).timestamp()
         self.known = known
         self.metadata = metadata
         self.signature = gallery_signature(self.path)

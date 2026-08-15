@@ -12,6 +12,8 @@ The application code does not grant a production or commercial license for recog
 
 Changing the recognition model requires rebuilding every employee embedding and recalibrating the recognition threshold and score margin. Never mix embeddings from different models or preprocessing pipelines.
 
+`model_directory` must be the exact `<insightface-root>/models/<model>` directory. The manifest verifier validates that layout and its complete file inventory. The watcher derives the InsightFace root from it, passes that root to `FaceAnalysis`, and confirms the model directory reported by the runtime. A manifest for one directory cannot authorize a different directory loaded through InsightFace's default cache.
+
 ## Web administration
 
 The admin UI is locked until a password hash and persistent session secret exist. Configure it on the server:
@@ -47,6 +49,8 @@ Production recognition never needs to wait for a central-server request.
 
 The sync client validates HTTPS, authentication, content type, response size, schema, branch, model, dimensions, and vector values. It uses conditional requests, bounded timeouts, and retry backoff. A failed sync leaves the last valid local gallery untouched.
 
+In production, `runtime_policy.py` is authoritative for branch, model, model version, employee/template limits, empty-gallery behavior, and freshness. Sync validates the policy before networking; the local reloader retains the activation time of the last successfully loaded gallery; `/readyz`, the dashboard, export routes, and the watcher all consume the same effective options. Replacing a valid gallery with a malformed or newly timestamped invalid file cannot reset the age of the active in-memory gallery.
+
 Useful commands:
 
 ```bash
@@ -58,7 +62,7 @@ python sync_embeddings.py --status
 
 ## Camera event replay protection
 
-The production watcher is `watch_service.py`, not the legacy direct folder command. It computes a SHA-256 digest for each completed camera upload and claims an event in SQLite before recognition. The same binary image from the same camera cannot be processed again, including after a restart.
+The only supported live watcher is `watch_service.py`. Linux systemd and every bundled Windows launcher execute that entry point. The legacy commands refuse execution unless `--dry-run` is present, so they cannot silently bypass readiness, PAD, replay protection, or event state. The canonical watcher computes a SHA-256 digest for each completed camera upload and claims an event in SQLite before recognition. The same binary image from the same camera cannot be processed again, including after a restart.
 
 The fail-safe behavior is intentional: an event left in `processing` after an abnormal crash remains blocked rather than risking a duplicate attendance record. Review the state before manual recovery.
 

@@ -1,5 +1,15 @@
-$taskName = "Face Attendance Watcher"
+$ErrorActionPreference = 'Stop'
 
-Stop-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
-Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
-Write-Host "Stopped and removed: $taskName"
+$TaskNames = @(
+    'Face Attendance Watcher',
+    'Face Attendance FTP Receiver'
+)
+
+foreach ($TaskName in $TaskNames) {
+    Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+    Unregister-ScheduledTask `
+        -TaskName $TaskName `
+        -Confirm:$false `
+        -ErrorAction SilentlyContinue
+    Write-Host "Stopped and removed: $TaskName"
+}

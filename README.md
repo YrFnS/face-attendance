@@ -32,10 +32,14 @@ The camera still sends an image because it cannot send an InsightFace embedding.
 
 ## Main files
 
-- `face_attendance.py` — recognition/check-in helpers and legacy watcher commands.
+- `face_attendance.py` — recognition/check-in helpers and legacy diagnostic commands that refuse live processing.
 - `watch_service.py` — production FTP watcher with readiness, PAD, replay protection, and event state.
-- `embedding_gallery.py` — validates, normalizes, stores, synchronizes, and reloads galleries.
+- `erpnext_adapter.py` — explicit, independently tested REST and local-bench Employee Checkin transports.
+- `delivery_outbox.py` — schema-v6 transactional delivery jobs created with accepted recognition decisions.
+- `embedding_gallery.py` — validates, normalizes, stores, and reloads galleries.
+- `secure_sync.py` — authoritative bounded gallery-sync client with authenticated, same-origin redirect validation.
 - `sync_embeddings.py` — manual or continuous gallery synchronization.
+- `legacy_gallery_converter.py` — explicit offline converter for a trusted legacy `embeddings.pkl`; never used during service startup.
 - `web_admin.py` — gallery status, manual sync, optional central enrollment UI, and optional export API.
 - `ftp_receiver.py` — receives camera FTP uploads.
 - `import_faces.py` — compatibility wrapper; now syncs embeddings instead of downloading images.
@@ -59,7 +63,7 @@ face-attendance-web
 face-attendance-sync.timer
 ```
 
-On a fresh installation, FTP and the web UI start, but the live watcher stays stopped until a valid embedding gallery exists. This prevents accidental checkin creation before enrollment is verified.
+On a fresh installation, FTP and the web UI start, but the live watcher stays stopped until a valid `embedding_gallery.json` exists. A legacy `embeddings.pkl` never enables the watcher. This prevents accidental checkin creation before enrollment is verified.
 
 Edit the runtime config and restart services:
 
@@ -81,13 +85,14 @@ The attendance server receives embeddings and should normally have local enrollm
   "embedding_sync_enabled": true,
   "embedding_sync_interval_seconds": 300,
   "embedding_max_age_seconds": 86400,
+  "embedding_max_redirects": 3,
   "require_model_match": true,
   "local_enrollment_enabled": false,
   "model": "buffalo_l"
 }
 ```
 
-Use HTTPS. Plain HTTP to a non-local host is rejected unless `allow_insecure_central_url` is explicitly enabled for a trusted VPN or isolated LAN.
+Use HTTPS. Plain HTTP to a non-local host is rejected unless `allow_insecure_central_url` is explicitly enabled for a trusted VPN or isolated LAN. Redirects are followed manually and only when they stay on the same origin; HTTPS downgrades and cross-origin redirects are rejected before the bearer token can be sent to the redirected destination.
 
 Run the first sync before enabling live checkins:
 
@@ -131,7 +136,7 @@ Authorization: Bearer <token>
 
 For a separate central dashboard, implement the same contract described in `docs/embedding-api.md`.
 
-## Migration from image synchronization
+## Migration from image synchronization and legacy pickle files
 
 Older deployments used:
 
@@ -140,7 +145,30 @@ python import_faces.py
 python face_attendance.py build
 ```
 
-`import_faces.py` now invokes embedding synchronization and no longer downloads central employee images. If a local `embeddings.pkl` exists and `embedding_gallery.json` does not, the watcher converts that local legacy file once into the validated JSON format. Remote pickle files are never accepted.
+`import_faces.py` now invokes the bounded embedding synchronization client and no longer downloads central employee images.
+
+Service startup **never deserializes `embeddings.pkl`**. If a legacy pickle exists while `embedding_gallery.json` does not, startup stops with an actionable error. The preferred migration is to rebuild or synchronize a fresh JSON gallery. Use the converter only when the local pickle is genuinely required and its provenance can be verified from a trusted inventory, backup record, or release record.
+
+Pickle deserialization can execute code. Stop attendance services, isolate the host from untrusted networks, compare the file with the trusted SHA-256 record, and then run the explicit one-shot converter:
+
+```bash
+cd /opt/face-attendance
+. .venv/bin/activate
+sudo systemctl stop face-attendance-watch face-attendance-web face-attendance-sync.timer
+
+sha256sum embeddings.pkl
+# Compare the result with the trusted pre-recorded digest. Do not treat a digest
+# calculated from an untrusted file as proof that the file itself is trustworthy.
+
+python legacy_gallery_converter.py \
+  --expected-sha256 <TRUSTED_64_CHARACTER_SHA256> \
+  --acknowledge-pickle-code-execution-risk
+
+python sync_embeddings.py --status
+python production_readiness.py --strict
+```
+
+The converter refuses to overwrite an existing JSON gallery, creates a mode-`0600` backup before deserialization, validates and atomically writes the JSON gallery, and moves the original pickle into `legacy_quarantine/` by default. Keep the backup and quarantine only for the approved rollback window, then dispose of them under the biometric-retention policy. When no trusted provenance record exists, do not deserialize the pickle; rebuild or synchronize the gallery instead.
 
 After a successful central sync and controlled tests, the attendance server's `faces/` directory can be removed. Keep it only on the trusted enrollment server or while retaining a temporary rollback path.
 
@@ -154,6 +182,9 @@ Recommended privacy-oriented settings:
   "save_rejected_crops": true,
   "save_checkin_crops": true,
   "attach_checkin_crop": true,
+  "attachment_worker_enabled": false,
+  "attachment_spool_dir": "/opt/face-attendance/attachment_spool",
+  "attachment_delete_spool_after_success": true,
   "delete_camera_uploads_after_processing": true,
   "audit_retention_days": 7
 }
@@ -164,7 +195,8 @@ Behavior:
 - `delete_camera_uploads_after_processing` deletes a readable FTP capture only after processing completes. A processing exception preserves the source image for investigation.
 - `save_rejected_crops` retains rejected audit crops under `logs/unknown/`.
 - `save_checkin_crops` retains accepted audit crops under `logs/checkins/`.
-- `attach_checkin_crop` attaches the accepted crop to ERPNext. It can work with `save_checkin_crops: false`; a temporary file is deleted after upload.
+- `attach_checkin_crop` creates a separate durable private-attachment job. The crop is copied into the protected attachment spool, remains independent from Employee Checkin delivery, and is deleted after confirmed upload by default. See `docs/attachment-jobs.md`.
+- Set `attachment_worker_enabled: true` when `delivery_mode` is `worker`; the synchronous compatibility path performs a separate best-effort upload without durable attachment retries.
 - `audit_retention_days` removes old accepted/rejected crops hourly. Set `0` to disable cleanup.
 
 ## Matching safeguards
@@ -223,6 +255,11 @@ python sync_embeddings.py
 python sync_embeddings.py --status
 python face_attendance.py status
 
+# Explicit offline migration of a trusted legacy pickle only
+python legacy_gallery_converter.py \
+  --expected-sha256 <TRUSTED_64_CHARACTER_SHA256> \
+  --acknowledge-pickle-code-execution-risk
+
 # Central/local fallback enrollment only
 python face_attendance.py build
 python face_attendance.py enroll HR-EMP-00001 --photos 5
@@ -233,7 +270,7 @@ python watch_service.py --dry-run
 python watch_service.py --once --dry-run --allow-stale
 ```
 
-`face_attendance.py watch` and `watch-folder` are legacy compatibility paths. Do not use them for live production processing because they bypass the production event ledger, PAD, and readiness gate.
+`watch_service.py` is the only supported live watcher. The legacy `face_attendance.py watch` and `watch-folder` commands fail closed unless `--dry-run` is present, because they do not provide the production readiness, PAD, replay, and event-ledger controls.
 
 Service status and logs:
 
@@ -254,9 +291,61 @@ The following contain local state or biometric data and are ignored by Git:
 - `embedding_gallery.json`
 - `embedding_sync_status.json`
 - legacy `embeddings.pkl`
+- `legacy_backups/`
+- `legacy_quarantine/`
 - `faces/`
 - `camera_uploads/`
 - `logs/`
 - `cooldown_state.json`
 
-Do not commit employee photos, embeddings, camera captures, logs, API tokens, or passwords.
+Do not commit employee photos, embeddings, camera captures, legacy pickle backups, logs, API tokens, or passwords.
+
+### Inspect and resolve attendance events
+
+After migrating `runtime_state.sqlite3` to the current schema, use the dedicated event CLI:
+
+```bash
+python event_admin.py list --database runtime_state.sqlite3
+python event_admin.py explain EVENT_ID --database runtime_state.sqlite3
+```
+
+Audited reprocess, quarantine-resolution, and dismissal commands require an actor, a human reason, and explicit confirmation. They never retry or cancel ERPNext delivery. See `docs/event-operations.md` for the complete safety and recovery workflow.
+
+### Event identity and replay retention
+
+Runtime schema version 9 retains domain-separated capture, event,
+recognition-decision, and ERPNext delivery IDs; durable delivery jobs; leased
+worker state; and immutable ERPNext idempotency-contract evidence. A minimal
+camera/content tombstone is written with every receipt and survives detailed
+event pruning, so an old upload does not become eligible again merely because
+its verbose history expired. Frozen synthetic databases for released schema
+versions 1–4 exercise the real backup-before-migrate path. See
+`docs/event-identity-tombstones.md` and `docs/runtime-state-migrations.md`.
+
+### Separate private crop delivery
+
+Runtime schema version 9 creates durable private crop attachment jobs. Employee Checkin creation and crop upload have independent leases and outcomes, so an attachment failure never downgrades a confirmed check-in. Protected spool media is retained until the attachment job becomes terminal. See `docs/attachment-jobs.md`.
+
+## Durable delivery worker (P2-03)
+
+Accepted recognition decisions can now be drained by `delivery_service.py` using
+renewable SQLite leases, bounded exponential backoff, jitter, retry budgets, and
+a fail-closed submission boundary. See `docs/delivery-worker.md`.
+
+## ERPNext atomic delivery idempotency (P2-04)
+
+The companion Frappe app in
+`frappe_apps/face_attendance_idempotency` installs a database-unique Employee
+Checkin delivery ID and exposes one authenticated atomic create-or-get contract
+for both REST and local-bench transports. A verified, site-pinned capability
+allows the worker to replay a timeout after ERPNext committed without creating a
+second Employee Checkin.
+
+Production readiness now requires the approved ERPNext site and capability
+fingerprint. Real ERPNext/HRMS v15 staging installation and timeout-after-commit
+evidence are still required before production activation. See
+`docs/erpnext-idempotency.md`.
+
+The default synchronous compatibility mode remains available outside the strict
+production profile. Worker mode must keep `attach_checkin_crop=false` until
+P2-05 introduces a separate durable attachment job.
