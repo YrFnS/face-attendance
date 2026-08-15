@@ -1148,11 +1148,29 @@ def process_path(
                 )
                 raise
             try:
+                delivery_metadata = {}
+                if bool(cfg.get("erpnext_idempotency_required", False)):
+                    job = state.delivery_job_for_decision(decision_id)
+                    if not job:
+                        raise RuntimeError(
+                            "delivery job is missing before idempotent submission"
+                        )
+                    delivery_metadata = {
+                        "delivery_id": job["delivery_id"],
+                        "event_id": event_id,
+                        "decision_id": decision_id,
+                        "camera_id": camera_id,
+                        "branch": camera_source.branch,
+                        "delivery_contract_version": job[
+                            "delivery_contract_version"
+                        ],
+                    }
                 remote_docname = attendance.create_checkin(
                     employee,
                     log_type,
                     image_path,
                     event_time=effective_at,
+                    **delivery_metadata,
                 )
             except Exception as exc:
                 try:

@@ -81,6 +81,15 @@ Use:
 
 Upload images through the web UI, rebuild embeddings, and expose `/api/faces/embeddings` over HTTPS/VPN. A separate central dashboard may implement the same API contract instead.
 
+## ERPNext delivery idempotency
+
+Production delivery requires the companion Frappe app under
+`frappe_apps/face_attendance_idempotency`, an authenticated capability probe,
+and approved ERPNext site/fingerprint pins. See
+`docs/erpnext-idempotency.md`. Keep production delivery disabled until the
+atomic same-ID, concurrent-request, and timeout-after-commit checks pass on the
+real ERPNext/HRMS v15 staging site.
+
 ## Commands
 
 See the authoritative [README command reference](README.md#commands).

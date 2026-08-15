@@ -15,19 +15,25 @@ The default remains the compatibility path:
 }
 ```
 
-A staging node can enable the worker with:
+A staging node can enable the worker only after installing and pinning the
+P2-04 ERPNext contract:
 
 ```json
 {
   "delivery_mode": "worker",
   "delivery_worker_enabled": true,
+  "erpnext_idempotency_required": true,
+  "erpnext_expected_site": "approved-site-name",
+  "erpnext_expected_idempotency_fingerprint": "64-lowercase-hex-characters",
   "attach_checkin_crop": false
 }
 ```
 
-Production worker mode is intentionally blocked until `P2-04` verifies an
-ERPNext-side atomic `face_attendance_delivery_id` contract. The worker does not
-claim exactly-once delivery before that dependency exists.
+Production delivery is blocked unless the companion Frappe app exposes the
+approved atomic delivery-ID contract. Static configuration is not enough: the
+worker performs an authenticated capability probe before claiming work and
+immutably binds every job to the verified site, app/version, method, contract,
+and fingerprint. See `docs/erpnext-idempotency.md`.
 
 `attach_checkin_crop` must remain false in worker mode until `P2-05` creates a
 separate durable attachment job. A crop upload failure must never downgrade a
@@ -50,7 +56,9 @@ Immediately before calling ERPNext it records `submission_started_at`. This is
 the crash boundary:
 
 - an expired lease with no submission timestamp is safe to requeue;
-- an expired lease after submission starts becomes `uncertain`;
+- an expired lease after submission starts becomes `retry_wait` only when the
+  job already carries a verified P2-04 contract binding; otherwise it becomes
+  `uncertain`;
 - an uncertain job is never retried automatically.
 
 The worker renews its lease while the adapter call is active. Every completion
@@ -70,12 +78,16 @@ Retries use bounded exponential backoff with configurable jitter:
 }
 ```
 
-Before server-side idempotency is available, only failures known to be safe are
-retried automatically. Current safe cases are connection establishment timeout
-and an explicit HTTP `429` response. Validation/configuration failures become
-`permanent_failure`. Read timeout, connection loss, ambiguous HTTP responses,
-lease-heartbeat loss, and local failure after remote success become
+Without a verified server binding, only failures known to occur before a remote
+commit are retried automatically. Read timeout, connection loss, ambiguous HTTP
+responses, lease-heartbeat loss, and local failure after remote success remain
 `uncertain`.
+
+With a verified P2-04 binding, those ambiguous outcomes can be replayed with the
+same immutable delivery ID. ERPNext either creates the Employee Checkin once or
+returns the existing matching document. A delivery-ID payload conflict,
+capability drift, authentication failure, or invalid payload remains a permanent
+failure.
 
 `P2-07` will expand the classifier and operational error taxonomy. It must not
 weaken the conservative timeout behavior established here.
@@ -123,9 +135,12 @@ On startup and before each batch, the worker recovers expired delivery leases:
 
 - pre-submission lease expiry -> immediate `retry_wait`, subject to the retry
   budget;
-- post-submission lease expiry -> `uncertain` and attendance policy uncertainty;
+- post-submission lease expiry with verified idempotency -> bounded
+  `retry_wait`;
+- post-submission lease expiry without verified idempotency -> `uncertain` and
+  attendance policy uncertainty;
 - exhausted pre-submission retry budget -> `permanent_failure`.
 
-An operator must reconcile uncertain jobs against ERPNext after `P2-08` is
-implemented. Until then, no automatic retry or manual force-delivery command is
-provided for uncertain work.
+An operator must reconcile genuinely uncertain or contract-conflicting jobs
+against ERPNext after `P2-08` is implemented. Until then, no manual
+force-delivery command is provided for uncertain work.

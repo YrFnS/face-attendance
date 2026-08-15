@@ -309,7 +309,14 @@ Audited reprocess, quarantine-resolution, and dismissal commands require an acto
 
 ### Event identity and replay retention
 
-Runtime schema version 5 stores domain-separated capture, event, recognition-decision, and future ERPNext delivery IDs. A minimal camera/content tombstone is written with every receipt and survives detailed event pruning, so an old upload does not become eligible again merely because its verbose history expired. Frozen synthetic databases for released schema versions 1–4 exercise the real backup-before-migrate path. See `docs/event-identity-tombstones.md`.
+Runtime schema version 8 retains domain-separated capture, event,
+recognition-decision, and ERPNext delivery IDs; durable delivery jobs; leased
+worker state; and immutable ERPNext idempotency-contract evidence. A minimal
+camera/content tombstone is written with every receipt and survives detailed
+event pruning, so an old upload does not become eligible again merely because
+its verbose history expired. Frozen synthetic databases for released schema
+versions 1–4 exercise the real backup-before-migrate path. See
+`docs/event-identity-tombstones.md` and `docs/runtime-state-migrations.md`.
 
 ## Durable delivery worker (P2-03)
 
@@ -317,6 +324,20 @@ Accepted recognition decisions can now be drained by `delivery_service.py` using
 renewable SQLite leases, bounded exponential backoff, jitter, retry budgets, and
 a fail-closed submission boundary. See `docs/delivery-worker.md`.
 
-Worker mode remains non-production until ERPNext-side atomic delivery-ID
-idempotency is implemented in P2-04. The default synchronous compatibility path
-is unchanged.
+## ERPNext atomic delivery idempotency (P2-04)
+
+The companion Frappe app in
+`frappe_apps/face_attendance_idempotency` installs a database-unique Employee
+Checkin delivery ID and exposes one authenticated atomic create-or-get contract
+for both REST and local-bench transports. A verified, site-pinned capability
+allows the worker to replay a timeout after ERPNext committed without creating a
+second Employee Checkin.
+
+Production readiness now requires the approved ERPNext site and capability
+fingerprint. Real ERPNext/HRMS v15 staging installation and timeout-after-commit
+evidence are still required before production activation. See
+`docs/erpnext-idempotency.md`.
+
+The default synchronous compatibility mode remains available outside the strict
+production profile. Worker mode must keep `attach_checkin_crop=false` until
+P2-05 introduces a separate durable attachment job.

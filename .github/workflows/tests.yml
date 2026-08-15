@@ -32,7 +32,10 @@ jobs:
             "requests>=2.32.3,<3" \
             "cryptography>=43,<48"
       - name: Compile Python files
-        run: python -m py_compile *.py
+        run: |
+          python -m py_compile *.py
+          python -m compileall -q \
+            frappe_apps/face_attendance_idempotency/face_attendance_idempotency
       - name: Run lightweight tests
         run: |
           python -m unittest -v \
@@ -55,6 +58,8 @@ jobs:
             test_runtime_schema_fixtures.py \
             test_erpnext_adapter.py \
             test_delivery_outbox.py \
+            test_delivery_worker.py \
+            test_erpnext_idempotency.py \
             test_h0_credential_auth.py \
             test_web_security.py \
             test_web_admin.py \
@@ -68,5 +73,18 @@ jobs:
         run: |
           python -m json.tool config.example.json >/dev/null
           python -m json.tool tests/fixtures/manifest.json >/dev/null
+          python - <<'PY'
+          import tomllib
+          from pathlib import Path
+
+          app = Path("frappe_apps/face_attendance_idempotency")
+          metadata = tomllib.loads((app / "pyproject.toml").read_text())
+          assert metadata["project"]["name"] == "face-attendance-idempotency"
+          assert (app / "face_attendance_idempotency" / "api.py").is_file()
+          assert (app / "face_attendance_idempotency" / "install.py").is_file()
+          assert (app / "MANIFEST.in").is_file()
+          PY
           bash -n install_linux.sh
           bash -n deploy/firewall/ufw-rules.example.sh
+          test -s docs/erpnext-idempotency.md
+          grep -F -- '- [x] `P2-04`' docs/attendance-platform-plan.md

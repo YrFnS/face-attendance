@@ -20,6 +20,13 @@ from delivery_outbox import (
     DELIVERY_WORKER_SCHEMA_STATEMENTS,
     DeliveryOutboxMixin,
 )
+from erpnext_idempotency import (
+    IDEMPOTENCY_REQUIRED_INDEXES,
+    IDEMPOTENCY_REQUIRED_TABLE_COLUMNS,
+    IDEMPOTENCY_REQUIRED_TRIGGERS,
+    IDEMPOTENCY_SCHEMA_STATEMENTS,
+    ERPNextIdempotencyMixin,
+)
 from event_identity import (
     IDENTITY_REQUIRED_INDEXES,
     IDENTITY_REQUIRED_TABLE_COLUMNS,
@@ -50,7 +57,7 @@ from processing_recovery import (
 )
 
 
-RUNTIME_SCHEMA_VERSION = 7
+RUNTIME_SCHEMA_VERSION = 8
 MIGRATION_TABLE = "schema_migrations"
 DEFAULT_BACKUP_DIRECTORY = "runtime_state_backups"
 
@@ -212,6 +219,11 @@ MIGRATIONS = (
         7,
         "leased_delivery_worker",
         DELIVERY_WORKER_SCHEMA_STATEMENTS,
+    ),
+    Migration(
+        8,
+        "verified_erpnext_delivery_idempotency",
+        IDEMPOTENCY_SCHEMA_STATEMENTS,
     ),
 )
 MIGRATION_BY_VERSION = {migration.version: migration for migration in MIGRATIONS}
@@ -414,6 +426,11 @@ def _required_schema_errors(connection, version=None):
             table_requirements.setdefault(table, {}).update(columns)
         index_requirements.update(DELIVERY_WORKER_REQUIRED_INDEXES)
         trigger_requirements.update(DELIVERY_WORKER_REQUIRED_TRIGGERS)
+    if version >= 8:
+        for table, columns in IDEMPOTENCY_REQUIRED_TABLE_COLUMNS.items():
+            table_requirements.setdefault(table, {}).update(columns)
+        index_requirements.update(IDEMPOTENCY_REQUIRED_INDEXES)
+        trigger_requirements.update(IDEMPOTENCY_REQUIRED_TRIGGERS)
 
     errors = []
     for table, required in table_requirements.items():
@@ -863,6 +880,7 @@ def restore_runtime_backup(
 
 
 class RuntimeState(
+    ERPNextIdempotencyMixin,
     DeliveryOutboxMixin,
     EventOperationsMixin,
     ProcessingRecoveryMixin,

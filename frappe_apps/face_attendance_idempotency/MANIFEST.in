@@ -1,0 +1,8 @@
+include MANIFEST.in
+include README.md
+include license.txt
+include pyproject.toml
+recursive-include face_attendance_idempotency *.py
+recursive-include face_attendance_idempotency *.txt
+recursive-exclude face_attendance_idempotency *.pyc
+recursive-exclude face_attendance_idempotency __pycache__

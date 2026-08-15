@@ -63,6 +63,8 @@ class DeliveryWorkerTests(unittest.TestCase):
             retry_jitter_fraction=0.0,
             queue_max_active_jobs=100,
             queue_min_free_bytes=0,
+            idempotency_required=False,
+            idempotency_probe_cache_seconds=300.0,
         )
 
     def tearDown(self):
@@ -152,9 +154,9 @@ class DeliveryWorkerTests(unittest.TestCase):
             logger=lambda _message: None,
         )
 
-    def test_schema_v7_has_worker_submission_boundary(self):
-        self.assertEqual(RUNTIME_SCHEMA_VERSION, 7)
-        self.assertEqual(self.state.migration_status()["schema_version"], 7)
+    def test_schema_v8_has_worker_submission_boundary(self):
+        self.assertEqual(RUNTIME_SCHEMA_VERSION, 8)
+        self.assertEqual(self.state.migration_status()["schema_version"], 8)
         connection = sqlite3.connect(self.state.path)
         try:
             columns = {
@@ -217,7 +219,9 @@ class DeliveryWorkerTests(unittest.TestCase):
         text = "\n".join(issues)
         self.assertIn("delivery_worker_enabled", text)
         self.assertIn("attach_checkin_crop", text)
-        self.assertIn("P2-04", text)
+        self.assertIn("erpnext_idempotency_required", text)
+        self.assertIn("erpnext_expected_site", text)
+        self.assertIn("erpnext_expected_idempotency_fingerprint", text)
 
     def test_claim_is_exclusive_and_pre_submission_expiry_requeues(self):
         self.prepare_job()

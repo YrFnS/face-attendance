@@ -1,0 +1,19 @@
+[project]
+name = "face-attendance-idempotency"
+version = "1.0.0"
+authors = [
+  { name = "Face Attendance maintainers" }
+]
+description = "Atomic Employee Checkin idempotency bridge for face-attendance"
+requires-python = ">=3.10"
+readme = "README.md"
+license = { text = "MIT" }
+dependencies = []
+
+[build-system]
+requires = ["flit_core >=3.4,<4"]
+build-backend = "flit_core.buildapi"
+
+[tool.bench.frappe-dependencies]
+frappe = ">=15.0.0,<16.0.0"
+erpnext = ">=15.0.0,<16.0.0"

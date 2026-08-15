@@ -150,14 +150,16 @@ Delivery jobs cannot be directly deleted. A future retention policy must be
 introduced through a separately reviewed migration rather than ordinary event
 cleanup.
 
-## Next slice
+## ERPNext boundary
 
-`P2-03` will add a single-node delivery worker with renewable leases, bounded
-exponential backoff, jitter, retry budgets, and queue/disk safeguards.
+P2-04 adds the companion Frappe app and authenticated capability proof described
+in `docs/erpnext-idempotency.md`. A delivery job is bound to the verified ERPNext
+site and contract before submission. This makes response loss and restart after
+commit safely replayable with the same immutable delivery ID.
 
-`P2-04` must add the ERPNext-side atomic idempotency dependency keyed by
-`face_attendance_delivery_id`. Until that server-enforced dependency exists, the
-system must not claim exactly-once delivery.
+Jobs without that verified binding retain the conservative P2-03 behavior:
+ambiguous post-submit outcomes become `uncertain` rather than automatically
+retrying.
 
 ## P2-03 leased worker
 
@@ -166,3 +168,10 @@ single-node worker claims due jobs atomically, renews its lease during ERPNext
 calls, retries only provably safe failures, and marks ambiguous post-submission
 outcomes `uncertain`. Full configuration and operations are documented in
 `docs/delivery-worker.md`.
+
+## P2-04 verified idempotency
+
+Schema version 8 stores the approved ERPNext site, app/version, idempotency
+contract, create method, capability fingerprint, and verification timestamp on
+the delivery job. The binding becomes immutable after first use. A populated
+schema-7 database is backed up and verified before migration.
