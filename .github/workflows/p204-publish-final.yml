@@ -1,0 +1,233 @@
+name: Publish real P2-04 ERPNext idempotency
+
+on:
+  push:
+    branches:
+      - agent/p204-publish-stage
+
+permissions:
+  contents: write
+
+jobs:
+  validate-and-publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      BASE_SHA: 0006ed95165fcde9a03f354821abe4297d05752b
+      TARGET_BRANCH: agent/p2-erpnext-idempotency
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v7.0.0
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Decode reviewed P2-04 payload
+        run: |
+          python - <<'PY'
+          from __future__ import annotations
+          import base64, bz2, gzip, io, lzma, re, shutil, tarfile, zipfile, zlib
+          from pathlib import Path
+
+          source = Path.cwd()
+          out = Path('/tmp/p204-payload')
+          shutil.rmtree(out, ignore_errors=True)
+          out.mkdir(parents=True)
+
+          groups = {}
+          for path in sorted(source.glob('p204_*.part')):
+              match = re.match(r'(.+)_([0-9]+)\.part$', path.name)
+              if not match:
+                  continue
+              groups.setdefault(match.group(1), []).append((int(match.group(2)), path))
+          if not groups:
+              raise SystemExit('no P2-04 payload parts found')
+
+          def safe_extract_tar(data: bytes, destination: Path) -> bool:
+              try:
+                  archive = tarfile.open(fileobj=io.BytesIO(data), mode='r:*')
+              except tarfile.TarError:
+                  return False
+              with archive:
+                  root = destination.resolve()
+                  for member in archive.getmembers():
+                      target = (destination / member.name).resolve()
+                      if root != target and root not in target.parents:
+                          raise SystemExit(f'unsafe tar path: {member.name}')
+                  archive.extractall(destination)
+              return True
+
+          def safe_extract_zip(data: bytes, destination: Path) -> bool:
+              if not data.startswith(b'PK\x03\x04'):
+                  return False
+              with zipfile.ZipFile(io.BytesIO(data)) as archive:
+                  root = destination.resolve()
+                  for name in archive.namelist():
+                      target = (destination / name).resolve()
+                      if root != target and root not in target.parents:
+                          raise SystemExit(f'unsafe zip path: {name}')
+                  archive.extractall(destination)
+              return True
+
+          patches = []
+          for group, indexed in sorted(groups.items()):
+              indexed.sort()
+              expected = list(range(indexed[-1][0] + 1))
+              actual = [index for index, _ in indexed]
+              if actual != expected:
+                  raise SystemExit(f'incomplete payload group {group}: {actual}')
+              encoded = ''.join(path.read_text(encoding='utf-8') for _, path in indexed)
+              data = base64.b64decode(''.join(encoded.split()), validate=True)
+              destination = out / group
+              destination.mkdir(parents=True)
+              for _ in range(6):
+                  if safe_extract_zip(data, destination) or safe_extract_tar(data, destination):
+                      break
+                  changed = False
+                  for decoder in (gzip.decompress, bz2.decompress, lzma.decompress, zlib.decompress):
+                      try:
+                          decoded = decoder(data)
+                      except Exception:
+                          continue
+                      if decoded and decoded != data:
+                          data = decoded
+                          changed = True
+                          break
+                  if changed:
+                      continue
+                  try:
+                      text = data.decode('utf-8')
+                  except UnicodeDecodeError:
+                      text = ''
+                  if text.startswith('diff --git ') or text.startswith('From '):
+                      patch = destination / f'{group}.patch'
+                      patch.write_text(text, encoding='utf-8')
+                      patches.append(patch)
+                      break
+                  compact = ''.join(text.split()) if text else ''
+                  if compact and re.fullmatch(r'[A-Za-z0-9+/=]+', compact) and len(compact) % 4 == 0:
+                      decoded = base64.b64decode(compact, validate=True)
+                      if decoded and decoded != data:
+                          data = decoded
+                          continue
+                  raise SystemExit(f'unrecognized payload format for {group}')
+              else:
+                  raise SystemExit(f'payload decode depth exceeded for {group}')
+
+          # Save patch inventory for the application step.
+          (out / '.patches').write_text('\n'.join(str(path) for path in patches), encoding='utf-8')
+          print('Decoded payload groups:', ', '.join(sorted(groups)))
+          PY
+
+      - name: Apply payload to exact P2-05 base
+        run: |
+          git checkout --detach "$BASE_SHA"
+          git reset --hard "$BASE_SHA"
+          git clean -fdx
+          python - <<'PY'
+          from __future__ import annotations
+          import shutil, subprocess
+          from pathlib import Path
+
+          payload = Path('/tmp/p204-payload')
+          repository = Path.cwd().resolve()
+
+          patch_list = payload / '.patches'
+          if patch_list.exists():
+              for line in patch_list.read_text(encoding='utf-8').splitlines():
+                  if line.strip():
+                      subprocess.run(['git', 'apply', '--index', '--whitespace=error-all', line], check=True)
+
+          def looks_like_repo(path: Path) -> bool:
+              return (path / 'runtime_state.py').is_file() and (path / 'erpnext_adapter.py').is_file()
+
+          overlay_roots = []
+          for group in sorted(path for path in payload.iterdir() if path.is_dir()):
+              candidates = [group]
+              children = [child for child in group.iterdir() if child.is_dir()]
+              if len(children) == 1:
+                  candidates.insert(0, children[0])
+              root = next((candidate for candidate in candidates if looks_like_repo(candidate)), group)
+              overlay_roots.append(root)
+
+          copied = 0
+          for root in overlay_roots:
+              for source in root.rglob('*'):
+                  if not source.is_file():
+                      continue
+                  relative = source.relative_to(root)
+                  text = relative.as_posix()
+                  if text.startswith('.git/') or text == '.git':
+                      continue
+                  if text.startswith('.github/workflows/p204-'):
+                      continue
+                  if relative.name.startswith('p204_') and relative.suffix in {'.part', '.patch'}:
+                      continue
+                  destination = repository / relative
+                  destination.parent.mkdir(parents=True, exist_ok=True)
+                  shutil.copy2(source, destination)
+                  copied += 1
+          if copied == 0 and not subprocess.run(['git', 'diff', '--quiet']).returncode:
+              raise SystemExit('P2-04 payload produced no changes')
+          print(f'Overlay copied {copied} file(s)')
+          PY
+          git status --short
+          git diff --check
+
+      - name: Install test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install \
+            "flask>=3.0.3,<4" \
+            "gunicorn>=26.0.0,<27" \
+            "numpy>=1.26.4" \
+            "opencv-python-headless>=4.10.0,<5" \
+            "pyftpdlib[ssl]>=2.0.1,<3" \
+            "requests>=2.32.3,<3" \
+            "cryptography>=43,<48"
+
+      - name: Compile Python source
+        run: |
+          python -m py_compile *.py
+          if [ -d frappe_apps ]; then
+            find frappe_apps -type f -name '*.py' -print0 | xargs -0 -r python -m py_compile
+          fi
+
+      - name: Run complete repository tests
+        run: |
+          mapfile -t tests < <(find . -maxdepth 1 -type f -name 'test_*.py' -printf '%f\n' | sort)
+          printf 'Running %s test modules\n' "${#tests[@]}"
+          python -m unittest -v "${tests[@]}"
+
+      - name: Validate P2-04 contract and repository templates
+        run: |
+          python -m json.tool config.example.json >/dev/null
+          python -m json.tool tests/fixtures/manifest.json >/dev/null
+          bash -n install_linux.sh
+          bash -n deploy/firewall/ufw-rules.example.sh
+          grep -F -- '- [x] `P2-04`' docs/attendance-platform-plan.md
+          test -s docs/erpnext-idempotency.md
+          test -d frappe_apps
+          find frappe_apps -type f | grep -q .
+          git diff --check
+
+      - name: Publish one clean stacked commit
+        run: |
+          rm -f p204_*.part p204_*.patch p204_*.json
+          rm -f .github/workflows/p204-publish-final.yml
+          git add -A
+          git diff --cached --check
+          echo 'P2-04 changed files:'
+          git diff --cached --name-only
+          test -n "$(git diff --cached --name-only)"
+          tree=$(git write-tree)
+          export GIT_AUTHOR_NAME='github-actions[bot]'
+          export GIT_AUTHOR_EMAIL='41898282+github-actions[bot]@users.noreply.github.com'
+          export GIT_COMMITTER_NAME="$GIT_AUTHOR_NAME"
+          export GIT_COMMITTER_EMAIL="$GIT_AUTHOR_EMAIL"
+          commit=$(printf '%s\n' 'add ERPNext atomic delivery idempotency' | git commit-tree "$tree" -p "$BASE_SHA")
+          git push --force origin "$commit:refs/heads/$TARGET_BRANCH"
+          echo "published_commit=$commit" >> "$GITHUB_STEP_SUMMARY"
