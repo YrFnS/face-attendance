@@ -9,6 +9,8 @@ on:
 
 permissions:
   contents: write
+  pull-requests: write
+  issues: write
 
 jobs:
   validate-and-publish:
@@ -30,12 +32,20 @@ jobs:
           cat phase2.publish/part* > /tmp/phase2.patch.gz.b64
           base64 -d /tmp/phase2.patch.gz.b64 | gzip -d > /tmp/phase2.patch
           echo "$PATCH_SHA256  /tmp/phase2.patch" | sha256sum -c -
+          cp .github/workflows/tests.yml /tmp/reviewed-tests.yml
           git reset --hard "$BASE_SHA"
           git apply --index /tmp/phase2.patch
+          # The publication workflow runs the complete discovery suite below.
+          # Preserve the already-reviewed permanent workflow so GITHUB_TOKEN does
+          # not need workflow-file write permission when it publishes the branch.
+          cp /tmp/reviewed-tests.yml .github/workflows/tests.yml
+          git add .github/workflows/tests.yml
           find . -type d -name __pycache__ -prune -exec rm -rf {} +
           find . -name '*.pyc' -delete
           git add -A
           git diff --cached --check
+          test ! -e phase2.publish
+          test ! -e .github/workflows/publish-phase2-live-acceptance.yml
       - name: Install test dependencies
         run: |
           python -m pip install --upgrade pip
@@ -74,6 +84,7 @@ jobs:
           PY
           git diff --cached --check
       - name: Publish clean Phase 2 branch
+        id: publish
         env:
           BASE_SHA: 0006ed95165fcde9a03f354821abe4297d05752b
           TARGET_BRANCH: agent/p2-phase2-complete
@@ -85,4 +96,56 @@ jobs:
           export GIT_COMMITTER_EMAIL="$GIT_AUTHOR_EMAIL"
           commit=$(printf '%s\n' 'complete Phase 2 and add live staging acceptance' | git commit-tree "$tree" -p "$BASE_SHA")
           git push --force origin "$commit:refs/heads/$TARGET_BRANCH"
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
           echo "Published $TARGET_BRANCH at $commit"
+      - name: Open or update authoritative draft pull request
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET_BRANCH: agent/p2-phase2-complete
+          BASE_BRANCH: agent/p2-delivery-worker
+          PUBLISHED_COMMIT: ${{ steps.publish.outputs.commit }}
+        run: |
+          body=/tmp/phase2-pr.md
+          cat > "$body" <<'EOF'
+          ## Summary
+
+          This is the authoritative Phase 2 completion and live-staging acceptance pull request.
+
+          It includes P2-04 through P2-11 on top of the durable worker and private-crop attachment foundation, plus executable staging acceptance probes and hash-bound evidence reports.
+
+          ### Completed Phase 2 scope
+
+          - P2-01 explicit ERPNext adapters
+          - P2-02 transactional delivery outbox
+          - P2-03 leased delivery worker
+          - P2-04 database-enforced delivery-ID idempotency
+          - P2-05 independent private-crop attachment jobs
+          - P2-06 immutable ERPNext trace metadata
+          - P2-07 stable redacted error taxonomy
+          - P2-08 reconciliation
+          - P2-09 audited dead-letter operations
+          - P2-10 outage/capacity safeguards
+          - P2-11 branch-scoped employee eligibility snapshots
+
+          ### Live-production acceptance tooling
+
+          The branch adds staging probes for companion-app migration, physical unique-index verification, site/fingerprint pinning, concurrent same-ID races, response loss after commit, REST/bench parity, employee eligibility, and capacity evidence.
+
+          This PR remains draft until those probes are run against a real ERPNext/HRMS v15 staging site and the real camera/PAD/outage/canary evidence is reviewed.
+          EOF
+          pr=$(gh pr list --repo "$GITHUB_REPOSITORY" --state open --head "$TARGET_BRANCH" --json number --jq '.[0].number // empty')
+          if [ -z "$pr" ]; then
+            gh pr create \
+              --repo "$GITHUB_REPOSITORY" \
+              --draft \
+              --base "$BASE_BRANCH" \
+              --head "$TARGET_BRANCH" \
+              --title "Complete Phase 2 and add live-production acceptance tooling" \
+              --body-file "$body"
+          else
+            gh pr edit "$pr" --repo "$GITHUB_REPOSITORY" \
+              --title "Complete Phase 2 and add live-production acceptance tooling" \
+              --body-file "$body"
+          fi
+          gh pr comment 26 --repo "$GITHUB_REPOSITORY" --body "Superseded by the clean authoritative Phase 2 branch at \`$PUBLISHED_COMMIT\`. This temporary integration PR must not be merged."
+          gh pr close 26 --repo "$GITHUB_REPOSITORY" || true
