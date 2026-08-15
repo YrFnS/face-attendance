@@ -1,0 +1,134 @@
+name: Diagnose Phase 2 publication payload
+
+on:
+  push:
+    branches:
+      - agent/p2-live-acceptance-publish
+    paths:
+      - .github/workflows/diagnose-phase2-publication.yml
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          fetch-depth: 0
+      - name: Inspect and reconstruct payload
+        id: reconstruct
+        shell: bash
+        env:
+          BASE_SHA: 0006ed95165fcde9a03f354821abe4297d05752b
+          PATCH_SHA256: 0da08bfe0df549092634cb7f36b91e9737c4b7a2346cb34caaca4300ed3b6a5c
+        run: |
+          set +e
+          out=/tmp/phase2-diagnostic
+          mkdir -p "$out"
+          exec > >(tee "$out/diagnostics.txt") 2>&1
+
+          echo '== repository state =='
+          git status --short
+          git rev-parse HEAD
+          git cat-file -t "$BASE_SHA"
+
+          echo '== payload inventory =='
+          find phase2.publish -maxdepth 1 -type f -printf '%f %s bytes\n' | sort
+          wc -c phase2.publish/part*
+
+          echo '== concatenate =='
+          cat phase2.publish/part* > "$out/phase2.patch.gz.b64"
+          concatenate_status=$?
+          echo "concatenate_status=$concatenate_status"
+          wc -c "$out/phase2.patch.gz.b64"
+
+          echo '== base64 decode =='
+          base64 -d "$out/phase2.patch.gz.b64" > "$out/phase2.patch.gz"
+          decode_status=$?
+          echo "decode_status=$decode_status"
+          if [ -f "$out/phase2.patch.gz" ]; then
+            wc -c "$out/phase2.patch.gz"
+            gzip -t "$out/phase2.patch.gz"
+            gzip_test_status=$?
+            echo "gzip_test_status=$gzip_test_status"
+          else
+            gzip_test_status=99
+          fi
+
+          echo '== decompress =='
+          if [ "$decode_status" -eq 0 ] && [ "$gzip_test_status" -eq 0 ]; then
+            gzip -dc "$out/phase2.patch.gz" > "$out/phase2.patch"
+            decompress_status=$?
+          else
+            decompress_status=99
+          fi
+          echo "decompress_status=$decompress_status"
+          if [ -f "$out/phase2.patch" ]; then
+            wc -c "$out/phase2.patch"
+            actual_sha=$(sha256sum "$out/phase2.patch" | awk '{print $1}')
+            echo "expected_patch_sha256=$PATCH_SHA256"
+            echo "actual_patch_sha256=$actual_sha"
+            if [ "$actual_sha" = "$PATCH_SHA256" ]; then
+              hash_status=0
+            else
+              hash_status=1
+            fi
+          else
+            hash_status=99
+          fi
+          echo "hash_status=$hash_status"
+
+          echo '== apply check =='
+          cp .github/workflows/tests.yml "$out/reviewed-tests.yml"
+          git reset --hard "$BASE_SHA"
+          if [ -f "$out/phase2.patch" ]; then
+            git apply --check --verbose "$out/phase2.patch"
+            apply_check_status=$?
+          else
+            apply_check_status=99
+          fi
+          echo "apply_check_status=$apply_check_status"
+
+          echo '== apply and package clean tree =='
+          if [ "$apply_check_status" -eq 0 ]; then
+            git apply --index "$out/phase2.patch"
+            apply_status=$?
+            echo "apply_status=$apply_status"
+            cp "$out/reviewed-tests.yml" .github/workflows/tests.yml
+            git add .github/workflows/tests.yml
+            find . -type d -name __pycache__ -prune -exec rm -rf {} +
+            find . -name '*.pyc' -delete
+            git add -A
+            git diff --cached --check
+            diff_check_status=$?
+            echo "diff_check_status=$diff_check_status"
+            git diff --cached --stat
+            git diff --cached --name-status > "$out/clean-tree-name-status.txt"
+            tar --exclude=.git -czf "$out/clean-tree.tar.gz" .
+          else
+            apply_status=99
+            diff_check_status=99
+          fi
+
+          printf '%s\n' \
+            "concatenate_status=$concatenate_status" \
+            "decode_status=$decode_status" \
+            "gzip_test_status=$gzip_test_status" \
+            "decompress_status=$decompress_status" \
+            "hash_status=$hash_status" \
+            "apply_check_status=$apply_check_status" \
+            "apply_status=$apply_status" \
+            "diff_check_status=$diff_check_status" \
+            > "$out/status.env"
+
+          exit 0
+      - name: Upload diagnostic bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: phase2-publication-diagnostic
+          path: /tmp/phase2-diagnostic/
+          if-no-files-found: error
+          retention-days: 1
