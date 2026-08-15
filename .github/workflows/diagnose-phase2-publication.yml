@@ -18,117 +18,94 @@ jobs:
       - uses: actions/checkout@v7.0.1
         with:
           fetch-depth: 0
-      - name: Inspect and reconstruct payload
-        id: reconstruct
+      - name: Extract every historical payload chunk
         shell: bash
         env:
-          BASE_SHA: 0006ed95165fcde9a03f354821abe4297d05752b
           PATCH_SHA256: 0da08bfe0df549092634cb7f36b91e9737c4b7a2346cb34caaca4300ed3b6a5c
         run: |
-          set +e
-          out=/tmp/phase2-diagnostic
-          mkdir -p "$out"
-          exec > >(tee "$out/diagnostics.txt") 2>&1
+          set -euo pipefail
+          out=/tmp/phase2-chunk-history
+          mkdir -p "$out/blobs" "$out/commits"
 
-          echo '== repository state =='
-          git status --short
-          git rev-parse HEAD
-          git cat-file -t "$BASE_SHA"
+          git log --all --date=iso-strict --pretty='format:%H %ad %s' -- phase2.publish \
+            > "$out/payload-history.txt"
+          git log --all --raw --no-abbrev --pretty='format:commit %H %s' -- phase2.publish \
+            > "$out/payload-raw-history.txt"
 
-          echo '== payload inventory =='
-          find phase2.publish -maxdepth 1 -type f -printf '%f %s bytes\n' | sort
-          wc -c phase2.publish/part*
+          while read -r commit; do
+            [ -n "$commit" ] || continue
+            commit_dir="$out/commits/$commit"
+            mkdir -p "$commit_dir"
+            git ls-tree -r "$commit" phase2.publish > "$commit_dir/tree.txt" || true
 
-          echo '== concatenate =='
-          cat phase2.publish/part* > "$out/phase2.patch.gz.b64"
-          concatenate_status=$?
-          echo "concatenate_status=$concatenate_status"
-          wc -c "$out/phase2.patch.gz.b64"
+            complete=1
+            : > "$commit_dir/payload.b64"
+            for number in 00 01 02 03 04 05 06 07 08; do
+              path="phase2.publish/part$number"
+              entry=$(git ls-tree "$commit" "$path" || true)
+              if [ -z "$entry" ]; then
+                complete=0
+                echo "missing $path" >> "$commit_dir/status.txt"
+                continue
+              fi
+              blob=$(printf '%s\n' "$entry" | awk '{print $3}')
+              mkdir -p "$out/blobs/part$number"
+              if [ ! -f "$out/blobs/part$number/$blob" ]; then
+                git cat-file blob "$blob" > "$out/blobs/part$number/$blob"
+              fi
+              printf 'part%s %s %s bytes\n' "$number" "$blob" \
+                "$(git cat-file -s "$blob")" >> "$commit_dir/parts.txt"
+              git cat-file blob "$blob" >> "$commit_dir/payload.b64"
+            done
 
-          echo '== base64 decode =='
-          base64 -d "$out/phase2.patch.gz.b64" > "$out/phase2.patch.gz"
-          decode_status=$?
-          echo "decode_status=$decode_status"
-          if [ -f "$out/phase2.patch.gz" ]; then
-            wc -c "$out/phase2.patch.gz"
-            gzip -t "$out/phase2.patch.gz"
-            gzip_test_status=$?
-            echo "gzip_test_status=$gzip_test_status"
-          else
-            gzip_test_status=99
-          fi
+            if [ "$complete" -eq 1 ]; then
+              python - "$commit_dir" "$PATCH_SHA256" <<'PY'
+          import base64
+          import gzip
+          import hashlib
+          import sys
+          from pathlib import Path
 
-          echo '== decompress =='
-          if [ "$decode_status" -eq 0 ] && [ "$gzip_test_status" -eq 0 ]; then
-            gzip -dc "$out/phase2.patch.gz" > "$out/phase2.patch"
-            decompress_status=$?
-          else
-            decompress_status=99
-          fi
-          echo "decompress_status=$decompress_status"
-          if [ -f "$out/phase2.patch" ]; then
-            wc -c "$out/phase2.patch"
-            actual_sha=$(sha256sum "$out/phase2.patch" | awk '{print $1}')
-            echo "expected_patch_sha256=$PATCH_SHA256"
-            echo "actual_patch_sha256=$actual_sha"
-            if [ "$actual_sha" = "$PATCH_SHA256" ]; then
-              hash_status=0
-            else
-              hash_status=1
+          directory = Path(sys.argv[1])
+          expected = sys.argv[2]
+          payload = (directory / "payload.b64").read_bytes()
+          status = []
+          status.append(f"payload_bytes={len(payload)}")
+          try:
+              compressed = base64.b64decode(payload, validate=True)
+              status.append("base64=ok")
+              (directory / "payload.patch.gz").write_bytes(compressed)
+          except Exception as exc:
+              status.append(f"base64=error:{type(exc).__name__}:{exc}")
+              (directory / "status.txt").write_text("\n".join(status) + "\n")
+              raise SystemExit(0)
+          try:
+              patch = gzip.decompress(compressed)
+              status.append("gzip=ok")
+              (directory / "payload.patch").write_bytes(patch)
+          except Exception as exc:
+              status.append(f"gzip=error:{type(exc).__name__}:{exc}")
+              (directory / "status.txt").write_text("\n".join(status) + "\n")
+              raise SystemExit(0)
+          digest = hashlib.sha256(patch).hexdigest()
+          status.append(f"patch_bytes={len(patch)}")
+          status.append(f"sha256={digest}")
+          status.append(f"expected={expected}")
+          status.append(f"match={str(digest == expected).lower()}")
+          (directory / "status.txt").write_text("\n".join(status) + "\n")
+          PY
             fi
-          else
-            hash_status=99
-          fi
-          echo "hash_status=$hash_status"
+          done < <(git log --all --format='%H' -- phase2.publish | awk '!seen[$0]++')
 
-          echo '== apply check =='
-          cp .github/workflows/tests.yml "$out/reviewed-tests.yml"
-          git reset --hard "$BASE_SHA"
-          if [ -f "$out/phase2.patch" ]; then
-            git apply --check --verbose "$out/phase2.patch"
-            apply_check_status=$?
-          else
-            apply_check_status=99
-          fi
-          echo "apply_check_status=$apply_check_status"
-
-          echo '== apply and package clean tree =='
-          if [ "$apply_check_status" -eq 0 ]; then
-            git apply --index "$out/phase2.patch"
-            apply_status=$?
-            echo "apply_status=$apply_status"
-            cp "$out/reviewed-tests.yml" .github/workflows/tests.yml
-            git add .github/workflows/tests.yml
-            find . -type d -name __pycache__ -prune -exec rm -rf {} +
-            find . -name '*.pyc' -delete
-            git add -A
-            git diff --cached --check
-            diff_check_status=$?
-            echo "diff_check_status=$diff_check_status"
-            git diff --cached --stat
-            git diff --cached --name-status > "$out/clean-tree-name-status.txt"
-            tar --exclude=.git -czf "$out/clean-tree.tar.gz" .
-          else
-            apply_status=99
-            diff_check_status=99
-          fi
-
-          printf '%s\n' \
-            "concatenate_status=$concatenate_status" \
-            "decode_status=$decode_status" \
-            "gzip_test_status=$gzip_test_status" \
-            "decompress_status=$decompress_status" \
-            "hash_status=$hash_status" \
-            "apply_check_status=$apply_check_status" \
-            "apply_status=$apply_status" \
-            "diff_check_status=$diff_check_status" \
-            > "$out/status.env"
-
-          exit 0
-      - name: Upload diagnostic bundle
+          find "$out/blobs" -type f -printf '%P %s bytes\n' | sort \
+            > "$out/blob-inventory.txt"
+          find "$out/commits" -name status.txt -print -exec sh -c \
+            'echo "--- $1"; cat "$1"' sh {} \; \
+            > "$out/commit-statuses.txt"
+      - name: Upload chunk history
         uses: actions/upload-artifact@v4
         with:
-          name: phase2-publication-diagnostic
-          path: /tmp/phase2-diagnostic/
+          name: phase2-chunk-history
+          path: /tmp/phase2-chunk-history/
           if-no-files-found: error
           retention-days: 1
