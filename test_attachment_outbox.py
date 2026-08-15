@@ -270,7 +270,7 @@ class AttachmentOutboxTests(unittest.TestCase):
         migrated = RuntimeState(
             previous, backup_dir=self.root / "schema-v7-backups"
         )
-        self.assertEqual(migrated.migration_status()["schema_version"], 8)
+        self.assertEqual(migrated.migration_status()["schema_version"], 9)
         self.assertIsNotNone(migrated.last_migration_backup)
         backup = verify_runtime_backup(migrated.last_migration_backup["path"])
         self.assertTrue(backup["ok"], backup)
@@ -278,9 +278,9 @@ class AttachmentOutboxTests(unittest.TestCase):
         self.assertIsNotNone(migrated.delivery_job_for_decision(decision_id))
         self.assertIsNone(migrated.attachment_job_for_decision(decision_id))
 
-    def test_schema_v8_has_attachment_jobs_and_guards(self):
-        self.assertEqual(RUNTIME_SCHEMA_VERSION, 8)
-        self.assertEqual(self.state.migration_status()["schema_version"], 8)
+    def test_schema_v9_has_attachment_jobs_and_guards(self):
+        self.assertEqual(RUNTIME_SCHEMA_VERSION, 9)
+        self.assertEqual(self.state.migration_status()["schema_version"], 9)
         connection = sqlite3.connect(self.state.path)
         try:
             tables = {

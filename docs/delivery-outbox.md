@@ -144,14 +144,16 @@ Delivery jobs cannot be directly deleted. A future retention policy must be
 introduced through a separately reviewed migration rather than ordinary event
 cleanup.
 
-## Next slice
+## ERPNext boundary
 
-`P2-03` will add a single-node delivery worker with renewable leases, bounded
-exponential backoff, jitter, retry budgets, and queue/disk safeguards.
+P2-04 adds the companion Frappe app and authenticated capability proof described
+in `docs/erpnext-idempotency.md`. A delivery job is bound to the verified ERPNext
+site and contract before submission. This makes response loss and restart after
+commit safely replayable with the same immutable delivery ID.
 
-`P2-04` must add the ERPNext-side atomic idempotency dependency keyed by
-`face_attendance_delivery_id`. Until that server-enforced dependency exists, the
-system must not claim exactly-once delivery.
+Jobs without that verified binding retain the conservative P2-03 behavior:
+ambiguous post-submit outcomes become `uncertain` rather than automatically
+retrying.
 
 ## P2-03 leased worker
 
@@ -162,6 +164,20 @@ outcomes `uncertain`. Full configuration and operations are documented in
 `docs/delivery-worker.md`.
 
 
+## P2-04 verified idempotency
+
+The P2-04 schema-8 history stores the approved ERPNext site, app/version,
+idempotency contract, create method, capability fingerprint, and verification
+timestamp on the delivery job. The binding becomes immutable after first use.
+
 ## P2-05 private attachment outbox
 
-Schema version 8 adds `attachment_jobs`. An accepted decision can insert its delivery and attachment jobs in the same SQLite transaction. The crop is copied into a protected spool before the transaction, and the job remains unclaimable until the parent Employee Checkin job is delivered. Attachment failure has no state transition on the parent delivery job. See `docs/attachment-jobs.md`.
+The independently developed P2-05 schema-8 history adds `attachment_jobs`. An
+accepted decision can insert its delivery and attachment jobs in the same
+SQLite transaction. The crop is copied into a protected spool before the
+transaction, and the job remains unclaimable until the parent Employee Checkin
+job is delivered. Attachment failure has no state transition on the parent
+delivery job. See `docs/attachment-jobs.md`.
+
+Runtime schema version 9 recognizes either exact checksum-bound schema-8
+history, backs it up, and adds the missing half so both guarantees are present.

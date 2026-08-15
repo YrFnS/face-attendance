@@ -159,6 +159,20 @@ class ProductionReadinessTests(unittest.TestCase):
             "web_max_forwarded_hops": 8,
             "frappe_url": "https://erp.example.test",
             "allow_insecure_frappe_url": False,
+            "erpnext_idempotency_required": True,
+            "erpnext_idempotency_contract_version": (
+                "face-attendance/erpnext-checkin-idempotency/v1"
+            ),
+            "erpnext_idempotency_create_method": (
+                "face_attendance_idempotency.api."
+                "create_or_get_employee_checkin"
+            ),
+            "erpnext_idempotency_probe_method": (
+                "face_attendance_idempotency.api.get_contract"
+            ),
+            "erpnext_expected_site": "erp.example.test",
+            "erpnext_expected_idempotency_fingerprint": "f" * 64,
+            "erpnext_idempotency_probe_cache_seconds": 300,
             "ftp_tls_enabled": True,
             "ftp_tls_certfile": str(self.cert),
             "ftp_tls_keyfile": str(self.key),
@@ -280,6 +294,25 @@ class ProductionReadinessTests(unittest.TestCase):
         self.assertTrue(
             report.gallery["release_validation"]["verified"]
         )
+
+    def test_missing_erpnext_idempotency_proof_is_blocked(self):
+        cfg = self.valid_config()
+        cfg.update(
+            erpnext_idempotency_required=False,
+            erpnext_expected_site="",
+            erpnext_expected_idempotency_fingerprint="",
+        )
+        report = self.report(cfg, verify_model_files=False)
+        issues = [
+            issue.message
+            for issue in report.blockers
+            if issue.code == "delivery_worker_configuration_invalid"
+        ]
+        self.assertTrue(issues)
+        text = " ".join(issues)
+        self.assertIn("erpnext_idempotency_required", text)
+        self.assertIn("erpnext_expected_site", text)
+        self.assertIn("erpnext_expected_idempotency_fingerprint", text)
 
     def test_missing_pad_provider_and_model_pins_are_blocked(self):
         cfg = self.valid_config()

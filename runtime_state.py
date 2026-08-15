@@ -27,6 +27,13 @@ from delivery_outbox import (
     DELIVERY_WORKER_SCHEMA_STATEMENTS,
     DeliveryOutboxMixin,
 )
+from erpnext_idempotency import (
+    IDEMPOTENCY_REQUIRED_INDEXES,
+    IDEMPOTENCY_REQUIRED_TABLE_COLUMNS,
+    IDEMPOTENCY_REQUIRED_TRIGGERS,
+    IDEMPOTENCY_SCHEMA_STATEMENTS,
+    ERPNextIdempotencyMixin,
+)
 from event_identity import (
     IDENTITY_REQUIRED_INDEXES,
     IDENTITY_REQUIRED_TABLE_COLUMNS,
@@ -57,7 +64,7 @@ from processing_recovery import (
 )
 
 
-RUNTIME_SCHEMA_VERSION = 8
+RUNTIME_SCHEMA_VERSION = 9
 MIGRATION_TABLE = "schema_migrations"
 DEFAULT_BACKUP_DIRECTORY = "runtime_state_backups"
 
@@ -200,6 +207,18 @@ BASELINE_SCHEMA_STATEMENTS = (
 )
 
 
+ATTACHMENT_OUTBOX_MIGRATION_V8 = Migration(
+    8,
+    "separate_private_attachment_outbox",
+    ATTACHMENT_OUTBOX_SCHEMA_STATEMENTS,
+)
+IDEMPOTENCY_MIGRATION_V8 = Migration(
+    8,
+    "verified_erpnext_delivery_idempotency",
+    IDEMPOTENCY_SCHEMA_STATEMENTS,
+)
+
+
 MIGRATIONS = (
     Migration(1, "baseline_runtime_state", BASELINE_SCHEMA_STATEMENTS),
     Migration(2, "versioned_event_ledger", LEDGER_SCHEMA_STATEMENTS),
@@ -220,13 +239,25 @@ MIGRATIONS = (
         "leased_delivery_worker",
         DELIVERY_WORKER_SCHEMA_STATEMENTS,
     ),
+    ATTACHMENT_OUTBOX_MIGRATION_V8,
     Migration(
-        8,
-        "separate_private_attachment_outbox",
-        ATTACHMENT_OUTBOX_SCHEMA_STATEMENTS,
+        9,
+        "unify_parallel_delivery_schema_v8",
+        ATTACHMENT_OUTBOX_SCHEMA_STATEMENTS + IDEMPOTENCY_SCHEMA_STATEMENTS,
     ),
 )
 MIGRATION_BY_VERSION = {migration.version: migration for migration in MIGRATIONS}
+MIGRATION_IDENTITIES = {
+    migration.version: {(migration.name, migration.checksum)}
+    for migration in MIGRATIONS
+}
+# P2-04 and P2-05 were developed independently and both shipped a valid
+# schema version 8. Accept either exact, checksum-bound history and converge
+# them through migration 9. Unknown names or modified checksums still fail
+# closed.
+MIGRATION_IDENTITIES[8].add(
+    (IDEMPOTENCY_MIGRATION_V8.name, IDEMPOTENCY_MIGRATION_V8.checksum)
+)
 
 
 # Column specifications are (declared_type, not_null, primary_key_position).
@@ -369,16 +400,17 @@ def _schema_version(connection):
         )
     for row in history:
         version = int(row["version"])
-        expected_migration = MIGRATION_BY_VERSION.get(version)
-        if expected_migration is None:
+        identities = MIGRATION_IDENTITIES.get(version)
+        if identities is None:
             raise RuntimeStateMigrationError(
                 f"database contains unknown migration version {version}"
             )
-        if row["name"] != expected_migration.name:
+        accepted_names = {name for name, _checksum in identities}
+        if row["name"] not in accepted_names:
             raise RuntimeStateMigrationError(
                 f"migration {version} name mismatch: {row['name']!r}"
             )
-        if row["checksum"] != expected_migration.checksum:
+        if (row["name"], row["checksum"]) not in identities:
             raise RuntimeStateMigrationError(
                 f"migration {version} checksum mismatch"
             )
@@ -390,7 +422,7 @@ def _schema_version(connection):
     return current, history
 
 
-def _required_schema_errors(connection, version=None):
+def _required_schema_errors(connection, version=None, migration_name=None):
     version = RUNTIME_SCHEMA_VERSION if version is None else int(version)
     table_requirements = {
         table: dict(columns) for table, columns in REQUIRED_TABLE_COLUMNS.items()
@@ -426,11 +458,32 @@ def _required_schema_errors(connection, version=None):
             table_requirements.setdefault(table, {}).update(columns)
         index_requirements.update(DELIVERY_WORKER_REQUIRED_INDEXES)
         trigger_requirements.update(DELIVERY_WORKER_REQUIRED_TRIGGERS)
-    if version >= 8:
+    require_attachments = version >= 9
+    require_idempotency = version >= 9
+    if version == 8:
+        if migration_name is None:
+            history = _migration_history(connection)
+            if history and int(history[-1]["version"]) == 8:
+                migration_name = history[-1]["name"]
+        if migration_name == ATTACHMENT_OUTBOX_MIGRATION_V8.name:
+            require_attachments = True
+        elif migration_name == IDEMPOTENCY_MIGRATION_V8.name:
+            require_idempotency = True
+        else:
+            return [
+                "schema version 8 has an unknown migration identity: "
+                f"{migration_name!r}"
+            ]
+    if require_attachments:
         for table, columns in ATTACHMENT_OUTBOX_REQUIRED_TABLE_COLUMNS.items():
             table_requirements.setdefault(table, {}).update(columns)
         index_requirements.update(ATTACHMENT_OUTBOX_REQUIRED_INDEXES)
         trigger_requirements.update(ATTACHMENT_OUTBOX_REQUIRED_TRIGGERS)
+    if require_idempotency:
+        for table, columns in IDEMPOTENCY_REQUIRED_TABLE_COLUMNS.items():
+            table_requirements.setdefault(table, {}).update(columns)
+        index_requirements.update(IDEMPOTENCY_REQUIRED_INDEXES)
+        trigger_requirements.update(IDEMPOTENCY_REQUIRED_TRIGGERS)
 
     errors = []
     for table, required in table_requirements.items():
@@ -562,7 +615,16 @@ def inspect_runtime_database(path, *, require_latest=False):
             report["errors"].append(str(exc))
             return report
 
-        schema_errors = _required_schema_errors(connection, version=current) if current else []
+        latest_migration_name = history[-1]["name"] if history else None
+        schema_errors = (
+            _required_schema_errors(
+                connection,
+                version=current,
+                migration_name=latest_migration_name,
+            )
+            if current
+            else []
+        )
         report["schema_ok"] = not schema_errors
         report["errors"].extend(schema_errors)
         if require_latest and current != RUNTIME_SCHEMA_VERSION:
@@ -881,6 +943,7 @@ def restore_runtime_backup(
 
 class RuntimeState(
     AttachmentOutboxMixin,
+    ERPNextIdempotencyMixin,
     DeliveryOutboxMixin,
     EventOperationsMixin,
     ProcessingRecoveryMixin,
@@ -968,10 +1031,27 @@ class RuntimeState(
                 raise RuntimeStateMigrationError(
                     f"migration {migration.version} cannot follow schema version {current}"
                 )
-            for statement in migration.statements:
+            statements = migration.statements
+            if migration.version == 9:
+                if not _history or int(_history[-1]["version"]) != 8:
+                    raise RuntimeStateMigrationError(
+                        "schema unification migration requires an exact version 8 history"
+                    )
+                previous_name = _history[-1]["name"]
+                if previous_name == ATTACHMENT_OUTBOX_MIGRATION_V8.name:
+                    statements = IDEMPOTENCY_SCHEMA_STATEMENTS
+                elif previous_name == IDEMPOTENCY_MIGRATION_V8.name:
+                    statements = ATTACHMENT_OUTBOX_SCHEMA_STATEMENTS
+                else:
+                    raise RuntimeStateMigrationError(
+                        "schema unification migration cannot identify the version 8 branch"
+                    )
+            for statement in statements:
                 connection.execute(statement)
             schema_errors = _required_schema_errors(
-                connection, version=migration.version
+                connection,
+                version=migration.version,
+                migration_name=migration.name,
             )
             if schema_errors:
                 raise RuntimeStateMigrationError("; ".join(schema_errors))

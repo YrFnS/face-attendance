@@ -77,8 +77,8 @@ class ReleasedSchemaFixtureTests(unittest.TestCase):
                     state = RuntimeState(database, backup_dir=root / "backups")
                     report = state.migration_status()
                     self.assertTrue(report["ok"], report)
-                    self.assertEqual(report["schema_version"], 8)
-                    self.assertEqual(RUNTIME_SCHEMA_VERSION, 8)
+                    self.assertEqual(report["schema_version"], 9)
+                    self.assertEqual(RUNTIME_SCHEMA_VERSION, 9)
                     self.assertIsNotNone(state.last_migration_backup)
                     backup_report = verify_runtime_backup(
                         state.last_migration_backup["path"]

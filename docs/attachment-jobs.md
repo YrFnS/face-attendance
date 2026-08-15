@@ -43,7 +43,7 @@ A terminal attachment failure is recorded in the same decision transaction so
 the missing audit media is visible without turning a valid attendance decision
 into a failed check-in.
 
-## Schema version 8
+## Attachment schema and version-9 convergence
 
 Migration 8 creates `attachment_jobs`. Each row stores:
 

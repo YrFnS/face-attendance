@@ -124,11 +124,11 @@ class DeliveryOutboxTests(unittest.TestCase):
             decision_version=decision_version,
         )
 
-    def test_schema_v8_has_durable_delivery_jobs(self):
-        self.assertEqual(RUNTIME_SCHEMA_VERSION, 8)
+    def test_schema_v9_has_durable_delivery_jobs(self):
+        self.assertEqual(RUNTIME_SCHEMA_VERSION, 9)
         report = self.state.migration_status()
         self.assertTrue(report["ok"], report)
-        self.assertEqual(report["schema_version"], 8)
+        self.assertEqual(report["schema_version"], 9)
         connection = sqlite3.connect(self.database)
         try:
             tables = {
@@ -414,7 +414,7 @@ class DeliveryOutboxTests(unittest.TestCase):
             previous,
             backup_dir=self.root / "v5-backups",
         )
-        self.assertEqual(migrated.migration_status()["schema_version"], 8)
+        self.assertEqual(migrated.migration_status()["schema_version"], 9)
         self.assertIsNotNone(migrated.last_migration_backup)
         backup = verify_runtime_backup(migrated.last_migration_backup["path"])
         self.assertTrue(backup["ok"], backup)

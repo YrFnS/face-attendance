@@ -15,6 +15,7 @@ from datetime import datetime, timezone
 
 from data_contract import validate_erp_docname
 from event_identity import DELIVERY_ID_SCHEME
+from erpnext_idempotency import job_row_has_verified_idempotency
 
 
 HEX64_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -1038,7 +1039,26 @@ class DeliveryOutboxMixin:
         ).fetchall()
         results = []
         for row in rows:
-            if row["submission_started_at"]:
+            if int(row["attempt_count"]) >= max_attempts:
+                state = "permanent_failure"
+                error_class = "retry_budget_exhausted"
+                error = "delivery retry budget exhausted after lease expiry"
+                next_attempt = 0.0
+                self._policy_release_for_decision_tx(
+                    connection, row["decision_id"]
+                )
+            elif row["submission_started_at"] and job_row_has_verified_idempotency(row):
+                state = "retry_wait"
+                error_class = "delivery_lease_expired_after_idempotent_submission"
+                error = (
+                    "delivery worker lease expired after submission; the verified "
+                    "ERPNext delivery-ID contract permits a safe replay"
+                )
+                next_attempt = now
+                self._policy_extend_for_decision_tx(
+                    connection, row["decision_id"], now + 300.0
+                )
+            elif row["submission_started_at"]:
                 state = "uncertain"
                 error_class = "delivery_lease_expired_after_submission"
                 error = (
@@ -1046,14 +1066,6 @@ class DeliveryOutboxMixin:
                 )
                 next_attempt = 0.0
                 self._policy_uncertain_for_decision_tx(
-                    connection, row["decision_id"]
-                )
-            elif int(row["attempt_count"]) >= max_attempts:
-                state = "permanent_failure"
-                error_class = "retry_budget_exhausted"
-                error = "delivery retry budget exhausted after lease expiry"
-                next_attempt = 0.0
-                self._policy_release_for_decision_tx(
                     connection, row["decision_id"]
                 )
             else:

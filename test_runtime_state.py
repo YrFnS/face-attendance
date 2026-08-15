@@ -11,7 +11,10 @@ from test_event_ledger import EventLedgerTests
 from test_event_operations import EventOperationsTests
 from test_processing_recovery import ProcessingRecoveryTests
 from runtime_state import (
+    ATTACHMENT_OUTBOX_MIGRATION_V8,
+    IDEMPOTENCY_MIGRATION_V8,
     MIGRATION_BY_VERSION,
+    MIGRATIONS,
     RUNTIME_SCHEMA_VERSION,
     Migration,
     RuntimeState,
@@ -123,6 +126,64 @@ class RuntimeStateTests(unittest.TestCase):
             return event_id
         finally:
             connection.close()
+
+    def create_schema_v8_database(self, path, migration):
+        path.unlink(missing_ok=True)
+        connection = sqlite3.connect(path)
+        connection.row_factory = sqlite3.Row
+        try:
+            for item in (*MIGRATIONS[:7], migration):
+                RuntimeState._apply_migration(connection, item)
+        finally:
+            connection.close()
+
+    def test_both_exact_schema_v8_histories_converge_to_v9(self):
+        cases = (
+            ("attachments", ATTACHMENT_OUTBOX_MIGRATION_V8),
+            ("idempotency", IDEMPOTENCY_MIGRATION_V8),
+        )
+        for label, migration in cases:
+            with self.subTest(history=label):
+                database = self.root / f"schema-v8-{label}.sqlite3"
+                backups = self.root / f"schema-v8-{label}-backups"
+                self.create_schema_v8_database(database, migration)
+
+                before = inspect_runtime_database(database, require_latest=False)
+                self.assertTrue(before["ok"], before)
+                self.assertEqual(before["schema_version"], 8)
+                self.assertEqual(
+                    before["migration_history"][-1]["name"], migration.name
+                )
+
+                state = RuntimeState(database, backup_dir=backups)
+                after = state.migration_status()
+                self.assertTrue(after["ok"], after)
+                self.assertEqual(after["schema_version"], 9)
+                self.assertIsNotNone(state.last_migration_backup)
+                backup = verify_runtime_backup(state.last_migration_backup["path"])
+                self.assertTrue(backup["ok"], backup)
+                self.assertEqual(backup["schema_version"], 8)
+
+                connection = sqlite3.connect(database)
+                try:
+                    tables = {
+                        row[0]
+                        for row in connection.execute(
+                            "SELECT name FROM sqlite_master WHERE type='table'"
+                        )
+                    }
+                    delivery_columns = {
+                        row[1]
+                        for row in connection.execute(
+                            "PRAGMA table_info(delivery_jobs)"
+                        )
+                    }
+                finally:
+                    connection.close()
+                self.assertIn("attachment_jobs", tables)
+                self.assertIn(
+                    "erpnext_idempotency_fingerprint", delivery_columns
+                )
 
     def test_schema_version_and_history_are_initialized(self):
         report = self.state.migration_status()

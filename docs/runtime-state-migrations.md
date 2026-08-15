@@ -160,7 +160,7 @@ Backups contain operational and potentially biometric-adjacent metadata. Apply t
 
 ## Current schema generations and frozen compatibility fixtures
 
-The current runtime schema is version 8:
+The current runtime schema is version 9:
 
 - version 1 adopts the original runtime-state tables;
 - version 2 adds normalized events, recognition decisions, transitions, and operator actions;
@@ -168,9 +168,10 @@ The current runtime schema is version 8:
 - version 4 adds audited event inspection/reprocessing metadata and immutable retained-source paths;
 - version 5 adds explicit identifier schemes, accepted-decision delivery IDs, and permanent minimal replay tombstones;
 - version 6 adds durable ERPNext delivery jobs created atomically with accepted recognition decisions;
-- version 7 adds the leased delivery worker submission boundary, retry-delay evidence, pre-submit lease recovery, and post-submit uncertainty;
-- version 8 adds durable private crop attachment jobs, protected spool evidence, independent attachment leases/retries, and terminal attachment retention rules.
+- version 7 adds the leased delivery worker submission boundary, retry-delay evidence, pre-submit lease recovery, and conservative post-submit uncertainty;
+- version 8 has two accepted, exact checksum-bound histories because P2-04 and P2-05 were developed independently: one adds verified ERPNext idempotency evidence, while the other adds durable private attachment jobs;
+- version 9 converges either valid version-8 history by adding the missing schema, so every current database has both guarantees.
 
-Migration 4 preserves existing rows and gives older events blank source/retention paths; an operator must supply `--media-path` before reprocessing one of those migrated events. Migration 5 also preserves historical primary keys, labels them as legacy schemes rather than recomputing them, and backfills one minimal tombstone for every retained event. Migration 6 backfills jobs only for accepted schema-5 decisions that already have a durable delivery ID; it does not fabricate delivery identity for older historical decisions.
+Migration 4 preserves existing rows and gives older events blank source/retention paths; an operator must supply `--media-path` before reprocessing one of those migrated events. Migration 5 also preserves historical primary keys, labels them as legacy schemes rather than recomputing them, and backfills one minimal tombstone for every retained event. Migration 6 backfills jobs only for accepted schema-5 decisions that already have a durable delivery ID; it does not fabricate delivery identity for older historical decisions. Migration 9 accepts only the two known version-8 names with their exact checksums, creates a verified pre-migration backup, and applies only the missing domain schema.
 
-Frozen synthetic databases for released versions 1–4 live under `tests/fixtures/`. Their manifest records the source commit, released migration checksum, raw database digest, compressed digest, and size. Tests materialize those exact committed bytes and run the normal verified backup-before-migrate path to the current schema. See `docs/event-identity-tombstones.md` for the identifier and retention contract and `docs/delivery-outbox.md` for schema 6.
+Frozen synthetic databases for released versions 1–4 live under `tests/fixtures/`. Their manifest records the source commit, released migration checksum, raw database digest, compressed digest, and size. Tests materialize those exact committed bytes and run the normal verified backup-before-migrate path to version 9. Compatibility tests also construct both released version-8 histories and verify that each converges to the same version-9 schema. See `docs/event-identity-tombstones.md` for the identifier and retention contract, `docs/delivery-outbox.md` for the durable queues, and `docs/erpnext-idempotency.md` for the server contract.

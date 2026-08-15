@@ -216,7 +216,7 @@ class ERPNextAdapterTests(unittest.TestCase):
                 return type(
                     "Result",
                     (),
-                    {"docname": "CHK-SAFE-1", "transport": "rest"},
+                    {"docname": "CHK-SAFE-1", "transport": "rest", "created": True},
                 )()
 
             def attach_private_file(self, docname, image_path):
@@ -237,7 +237,7 @@ class ERPNextAdapterTests(unittest.TestCase):
                 ),
                 mock.patch.object(
                     face_attendance,
-                    "RESTERPNextAdapter",
+                    "build_erpnext_adapter",
                     return_value=Adapter(),
                 ),
                 mock.patch.object(face_attendance, "log") as logger,

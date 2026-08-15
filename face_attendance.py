@@ -34,9 +34,8 @@ from data_contract import (
     validate_log_type,
 )
 from erpnext_adapter import (
-    BenchERPNextAdapter,
     EmployeeCheckinRequest,
-    RESTERPNextAdapter,
+    build_erpnext_adapter,
     erp_event_time as adapter_erp_event_time,
     select_erpnext_transport,
 )
@@ -490,19 +489,48 @@ def erpnext_transport_name(cfg=None):
     return select_erpnext_transport(cfg or load_config())
 
 
-def create_checkin_api(employee, log_type, image_path=None, event_time=None):
-    cfg = load_config()
-    adapter = RESTERPNextAdapter(
-        base_url=cfg.get("frappe_url"),
-        api_key=cfg.get("frappe_api_key"),
-        api_secret=cfg.get("frappe_api_secret"),
-        allow_insecure=bool(cfg.get("allow_insecure_frappe_url", False)),
-        session=requests,
-        timeout_seconds=cfg.get("erpnext_request_timeout_seconds", 30),
+def _checkin_request(
+    employee,
+    log_type,
+    event_time=None,
+    *,
+    delivery_id="",
+    event_id="",
+    decision_id="",
+    camera_id="",
+    branch="",
+    delivery_contract_version="",
+):
+    return EmployeeCheckinRequest.build(
+        employee,
+        log_type,
+        event_time,
+        delivery_id=delivery_id,
+        event_id=event_id,
+        decision_id=decision_id,
+        camera_id=camera_id,
+        branch=branch,
+        delivery_contract_version=delivery_contract_version,
     )
-    request = EmployeeCheckinRequest.build(employee, log_type, event_time)
+
+
+def create_checkin_api(
+    employee,
+    log_type,
+    image_path=None,
+    event_time=None,
+    **delivery_metadata,
+):
+    cfg = load_config()
+    adapter = build_erpnext_adapter(cfg, rest_session=requests)
+    request = _checkin_request(
+        employee, log_type, event_time, **delivery_metadata
+    )
     result = adapter.create_employee_checkin(request)
-    log(f"checkin created: {request.employee} {request.log_type} {result.docname}")
+    log(
+        f"checkin created: {request.employee} {request.log_type} "
+        f"{result.docname} created={int(bool(result.created))}"
+    )
     if image_path:
         try:
             adapter.attach_private_file(result.docname, Path(image_path))
@@ -511,15 +539,24 @@ def create_checkin_api(employee, log_type, image_path=None, event_time=None):
                 f"{Path(image_path).name}"
             )
         except Exception as exc:
-            # P2-05: attachment failure never changes a confirmed check-in
-            # into a failed attendance delivery. The durable worker path uses
-            # an attachment job; this compatibility path records the failure.
+            # Attachment failure never changes a confirmed check-in into a
+            # failed attendance delivery. The durable worker path records a
+            # separate attachment job; this compatibility path logs failure.
             log(f"checkin attachment failed after delivery: {exc}")
     return result.docname
 
 
-def create_checkin_bench(employee, log_type, image_path=None, event_time=None):
-    request = EmployeeCheckinRequest.build(employee, log_type, event_time)
+def create_checkin_bench(
+    employee,
+    log_type,
+    image_path=None,
+    event_time=None,
+    **delivery_metadata,
+):
+    cfg = load_config()
+    request = _checkin_request(
+        employee, log_type, event_time, **delivery_metadata
+    )
 
     def attach(docname, path):
         attach_image("Employee Checkin", docname, path)
@@ -528,13 +565,17 @@ def create_checkin_bench(employee, log_type, image_path=None, event_time=None):
     def attachment_failed(exc):
         log(f"checkin attachment failed: {exc}")
 
-    adapter = BenchERPNextAdapter(
-        execute=bench_execute,
-        attach=attach,
-        attachment_error_handler=attachment_failed,
+    adapter = build_erpnext_adapter(
+        cfg,
+        bench_execute=bench_execute,
+        bench_attach=attach,
+        bench_attachment_error_handler=attachment_failed,
     )
     result = adapter.create_employee_checkin(request)
-    log(f"checkin created: {request.employee} {request.log_type} {result.docname}")
+    log(
+        f"checkin created: {request.employee} {request.log_type} "
+        f"{result.docname} created={int(bool(result.created))}"
+    )
     if image_path:
         try:
             adapter.attach_private_file(result.docname, Path(image_path))
@@ -543,12 +584,30 @@ def create_checkin_bench(employee, log_type, image_path=None, event_time=None):
     return result.docname
 
 
-def create_checkin(employee, log_type, image_path=None, event_time=None):
+def create_checkin(
+    employee,
+    log_type,
+    image_path=None,
+    event_time=None,
+    **delivery_metadata,
+):
     cfg = load_config()
     transport = select_erpnext_transport(cfg)
     if transport == "rest":
-        return create_checkin_api(employee, log_type, image_path, event_time)
-    return create_checkin_bench(employee, log_type, image_path, event_time)
+        return create_checkin_api(
+            employee,
+            log_type,
+            image_path,
+            event_time,
+            **delivery_metadata,
+        )
+    return create_checkin_bench(
+        employee,
+        log_type,
+        image_path,
+        event_time,
+        **delivery_metadata,
+    )
 
 
 def create_checkin_with_cooldown(

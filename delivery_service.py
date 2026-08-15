@@ -1,9 +1,9 @@
 """Single-node leased ERPNext delivery worker.
 
 P2-03 drains durable ``delivery_jobs`` created transactionally with accepted
-recognition decisions.  The worker retries only failures that are provably safe
-before ERPNext-side idempotency exists.  Any ambiguous outcome after submission
-starts is preserved as ``uncertain`` for reconciliation.
+recognition decisions. P2-04 permits ambiguous post-submit replay only after the
+job is immutably bound to a live, authenticated ERPNext capability proving the
+database-unique delivery-ID contract. Unverified ambiguity remains ``uncertain``.
 """
 
 from __future__ import annotations
@@ -29,11 +29,19 @@ from attachment_service import (
 from erpnext_adapter import (
     ERPNextAdapter,
     ERPNextAdapterConfigurationError,
+    ERPNextAdapterContractError,
+    ERPNextAdapterConflictError,
     ERPNextAdapterError,
     EmployeeCheckinRequest,
     EmployeeCheckinResult,
     build_erpnext_adapter,
     select_erpnext_transport,
+)
+from erpnext_idempotency import (
+    ERPNextIdempotencyCapability,
+    ERPNextIdempotencyCapabilityError,
+    ERPNextIdempotencyConflictError,
+    idempotency_configuration_issues,
 )
 from runtime_state import RuntimeState, resolve_runtime_path
 from secret_store import ConfigLoadError, load_runtime_config
@@ -77,6 +85,8 @@ class DeliveryWorkerSettings:
     retry_jitter_fraction: float
     queue_max_active_jobs: int
     queue_min_free_bytes: int
+    idempotency_required: bool
+    idempotency_probe_cache_seconds: float
 
 
 def _bool(cfg, key, default, issues):
@@ -182,11 +192,7 @@ def configuration_issues(cfg):
             "delivery_worker_enabled must be true when delivery_mode is worker"
         )
     issues.extend(attachment_configuration_issues(cfg, root=ROOT))
-    if bool(cfg.get("production_mode", False)) and mode == "worker":
-        issues.append(
-            "production worker delivery remains blocked until P2-04 verifies "
-            "ERPNext-side atomic delivery-id idempotency"
-        )
+    issues.extend(idempotency_configuration_issues(cfg))
     return issues
 
 
@@ -214,6 +220,12 @@ def settings_from_config(cfg):
         ),
         queue_min_free_bytes=int(
             cfg.get("delivery_queue_min_free_bytes", 1_073_741_824)
+        ),
+        idempotency_required=bool(
+            cfg.get("erpnext_idempotency_required", False)
+        ),
+        idempotency_probe_cache_seconds=float(
+            cfg.get("erpnext_idempotency_probe_cache_seconds", 300)
         ),
     )
 
@@ -252,7 +264,8 @@ def _retry_after_seconds(response):
     return min(86400.0, max(0.0, result))
 
 
-def classify_delivery_failure(exc):
+def classify_delivery_failure(exc, *, idempotency_verified=False):
+    idempotency_verified = bool(idempotency_verified)
     if isinstance(exc, SafeRetryableDeliveryError):
         return DeliveryFailureClassification(
             "retryable",
@@ -265,6 +278,16 @@ def classify_delivery_failure(exc):
             "retryable",
             "connect_timeout",
             safe_after_submission=True,
+        )
+    if isinstance(exc, ERPNextAdapterConflictError):
+        return DeliveryFailureClassification(
+            "permanent",
+            "erpnext_idempotency_conflict",
+        )
+    if isinstance(exc, ERPNextAdapterContractError):
+        return DeliveryFailureClassification(
+            "permanent",
+            "erpnext_idempotency_contract",
         )
     if isinstance(exc, ERPNextAdapterConfigurationError):
         return DeliveryFailureClassification(
@@ -291,16 +314,46 @@ def classify_delivery_failure(exc):
                 "permanent",
                 f"http_{status}",
             )
+        if idempotency_verified:
+            return DeliveryFailureClassification(
+                "retryable",
+                f"http_{status or 'unknown'}_idempotent_replay",
+                safe_after_submission=True,
+            )
         return DeliveryFailureClassification(
             "uncertain",
             f"http_{status or 'unknown'}_ambiguous",
         )
     if isinstance(exc, requests.ReadTimeout):
+        if idempotency_verified:
+            return DeliveryFailureClassification(
+                "retryable",
+                "read_timeout_idempotent_replay",
+                safe_after_submission=True,
+            )
         return DeliveryFailureClassification("uncertain", "read_timeout")
     if isinstance(exc, requests.ConnectionError):
+        if idempotency_verified:
+            return DeliveryFailureClassification(
+                "retryable",
+                "connection_lost_idempotent_replay",
+                safe_after_submission=True,
+            )
         return DeliveryFailureClassification("uncertain", "connection_lost")
     if isinstance(exc, ERPNextAdapterError):
+        if idempotency_verified:
+            return DeliveryFailureClassification(
+                "retryable",
+                "adapter_response_idempotent_replay",
+                safe_after_submission=True,
+            )
         return DeliveryFailureClassification("uncertain", "adapter_error")
+    if idempotency_verified:
+        return DeliveryFailureClassification(
+            "retryable",
+            "unexpected_idempotent_replay",
+            safe_after_submission=True,
+        )
     return DeliveryFailureClassification(
         "uncertain",
         type(exc).__name__ or "unexpected_delivery_error",
@@ -404,6 +457,8 @@ class DeliveryWorker:
         self.sleep = sleep
         self.random_source = random_source
         self.logger = logger
+        self._idempotency_capability = None
+        self._idempotency_verified_at = 0.0
         host = socket.gethostname().strip() or "unknown-host"
         self.owner = owner or f"delivery:{host}:{uuid.uuid4().hex}"
         self.delivery_enabled = settings.mode == "worker" and settings.enabled
@@ -421,6 +476,36 @@ class DeliveryWorker:
                 root=attachment_root,
             )
 
+    def _ensure_idempotency_contract(self, *, force=False):
+        if not self.settings.idempotency_required:
+            return None
+        now = float(self.clock())
+        if (
+            not force
+            and isinstance(
+                self._idempotency_capability, ERPNextIdempotencyCapability
+            )
+            and now - self._idempotency_verified_at
+            < self.settings.idempotency_probe_cache_seconds
+        ):
+            return self._idempotency_capability
+        verifier = getattr(self.adapter, "verify_idempotency_contract", None)
+        if not callable(verifier):
+            raise DeliveryWorkerConfigurationError(
+                "ERPNext adapter cannot verify the required idempotency contract"
+            )
+        # The worker cache owns the refresh interval. Once it expires, force
+        # the adapter to perform a new authenticated probe rather than returning
+        # its own older in-memory capability.
+        capability = verifier(force=True)
+        if not isinstance(capability, ERPNextIdempotencyCapability):
+            raise DeliveryWorkerConfigurationError(
+                "ERPNext adapter did not return a verified idempotency capability"
+            )
+        self._idempotency_capability = capability
+        self._idempotency_verified_at = now
+        return capability
+
     def recover(self):
         outcomes = {"delivery": [], "attachments": []}
         if self.delivery_enabled:
@@ -433,7 +518,11 @@ class DeliveryWorker:
         return outcomes
 
     def run_once(self, *, max_jobs=None):
+        # Local lease recovery must remain available during an ERPNext outage.
+        # The live capability is required before a new job can be claimed.
         self.recover()
+        if self.delivery_enabled:
+            self._ensure_idempotency_contract()
         default_limit = 0
         if self.delivery_enabled:
             default_limit += self.settings.batch_size
@@ -481,11 +570,52 @@ class DeliveryWorker:
 
     def _process_job(self, job):
         delivery_id = job["delivery_id"]
+        capability = self._ensure_idempotency_contract()
+        if capability is not None:
+            try:
+                job = self.state.bind_delivery_job_idempotency_contract_by_lease(
+                    delivery_id,
+                    owner=self.owner,
+                    capability=capability,
+                    now=self.clock(),
+                )
+            except (
+                ERPNextIdempotencyCapabilityError,
+                ERPNextIdempotencyConflictError,
+            ) as exc:
+                current = self.state.mark_delivery_job_permanent_failure_by_lease(
+                    delivery_id,
+                    owner=self.owner,
+                    error_class="erpnext_idempotency_binding",
+                    error=str(exc),
+                    now=self.clock(),
+                )
+                self.logger(
+                    f"delivery permanent failure id={delivery_id} "
+                    "class=erpnext_idempotency_binding"
+                )
+                return current["state"]
+
         try:
+            metadata = (
+                {
+                    "delivery_id": job["delivery_id"],
+                    "event_id": job["event_id"],
+                    "decision_id": job["decision_id"],
+                    "camera_id": job["camera_id"],
+                    "branch": job["branch"],
+                    "delivery_contract_version": job[
+                        "delivery_contract_version"
+                    ],
+                }
+                if capability is not None
+                else {}
+            )
             request = EmployeeCheckinRequest.build(
                 job["employee"],
                 job["log_type"],
                 job["effective_at"],
+                **metadata,
             )
         except Exception as exc:
             current = self.state.mark_delivery_job_permanent_failure_by_lease(
@@ -511,6 +641,7 @@ class DeliveryWorker:
             # No remote call has happened. Lease recovery can safely requeue it.
             raise
 
+        idempotency_verified = capability is not None
         with LeaseHeartbeat(
             self.state,
             delivery_id=delivery_id,
@@ -519,37 +650,54 @@ class DeliveryWorker:
             interval_seconds=self.settings.heartbeat_seconds,
         ) as heartbeat:
             try:
-                result = self.adapter.create_employee_checkin(request, image_path=None)
+                result = self.adapter.create_employee_checkin(
+                    request, image_path=None
+                )
                 if not isinstance(result, EmployeeCheckinResult):
                     raise ERPNextAdapterError(
                         "ERPNext adapter returned an invalid result"
                     )
+                if idempotency_verified and (
+                    not result.idempotency_verified
+                    or result.delivery_id != delivery_id
+                    or result.erpnext_site != capability.site
+                    or result.idempotency_fingerprint
+                    != capability.fingerprint
+                ):
+                    raise ERPNextAdapterContractError(
+                        "ERPNext result is not bound to the verified delivery contract"
+                    )
             except Exception as exc:
-                classification = classify_delivery_failure(exc)
+                classification = classify_delivery_failure(
+                    exc, idempotency_verified=idempotency_verified
+                )
                 if heartbeat.error is not None:
                     classification = DeliveryFailureClassification(
-                        "uncertain",
-                        "delivery_lease_heartbeat_lost",
+                        "retryable" if idempotency_verified else "uncertain",
+                        (
+                            "delivery_lease_heartbeat_lost_idempotent_replay"
+                            if idempotency_verified
+                            else "delivery_lease_heartbeat_lost"
+                        ),
+                        safe_after_submission=idempotency_verified,
                     )
-                return self._record_failure(
-                    job,
-                    exc,
-                    classification,
+                return self._record_failure_or_recovery_pending(
+                    job, exc, classification
                 )
 
         if heartbeat.error is not None:
-            current = self.state.mark_delivery_job_uncertain_by_lease(
-                delivery_id,
-                owner=self.owner,
-                error_class="delivery_lease_heartbeat_lost",
-                error=str(heartbeat.error),
-                now=self.clock(),
+            classification = DeliveryFailureClassification(
+                "retryable" if idempotency_verified else "uncertain",
+                (
+                    "delivery_lease_heartbeat_lost_idempotent_replay"
+                    if idempotency_verified
+                    else "delivery_lease_heartbeat_lost"
+                ),
+                safe_after_submission=idempotency_verified,
             )
-            self.logger(
-                f"delivery uncertain id={delivery_id} "
-                "class=delivery_lease_heartbeat_lost"
+            return self._record_failure_or_recovery_pending(
+                job, heartbeat.error, classification
             )
-            return current["state"]
 
         try:
             current = self.state.mark_delivery_job_delivered_by_lease(
@@ -560,26 +708,35 @@ class DeliveryWorker:
                 now=self.clock(),
             )
         except Exception as exc:
-            try:
-                current = self.state.mark_delivery_job_uncertain_by_lease(
-                    delivery_id,
-                    owner=self.owner,
-                    error_class="local_delivery_commit_failed",
-                    error=str(exc),
-                    now=self.clock(),
-                )
-            except Exception:
-                raise
-            self.logger(
-                f"delivery uncertain id={delivery_id} "
-                "class=local_delivery_commit_failed"
+            classification = DeliveryFailureClassification(
+                "retryable" if idempotency_verified else "uncertain",
+                (
+                    "local_delivery_commit_failed_idempotent_replay"
+                    if idempotency_verified
+                    else "local_delivery_commit_failed"
+                ),
+                safe_after_submission=idempotency_verified,
             )
-            return current["state"]
+            return self._record_failure_or_recovery_pending(
+                job, exc, classification
+            )
         self.logger(
             f"delivery completed id={delivery_id} "
             f"doc={current['remote_docname']} transport={current['transport']}"
         )
         return current["state"]
+
+    def _record_failure_or_recovery_pending(
+        self, job, exc, classification
+    ):
+        try:
+            return self._record_failure(job, exc, classification)
+        except Exception as state_exc:
+            self.logger(
+                f"delivery state update deferred to lease recovery "
+                f"id={job['delivery_id']}: {state_exc}"
+            )
+            return "recovery_pending"
 
     def _record_failure(self, job, exc, classification):
         delivery_id = job["delivery_id"]
