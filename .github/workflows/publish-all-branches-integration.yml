@@ -42,7 +42,8 @@ jobs:
           d537f57d5e8b4c3aced09e1f6a099bfa10e841e5a7f32123a9ba43ead027cec7  integration.publish/part02
           88572d437611b682d89f6369045227fa4b13c3e00eaa30e61a89912b01350852  integration.publish/part03
           59d5ba8d6298a8385e4c810e97ec7096f11e5100a71ab0ec4dca63252255ca00  integration.publish/part04
-          7b529b3aa8e52987307177822b6a4ca5cddff4086fbdd744c619ec0ff4929cbd  integration.publish/part05
+          dddac6b2ae4eaf0588f4c1715825ea912630e5e047612582366f6fbccfc40df5  integration.publish/part05a
+          93842198009dcaed94b327d54faf3eb79a961c34ce14c97c55401d4b51d0338b  integration.publish/part05b
           d93d74eb1d8215ec4fcef4705d390a577fdd1db84124da9b80dae28eec29b119  integration.publish/part06
           a3c4f12402ca8b480888ead2e48a89302e89229a56e3096dce4db0c64b4cda5f  integration.publish/part07
           226bc805a9ff03b4d8202d83beb43c0ea83838589d9161469e32c29d3197ff0c  integration.publish/part08
@@ -53,12 +54,24 @@ jobs:
           test "$(wc -c < integration.publish/part02)" -eq 6000
           test "$(wc -c < integration.publish/part03)" -eq 6000
           test "$(wc -c < integration.publish/part04)" -eq 6000
-          test "$(wc -c < integration.publish/part05)" -eq 6000
+          test "$(wc -c < integration.publish/part05a)" -eq 3000
+          test "$(wc -c < integration.publish/part05b)" -eq 3000
           test "$(wc -c < integration.publish/part06)" -eq 6000
           test "$(wc -c < integration.publish/part07)" -eq 6000
           test "$(wc -c < integration.publish/part08)" -eq 5668
 
-          cat integration.publish/part0? > /tmp/integration.patch.gz.b64
+          cat \
+            integration.publish/part00 \
+            integration.publish/part01 \
+            integration.publish/part02 \
+            integration.publish/part03 \
+            integration.publish/part04 \
+            integration.publish/part05a \
+            integration.publish/part05b \
+            integration.publish/part06 \
+            integration.publish/part07 \
+            integration.publish/part08 \
+            > /tmp/integration.patch.gz.b64
           test "$(wc -c < /tmp/integration.patch.gz.b64)" -eq 53668
           echo "$BASE64_SHA256  /tmp/integration.patch.gz.b64" | sha256sum --check --strict
           base64 --decode /tmp/integration.patch.gz.b64 > /tmp/integration.patch.gz
